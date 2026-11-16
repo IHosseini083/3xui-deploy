@@ -1,0 +1,32 @@
+# 3X-UI runtime data & credentials
+db/
+cert/
+pgdata/
+3xui-backups/
+.env
+.env.*
+*.conf
+
+# Backup archives & database artifacts
+*.tar.gz
+*.sql
+*.db
+*.db-wal
+*.db-shm
+
+# Certificates & keys
+*.pem
+*.key
+*.crt
+
+# Compose backups / temporary files
+compose.yaml.bak
+compose.yaml.tmp
+*.tmp
+*.bak
+
+# OS & editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
