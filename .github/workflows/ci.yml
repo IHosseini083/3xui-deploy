@@ -15,12 +15,10 @@ jobs:
 
       - name: Verify LF line endings
         run: |
-          for f in manage.sh compose.yaml; do
-            if grep -q $'\r' "$f"; then
-              echo "ERROR: $f contains CRLF line endings"
-              exit 1
-            fi
-          done
+          if grep -q $'\r' manage.sh; then
+            echo "ERROR: manage.sh contains CRLF line endings"
+            exit 1
+          fi
 
       - name: Check bash syntax
         run: bash -n manage.sh
@@ -35,8 +33,3 @@ jobs:
         run: |
           chmod +x manage.sh
           ./manage.sh --help
-
-      - name: Validate Docker Compose YAML
-        run: |
-          docker compose -f compose.yaml config >/dev/null
-          docker compose -f compose.yaml --profile postgres config >/dev/null

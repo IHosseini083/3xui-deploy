@@ -113,20 +113,6 @@ manage.sh [OPTIONS] [COMMAND] [ARGS]
 
 ---
 
-## Standalone Compose Template
-
-This repository also ships a standalone [compose.yaml](compose.yaml) with `NET_ADMIN`/`NET_RAW` capabilities (required by 3X-UI's Fail2ban), log rotation, and an optional `postgres` profile:
-
-```bash
-# Default SQLite backend
-docker compose up -d
-
-# Optional PostgreSQL backend (uncomment XUI_DB_TYPE & XUI_DB_DSN in compose.yaml first)
-docker compose --profile postgres up -d
-```
-
----
-
 ## Documentation
 
 - [Usage & Feature Guide](docs/USAGE.md) — TUI controls, remote SSH setup, backups, certs, BBR, firewall, and GeoIP updates
