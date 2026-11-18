@@ -4,11 +4,11 @@
 
 1. **Change default `admin / admin` credentials immediately** via the post-deploy hardening prompt or **Panel settings & security**.
 2. **Set a non-standard port and random `webBasePath`** (e.g., `/x9K2pQ7mR4vL/`) so automated scanners do not find the login form.
-3. **Enable TLS on the panel** using Let's Encrypt or an ECDSA self-signed certificate behind Cloudflare/reverse proxy so panel logins and API tokens are encrypted in transit.
+3. **Put the panel behind the Caddy reverse proxy (or enable panel TLS)**: Use **Reverse proxy (Caddy)** (`manage.sh proxy setup`) to bind 3X-UI to `127.0.0.1`, serve a static decoy website on `/`, proxy only your random `webBasePath` (and optional subscription domain) over HTTPS, or configure Let's Encrypt / ECDSA TLS directly on the panel.
 4. **Enable Two-Factor Authentication (2FA)** inside the 3X-UI web settings (and remember `manage.sh settings` can reset it via CLI if you ever lose your authenticator).
 5. **Keep Fail2ban enabled** (`XUI_ENABLE_FAIL2BAN: "true"` with `NET_ADMIN` + `NET_RAW` in `compose.yaml`) to enforce per-client IP limits and login brute-force bans.
 6. **Migrate SSH access to keys** via **Target & SSH manager → Install SSH public key & clear saved password**, removing password obfuscation from `~/.3xui-manager.conf`.
-7. **Restrict firewall ports** using **Firewall helper** so only SSH, your panel port (or restrict panel port to your VPN/home IP), and active Xray inbound ports are exposed.
+7. **Restrict firewall ports** using **Firewall helper** so only SSH, active Xray inbound ports, and either Caddy (`80/tcp` + `<PROXY_PORT>/tcp+udp` when proxying) or your panel port are exposed.
 
 ---
 

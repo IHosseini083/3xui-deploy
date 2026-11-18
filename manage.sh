@@ -44,7 +44,19 @@ PANEL_PORT="2053"
 PANEL_PATH="/"
 PANEL_USER="admin"
 PANEL_PROTO="http"
+PANEL_LISTEN=""
 PANEL_HAS_DEFAULT=""
+
+PROXY_ENABLED=false
+PROXY_DOMAIN=""
+PROXY_PORT="443"
+PROXY_EMAIL=""
+SUB_MODE="none"     # "none" | "same" | "dedicated"
+SUB_DOMAIN=""
+SUB_PORT="2096"
+SUB_PATH="/sub/"
+SUB_JSON_PATH="/json/"
+PROXY_SUB_URL=""
 
 # ─── Terminal Capability Detection ──────────────────────────────────────────
 setup_terminal() {
@@ -927,9 +939,10 @@ manage_ssh() {
 }
 
 # ─── Prerequisites & Docker Compose Helpers ─────────────────────────────────
-is_deployed() { run_q "test -f $(quote_sh "$INSTALL_DIR/compose.yaml")"; }
-is_running()  { run_q "docker ps --format '{{.Names}}' | grep -q '^3xui_app$'"; }
+is_deployed()   { run_q "test -f $(quote_sh "$INSTALL_DIR/compose.yaml")"; }
+is_running()    { run_q "docker ps --format '{{.Names}}' | grep -q '^3xui_app$'"; }
 is_pg_running() { run_q "docker ps --format '{{.Names}}' | grep -q '^3xui_postgres$'"; }
+is_caddy_running() { run_q "docker ps --format '{{.Names}}' | grep -q '^3xui_caddy$'"; }
 
 detect_compose() {
     [[ -n "$COMPOSE_CMD" ]] && return 0
@@ -1001,34 +1014,152 @@ get_pg_env() {
     fi
 }
 
+_is_postgres_backend() {
+    is_pg_running || run_q "grep -q 'XUI_DB_TYPE:[[:space:]]*\"postgres\"' $(quote_sh "$INSTALL_DIR/compose.yaml")"
+}
+
+ensure_sqlite_in_container() {
+    run_q "docker exec 3xui_app sh -c 'command -v sqlite3 >/dev/null 2>&1'" && return 0
+    info "Installing sqlite3 in container for database configuration..."
+    run "docker exec 3xui_app sh -c 'apk update >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1'" \
+        || return 1
+}
+
+xui_db_get() {
+    local key="$1"
+    [[ "$key" =~ ^[a-zA-Z0-9_]+$ ]] || return 1
+
+    if _is_postgres_backend; then
+        is_pg_running || return 1
+        get_pg_env
+        run_out "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -tAc $(quote_sh "SELECT value FROM settings WHERE key='${key}' LIMIT 1;")" || true
+    else
+        local sql="SELECT value FROM settings WHERE key='${key}' LIMIT 1;"
+        if is_running && ensure_sqlite_in_container; then
+            run_out "docker exec 3xui_app sqlite3 /etc/x-ui/x-ui.db $(quote_sh "$sql")" || true
+        elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
+            run_out "sqlite3 $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")" || true
+        fi
+    fi
+}
+
+xui_db_set() {
+    local key="$1" val="$2"
+    [[ "$key" =~ ^[a-zA-Z0-9_]+$ ]] || return 1
+    has_control_chars "$val" && return 1
+    local val_sql="${val//\'/\'\'}"
+
+    if _is_postgres_backend; then
+        is_pg_running || { error "PostgreSQL container is not running"; return 1; }
+        get_pg_env
+        local sql="WITH upd AS (UPDATE settings SET value='${val_sql}' WHERE key='${key}' RETURNING id) INSERT INTO settings (key, value) SELECT '${key}', '${val_sql}' WHERE NOT EXISTS (SELECT 1 FROM upd);"
+        run "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -c $(quote_sh "$sql") >/dev/null"
+    else
+        local sql="UPDATE settings SET value='${val_sql}' WHERE key='${key}'; INSERT INTO settings (key, value) SELECT '${key}', '${val_sql}' WHERE (SELECT changes()) = 0;"
+        if is_running && ensure_sqlite_in_container; then
+            run "docker exec 3xui_app sqlite3 /etc/x-ui/x-ui.db $(quote_sh "$sql")"
+        elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
+            run "sqlite3 $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")"
+        else
+            error "sqlite3 unavailable to update $INSTALL_DIR/db/x-ui.db"
+            return 1
+        fi
+    fi
+}
+
+load_proxy_conf() {
+    PROXY_ENABLED=false
+    PROXY_DOMAIN=""
+    PROXY_PORT="443"
+    PROXY_EMAIL=""
+    SUB_MODE="none"
+    SUB_DOMAIN=""
+    SUB_PORT="2096"
+    SUB_PATH="/sub/"
+    SUB_JSON_PATH="/json/"
+    PROXY_SUB_URL=""
+
+    local conf_raw
+    conf_raw=$(run_out "cat $(quote_sh "$INSTALL_DIR/caddy/proxy.conf")" || true)
+    [[ -z "$conf_raw" ]] && return 0
+
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            case "$key" in
+                PROXY_ENABLED) [[ "$val" == "true" ]] && PROXY_ENABLED=true || PROXY_ENABLED=false ;;
+                PROXY_DOMAIN)  validate_domain "$val" && PROXY_DOMAIN="$val" ;;
+                PROXY_PORT)    validate_port "$val" && PROXY_PORT="$val" ;;
+                PROXY_EMAIL)   validate_email "$val" && PROXY_EMAIL="$val" ;;
+                SUB_MODE)      [[ "$val" =~ ^(none|same|dedicated)$ ]] && SUB_MODE="$val" ;;
+                SUB_DOMAIN)    validate_domain "$val" && SUB_DOMAIN="$val" ;;
+                SUB_PORT)      validate_port "$val" && SUB_PORT="$val" ;;
+                SUB_PATH)      validate_webpath "$val" && SUB_PATH="$val" ;;
+                SUB_JSON_PATH) validate_webpath "$val" && SUB_JSON_PATH="$val" ;;
+            esac
+        fi
+    done <<< "$conf_raw"
+}
+
+save_proxy_conf() {
+    local conf_body
+    conf_body=$(printf 'PROXY_ENABLED="%s"\nPROXY_DOMAIN="%s"\nPROXY_PORT="%s"\nPROXY_EMAIL="%s"\nSUB_MODE="%s"\nSUB_DOMAIN="%s"\nSUB_PORT="%s"\nSUB_PATH="%s"\nSUB_JSON_PATH="%s"\n' \
+        "$PROXY_ENABLED" "$PROXY_DOMAIN" "$PROXY_PORT" "$PROXY_EMAIL" \
+        "$SUB_MODE" "$SUB_DOMAIN" "$SUB_PORT" "$SUB_PATH" "$SUB_JSON_PATH")
+
+    run "mkdir -p $(quote_sh "$INSTALL_DIR/caddy") && chmod 700 $(quote_sh "$INSTALL_DIR/caddy")" || return 1
+    if $REMOTE; then
+        printf '%s' "$conf_body" | ssh_cmd "umask 077 && cat > $(quote_sh "$INSTALL_DIR/caddy/proxy.conf") && chmod 600 $(quote_sh "$INSTALL_DIR/caddy/proxy.conf")"
+    else
+        ( umask 077; printf '%s' "$conf_body" > "$INSTALL_DIR/caddy/proxy.conf" )
+        chmod 600 "$INSTALL_DIR/caddy/proxy.conf"
+    fi
+}
+
 # ─── Panel Introspection & Settings ─────────────────────────────────────────
 get_panel_info() {
     PANEL_PORT="2053"
     PANEL_PATH="/"
     PANEL_USER="admin"
     PANEL_PROTO="http"
+    PANEL_LISTEN=""
     PANEL_HAS_DEFAULT=""
 
+    load_proxy_conf
+
     is_running || return 1
-    local out cert_out
+    local out cert_out listen_out
     out=$(run_out "docker exec 3xui_app x-ui setting -show=true" || true)
-    [[ -z "$out" ]] && return 0
+    if [[ -n "$out" ]]; then
+        local val
+        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*port:/ {print $2; exit}' | tr -d '\r')
+        validate_port "$val" && PANEL_PORT="$val"
 
-    local val
-    val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*port:/ {print $2; exit}' | tr -d '\r')
-    validate_port "$val" && PANEL_PORT="$val"
+        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*webBasePath:/ {print $2; exit}' | tr -d '\r')
+        if [[ -n "$val" ]]; then
+            [[ "$val" != /* ]] && val="/$val"
+            PANEL_PATH="$val"
+        fi
 
-    val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*webBasePath:/ {print $2; exit}' | tr -d '\r')
-    if [[ -n "$val" ]]; then
-        [[ "$val" != /* ]] && val="/$val"
-        PANEL_PATH="$val"
+        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*username:/ {print $2; exit}' | tr -d '\r')
+        [[ -n "$val" ]] && PANEL_USER="$val"
+
+        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*hasDefaultCredential:/ {print $2; exit}' | tr -d '\r')
+        PANEL_HAS_DEFAULT="$val"
     fi
 
-    val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*username:/ {print $2; exit}' | tr -d '\r')
-    [[ -n "$val" ]] && PANEL_USER="$val"
-
-    val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*hasDefaultCredential:/ {print $2; exit}' | tr -d '\r')
-    PANEL_HAS_DEFAULT="$val"
+    listen_out=$(run_out "docker exec 3xui_app x-ui setting -getListen=true" || true)
+    if [[ -n "$listen_out" ]]; then
+        PANEL_LISTEN=$(printf '%s\n' "$listen_out" | awk -F': *' '/(listen|IP)/ {print $2; exit}' | tr -d '\r ')
+    fi
 
     cert_out=$(run_out "docker exec 3xui_app x-ui setting -getCert=true" || true)
     if [[ -n "$cert_out" ]]; then
@@ -1038,12 +1169,25 @@ get_panel_info() {
             PANEL_PROTO="https"
         fi
     fi
+
+    if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]] && [[ "$SUB_MODE" != "none" ]]; then
+        local port_sfx="" sub_host="$PROXY_DOMAIN"
+        [[ "$PROXY_PORT" != "443" ]] && port_sfx=":${PROXY_PORT}"
+        [[ "$SUB_MODE" == "dedicated" && -n "$SUB_DOMAIN" ]] && sub_host="$SUB_DOMAIN"
+        PROXY_SUB_URL="https://${sub_host}${port_sfx}${SUB_PATH}"
+    fi
 }
 
 format_panel_url() {
     local ip="$1"
     local path="$PANEL_PATH"
     [[ "$path" != /* ]] && path="/$path"
+    if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]] && is_caddy_running; then
+        local port_sfx=""
+        [[ "$PROXY_PORT" != "443" ]] && port_sfx=":${PROXY_PORT}"
+        printf 'https://%s%s%s' "$PROXY_DOMAIN" "$port_sfx" "$path"
+        return 0
+    fi
     printf '%s://%s:%s%s' "$PANEL_PROTO" "$ip" "$PANEL_PORT" "$path"
 }
 
@@ -1077,6 +1221,24 @@ reset_credentials() {
     $auto_pass && echo -e "  Generated password: ${BOLD}${YELLOW}${new_pass}${NC}  (save this now!)"
 }
 
+_sync_caddy_if_active() {
+    load_proxy_conf
+    $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]] || return 0
+    local p_port="$1" p_path="$2"
+    local use_p_cert=false use_s_cert=false
+    run_q "grep -q $(quote_sh "tls /root/cert/$PROXY_DOMAIN/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" && use_p_cert=true
+    if [[ "$SUB_MODE" == "dedicated" && -n "$SUB_DOMAIN" ]]; then
+        run_q "grep -q $(quote_sh "tls /root/cert/$SUB_DOMAIN/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" && use_s_cert=true
+    fi
+    generate_caddyfile "$PROXY_DOMAIN" "$PROXY_PORT" "$PROXY_EMAIL" "$p_port" "$p_path" \
+        "$SUB_MODE" "$SUB_DOMAIN" "$SUB_PORT" "$SUB_PATH" "$SUB_JSON_PATH" \
+        "$use_p_cert" "$use_s_cert" || return 1
+    if is_caddy_running; then
+        run "docker exec 3xui_caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1" \
+            && success "Synced & reloaded Caddy reverse proxy" || warn "Failed to reload Caddy"
+    fi
+}
+
 change_panel_port() {
     require_running || return 1
     get_panel_info
@@ -1090,6 +1252,7 @@ change_panel_port() {
     fi
     run "docker exec 3xui_app x-ui setting -port $(quote_sh "$new_port")" || return 1
     success "Panel port updated to $new_port (restart required to take effect)"
+    _sync_caddy_if_active "$new_port" "$PANEL_PATH"
     confirm "Restart panel now?" && restart_panel || true
 }
 
@@ -1110,8 +1273,13 @@ change_panel_webpath() {
         error "Invalid path (allowed: alphanumeric, '/', '_', '-')"
         return 1
     fi
+    if $PROXY_ENABLED && [[ "$new_path" == "/" ]]; then
+        error "Web Base Path cannot be '/' while Caddy camouflage site is active"
+        return 1
+    fi
     run "docker exec 3xui_app x-ui setting -webBasePath $(quote_sh "$new_path")" || return 1
     success "Web Base Path set to ${BOLD}${new_path}${NC}"
+    _sync_caddy_if_active "$PANEL_PORT" "$new_path"
     confirm "Restart panel now?" && restart_panel || true
 }
 
@@ -1200,6 +1368,27 @@ get_latest_version() {
     printf '%s' "$tag"
 }
 
+_caddy_service_block() {
+    cat <<'YAML'
+  caddy:
+    image: caddy:2-alpine
+    container_name: 3xui_caddy
+    network_mode: host
+    volumes:
+      - $PWD/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - $PWD/caddy/site/:/srv/site/:ro
+      - $PWD/caddy/data/:/data/
+      - $PWD/caddy/config/:/config/
+      - $PWD/cert/:/root/cert/:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+YAML
+}
+
 generate_compose() {
     local db_type="${1:-sqlite}"
     local tag="${2:-latest}"
@@ -1211,7 +1400,13 @@ generate_compose() {
     local xui_db_env=""
     local xui_depends=""
     local pg_service=""
+    local caddy_service=""
     local env_content=""
+
+    if run_q "test -f $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")"; then
+        caddy_service="
+$(_caddy_service_block)"
+    fi
 
     if [[ "$db_type" == "postgres" ]]; then
         local enc_pass
@@ -1270,7 +1465,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    restart: unless-stopped${pg_service}
+    restart: unless-stopped${pg_service}${caddy_service}
 YAML
 )
 
@@ -1445,6 +1640,10 @@ deploy() {
     compose up -d || { error "Container start failed"; return 1; }
 
     $INTERACTIVE && post_deploy_harden
+    if $INTERACTIVE && is_running; then
+        echo ""
+        confirm "Set up Caddy reverse proxy now? (custom domain + HTTPS + camouflage + subs)" && setup_reverse_proxy || true
+    fi
 
     get_panel_info || true
     local panel_ip url
@@ -1561,6 +1760,10 @@ status_panel() {
         panel_ip=$(get_target_ip)
         url=$(format_panel_url "$panel_ip")
         echo -e "  Panel   : ${GREEN}Running${NC} ${ARROW} ${BOLD}${url}${NC}"
+        if $PROXY_ENABLED && is_caddy_running; then
+            echo -e "  Proxy   : ${GREEN}Caddy Active${NC} (backend ${PANEL_LISTEN:-127.0.0.1}:${PANEL_PORT})"
+            [[ -n "$PROXY_SUB_URL" ]] && echo -e "  Subs    : ${BOLD}${PROXY_SUB_URL}${NC}"
+        fi
         if [[ "$PANEL_HAS_DEFAULT" == "true" ]]; then
             echo -e "  ${YELLOW}! Default credentials still active — change them in Panel Settings${NC}"
         fi
@@ -1675,6 +1878,7 @@ if [ -d $q_inst/db ]; then
 fi
 
 [ -d $q_inst/cert ] && cp -a $q_inst/cert $q_stage/cert
+[ -d $q_inst/caddy ] && cp -a $q_inst/caddy $q_stage/caddy
 [ -f $q_inst/compose.yaml ] && cp -a $q_inst/compose.yaml $q_stage/compose.yaml
 [ -f $q_inst/.env ] && cp -a $q_inst/.env $q_stage/.env
 
@@ -1806,7 +2010,7 @@ restore_panel() {
     detect_compose || true
     local was_running=false
     if is_deployed && [[ -n "$COMPOSE_CMD" ]]; then
-        if is_running || is_pg_running; then
+        if is_running || is_pg_running || is_caddy_running; then
             was_running=true
             compose down || warn "Failed to stop containers cleanly"
         fi
@@ -1843,6 +2047,12 @@ if [ -d "\$src/cert" ]; then
     rm -rf $(quote_sh "$INSTALL_DIR/cert")
     cp -a "\$src/cert" $(quote_sh "$INSTALL_DIR/cert")
     chmod 700 $(quote_sh "$INSTALL_DIR/cert")
+fi
+if [ -d "\$src/caddy" ]; then
+    rm -rf $(quote_sh "$INSTALL_DIR/caddy")
+    cp -a "\$src/caddy" $(quote_sh "$INSTALL_DIR/caddy")
+    chmod 755 $(quote_sh "$INSTALL_DIR/caddy")
+    [ -f $(quote_sh "$INSTALL_DIR/caddy/proxy.conf") ] && chmod 600 $(quote_sh "$INSTALL_DIR/caddy/proxy.conf")
 fi
 if [ -f "\$src/compose.yaml" ]; then
     cp -a "\$src/compose.yaml" $(quote_sh "$INSTALL_DIR/compose.yaml")
@@ -1994,6 +2204,7 @@ if [ -d "\$INSTALL_DIR/db" ]; then
     fi
 fi
 [ -d "\$INSTALL_DIR/cert" ] && cp -a "\$INSTALL_DIR/cert" "\$stage/cert"
+[ -d "\$INSTALL_DIR/caddy" ] && cp -a "\$INSTALL_DIR/caddy" "\$stage/caddy"
 [ -f "\$INSTALL_DIR/compose.yaml" ] && cp -a "\$INSTALL_DIR/compose.yaml" "\$stage/compose.yaml"
 [ -f "\$INSTALL_DIR/.env" ] && cp -a "\$INSTALL_DIR/.env" "\$stage/.env"
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^3xui_postgres$'; then
@@ -2398,6 +2609,627 @@ manage_certs() {
     done
 }
 
+# ─── Reverse Proxy (Caddy) ──────────────────────────────────────────────────
+inject_caddy_compose() {
+    local cfg="$INSTALL_DIR/compose.yaml"
+    local q_cfg q_tmp
+    q_cfg=$(quote_sh "$cfg")
+    q_tmp=$(quote_sh "${cfg}.tmp")
+
+    run_q "grep -qE '^  caddy:' $q_cfg" && return 0
+
+    local block
+    block=$(_caddy_service_block)
+    local cur_yaml new_yaml
+    cur_yaml=$(run_out "cat $q_cfg") || return 1
+    new_yaml=$(CADDY_BLOCK="$block" awk '
+        BEGIN { blk = ENVIRON["CADDY_BLOCK"]; in_svc = 0; done = 0 }
+        /^services:[[:space:]]*$/ { in_svc = 1 }
+        in_svc && /^[^[:space:]#]/ && $0 !~ /^services:/ && !done {
+            print ""
+            print blk
+            done = 1
+            in_svc = 0
+        }
+        { print }
+        END {
+            if (!done) {
+                print ""
+                print blk
+            }
+        }
+    ' <<< "$cur_yaml") || return 1
+
+    if $REMOTE; then
+        printf '%s\n' "$new_yaml" | ssh_cmd "umask 077 && cat > $q_tmp && chmod 600 $q_tmp && mv $q_tmp $q_cfg"
+    else
+        ( umask 077; printf '%s\n' "$new_yaml" > "${cfg}.tmp" )
+        chmod 600 "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+    fi
+}
+
+remove_caddy_compose() {
+    local cfg="$INSTALL_DIR/compose.yaml"
+    local q_cfg q_tmp
+    q_cfg=$(quote_sh "$cfg")
+    q_tmp=$(quote_sh "${cfg}.tmp")
+
+    run_q "test -f $q_cfg" || return 0
+    run_q "grep -qE '^  caddy:' $q_cfg" || return 0
+
+    local cur_yaml new_yaml
+    cur_yaml=$(run_out "cat $q_cfg") || return 1
+    new_yaml=$(awk '
+        BEGIN { skip = 0 }
+        /^  caddy:[[:space:]]*$/ { skip = 1; next }
+        skip && (/^  [a-zA-Z0-9_-]+:/ || /^[^[:space:]#]/) { skip = 0 }
+        !skip { print }
+    ' <<< "$cur_yaml" | awk '{ lines[NR] = $0 } END { while (NR > 0 && lines[NR] ~ /^[[:space:]]*$/) NR--; for (i = 1; i <= NR; i++) print lines[i] }') || return 1
+
+    if $REMOTE; then
+        printf '%s\n' "$new_yaml" | ssh_cmd "umask 077 && cat > $q_tmp && chmod 600 $q_tmp && mv $q_tmp $q_cfg"
+    else
+        ( umask 077; printf '%s\n' "$new_yaml" > "${cfg}.tmp" )
+        chmod 600 "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+    fi
+}
+
+generate_decoy_site() {
+    local force="${1:-false}"
+    local site_dir="$INSTALL_DIR/caddy/site"
+    local index_file="$site_dir/index.html"
+
+    run "mkdir -p $(quote_sh "$site_dir") && chmod 755 $(quote_sh "$site_dir")" || return 1
+    if [[ "$force" != "true" ]] && run_q "test -f $(quote_sh "$index_file")"; then
+        return 0
+    fi
+
+    local html
+    html=$(cat <<'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Edge Telemetry &amp; Status</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0f172a; color: #e2e8f0; display: grid; place-items: center; min-height: 100vh;
+    }
+    .card {
+      max-width: 460px; padding: 2rem; border-radius: 12px;
+      background: #1e293b; border: 1px solid #334155; box-shadow: 0 12px 30px rgba(0,0,0,.35);
+    }
+    h1 { margin: 0 0 .5rem; font-size: 1.25rem; font-weight: 600; }
+    p { margin: 0 0 1.25rem; color: #94a3b8; font-size: .95rem; line-height: 1.5; }
+    .badge {
+      display: inline-flex; align-items: center; gap: .5rem;
+      font-size: .85rem; color: #34d399; background: rgba(16,185,129,.12);
+      padding: .35rem .75rem; border-radius: 999px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Edge Relay Node</h1>
+    <p>Automated routing and health probe endpoint. Authorized administrative endpoints require a valid session path.</p>
+    <span class="badge"><span class="dot"></span>Operational</span>
+  </main>
+</body>
+</html>
+HTML
+)
+    if $REMOTE; then
+        printf '%s\n' "$html" | ssh_cmd "cat > $(quote_sh "$index_file") && chmod 644 $(quote_sh "$index_file")"
+    else
+        printf '%s\n' "$html" > "$index_file"
+        chmod 644 "$index_file"
+    fi
+}
+
+_caddy_tls_block() {
+    local domain="$1" port="$2" use_existing="${3:-false}"
+    if [[ "$use_existing" == "true" ]]; then
+        printf '    tls /root/cert/%s/fullchain.pem /root/cert/%s/privkey.pem\n' "$domain" "$domain"
+    elif [[ "$port" != "443" ]]; then
+        cat <<'TLS'
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
+TLS
+    fi
+}
+
+generate_caddyfile() {
+    local panel_domain="$1"
+    local https_port="$2"
+    local acme_email="$3"
+    local panel_port="$4"
+    local panel_path="$5"
+    local sub_mode="$6"
+    local sub_domain="$7"
+    local sub_port="$8"
+    local sub_path="$9"
+    local sub_json_path="${10}"
+    local use_existing_panel_cert="${11:-false}"
+    local use_existing_sub_cert="${12:-false}"
+
+    local base_no_slash="${panel_path%/}"
+    [[ -z "$base_no_slash" ]] && base_no_slash="/"
+
+    local sub_no_slash="${sub_path%/}"
+    local sub_json_no_slash="${sub_json_path%/}"
+
+    local global_opts=""
+    if [[ -n "$acme_email" ]]; then
+        printf -v global_opts '{\n    email %s\n}\n\n' "$acme_email"
+    fi
+
+    local panel_addr="$panel_domain"
+    [[ "$https_port" != "443" ]] && panel_addr="${panel_domain}:${https_port}"
+
+    local panel_tls=""
+    panel_tls=$(_caddy_tls_block "$panel_domain" "$https_port" "$use_existing_panel_cert")
+
+    local same_sub_block=""
+    if [[ "$sub_mode" == "same" ]]; then
+        same_sub_block=$(cat <<EOF
+
+    @sub {
+        path ${sub_no_slash} ${sub_no_slash}/*
+    }
+    handle @sub {
+        reverse_proxy 127.0.0.1:${sub_port}
+    }
+
+    @subjson {
+        path ${sub_json_no_slash} ${sub_json_no_slash}/*
+    }
+    handle @subjson {
+        reverse_proxy 127.0.0.1:${sub_port}
+    }
+EOF
+)
+    fi
+
+    local dedicated_sub_block=""
+    if [[ "$sub_mode" == "dedicated" && -n "$sub_domain" ]]; then
+        local sub_addr="$sub_domain"
+        [[ "$https_port" != "443" ]] && sub_addr="${sub_domain}:${https_port}"
+        local sub_tls=""
+        sub_tls=$(_caddy_tls_block "$sub_domain" "$https_port" "$use_existing_sub_cert")
+        dedicated_sub_block=$(cat <<EOF
+
+${sub_addr} {
+${sub_tls}
+    encode gzip zstd
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    @sub {
+        path ${sub_no_slash} ${sub_no_slash}/*
+    }
+    handle @sub {
+        reverse_proxy 127.0.0.1:${sub_port}
+    }
+
+    @subjson {
+        path ${sub_json_no_slash} ${sub_json_no_slash}/*
+    }
+    handle @subjson {
+        reverse_proxy 127.0.0.1:${sub_port}
+    }
+
+    handle {
+        root * /srv/site
+        try_files {path} /index.html
+        file_server
+    }
+}
+EOF
+)
+    fi
+
+    local caddyfile_body
+    caddyfile_body=$(cat <<EOF
+${global_opts}${panel_addr} {
+${panel_tls}
+    encode gzip zstd
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    @panel {
+        path ${base_no_slash} ${base_no_slash}/*
+    }
+    handle @panel {
+        reverse_proxy 127.0.0.1:${panel_port}
+    }${same_sub_block}
+
+    handle {
+        root * /srv/site
+        try_files {path} /index.html
+        file_server
+    }
+}${dedicated_sub_block}
+EOF
+)
+
+    local cdir="$INSTALL_DIR/caddy"
+    local cfile="$cdir/Caddyfile"
+    run "mkdir -p $(quote_sh "$cdir") $(quote_sh "$cdir/data") $(quote_sh "$cdir/config") && chmod 755 $(quote_sh "$cdir")" || return 1
+    if $REMOTE; then
+        printf '%s\n' "$caddyfile_body" | ssh_cmd "cat > $(quote_sh "$cfile") && chmod 644 $(quote_sh "$cfile")"
+    else
+        printf '%s\n' "$caddyfile_body" > "$cfile"
+        chmod 644 "$cfile"
+    fi
+}
+
+setup_reverse_proxy() {
+    require_deployed || return 1
+    require_running  || return 1
+
+    get_panel_info || true
+
+    echo ""
+    echo -e "  ${BOLD}${MAGENTA}Caddy Reverse Proxy Setup${NC}"
+    echo -e "  ${DIM}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${NC}"
+    echo "  Places 3X-UI behind HTTPS (Caddy), locks the panel to 127.0.0.1,"
+    echo "  and serves a decoy website on '/'."
+    echo ""
+
+    # 1. Ensure non-root webBasePath so '/' belongs to the decoy site.
+    local panel_path="$PANEL_PATH"
+    if [[ "$panel_path" == "/" ]]; then
+        warn "Panel Web Base Path is currently '/' — a dedicated path is required behind a decoy site."
+        local new_base
+        read -rp "  Web Base Path (e.g. /panel/) [Enter to auto-generate random path]: " new_base
+        if [[ -z "$new_base" ]]; then
+            new_base="/$(generate_random_string 12)/"
+        else
+            [[ "$new_base" != /* ]] && new_base="/$new_base"
+            [[ "$new_base" != */ ]] && new_base="${new_base}/"
+        fi
+        if [[ "$new_base" == "/" ]] || ! validate_webpath "$new_base"; then
+            error "Invalid non-root Web Base Path"
+            return 1
+        fi
+        run "docker exec 3xui_app x-ui setting -webBasePath $(quote_sh "$new_base")" || return 1
+        panel_path="$new_base"
+        success "Panel Web Base Path set to ${BOLD}${panel_path}${NC}"
+    fi
+
+    # 2. Panel domain, HTTPS port, ACME email.
+    local panel_domain https_port acme_email
+    read -rp "  Panel domain (e.g. panel.example.com)${PROXY_DOMAIN:+ [$PROXY_DOMAIN]}: " panel_domain
+    panel_domain="${panel_domain:-$PROXY_DOMAIN}"
+    if ! validate_domain "$panel_domain"; then
+        error "Valid domain required (e.g. panel.example.com)"
+        return 1
+    fi
+
+    read -rp "  HTTPS listen port (use e.g. 8443 if Xray Reality uses 443) [${PROXY_PORT:-443}]: " https_port
+    https_port="${https_port:-${PROXY_PORT:-443}}"
+    if ! validate_port "$https_port"; then
+        error "Invalid HTTPS port: $https_port"
+        return 1
+    fi
+
+    local use_existing_panel_cert=false
+    if run_q "test -f $(quote_sh "$INSTALL_DIR/cert/$panel_domain/fullchain.pem") && test -f $(quote_sh "$INSTALL_DIR/cert/$panel_domain/privkey.pem")"; then
+        confirm "Found existing cert in $INSTALL_DIR/cert/$panel_domain/. Use it instead of Caddy ACME?" && use_existing_panel_cert=true
+    fi
+
+    if ! $use_existing_panel_cert; then
+        read -rp "  Email for ACME TLS notices [${PROXY_EMAIL:-blank to skip}]: " acme_email
+        [[ "$acme_email" == "blank to skip" ]] && acme_email=""
+        acme_email="${acme_email:-$PROXY_EMAIL}"
+        if [[ -n "$acme_email" ]] && ! validate_email "$acme_email"; then
+            error "Invalid email address: $acme_email"
+            return 1
+        fi
+    else
+        acme_email=""
+    fi
+
+    # 3. Subscription proxy configuration.
+    tui_select "Subscription Server Proxy" "How should 3X-UI subscription links be proxied?" \
+        "Dedicated subscription domain (e.g. sub.example.com)" \
+        "Same domain as panel (${panel_domain}/sub/)" \
+        "Do not proxy subscriptions (panel only)" \
+        "Cancel"
+    local sub_sel=$?
+    clear_screen
+
+    local sub_mode="none" sub_domain="" sub_port="${SUB_PORT:-2096}" sub_path="${SUB_PATH:-/sub/}" sub_json_path="${SUB_JSON_PATH:-/json/}"
+    local use_existing_sub_cert=false
+    case "$sub_sel" in
+        0) sub_mode="dedicated" ;;
+        1) sub_mode="same" ;;
+        2) sub_mode="none" ;;
+        3|255) info "Cancelled"; return 0 ;;
+    esac
+
+    if [[ "$sub_mode" != "none" ]]; then
+        local db_sub_port db_sub_path db_sub_json
+        db_sub_port=$(xui_db_get "subPort" | tr -d '\r ' || true)
+        db_sub_path=$(xui_db_get "subPath" | tr -d '\r ' || true)
+        db_sub_json=$(xui_db_get "subJsonPath" | tr -d '\r ' || true)
+        validate_port "$db_sub_port" && sub_port="$db_sub_port"
+        [[ -n "$db_sub_path" ]] && sub_path="$db_sub_path"
+        [[ -n "$db_sub_json" ]] && sub_json_path="$db_sub_json"
+
+        if [[ "$sub_mode" == "dedicated" ]]; then
+            read -rp "  Subscription domain (e.g. sub.example.com)${SUB_DOMAIN:+ [$SUB_DOMAIN]}: " sub_domain
+            sub_domain="${sub_domain:-$SUB_DOMAIN}"
+            if ! validate_domain "$sub_domain" || [[ "$sub_domain" == "$panel_domain" ]]; then
+                error "Valid subscription domain different from $panel_domain is required"
+                return 1
+            fi
+            if run_q "test -f $(quote_sh "$INSTALL_DIR/cert/$sub_domain/fullchain.pem") && test -f $(quote_sh "$INSTALL_DIR/cert/$sub_domain/privkey.pem")"; then
+                confirm "Found existing cert for $sub_domain. Use it instead of Caddy ACME?" && use_existing_sub_cert=true
+            fi
+        fi
+
+        read -rp "  Internal 3X-UI subscription port [${sub_port}]: " input_sp
+        sub_port="${input_sp:-$sub_port}"
+        validate_port "$sub_port" || { error "Invalid subscription port"; return 1; }
+        [[ "$sub_port" == "$PANEL_PORT" ]] && { error "Subscription port must differ from panel port ($PANEL_PORT)"; return 1; }
+
+        read -rp "  Subscription path [${sub_path}]: " input_spath
+        sub_path="${input_spath:-$sub_path}"
+        [[ "$sub_path" != /* ]] && sub_path="/$sub_path"
+        [[ "$sub_path" != */ ]] && sub_path="${sub_path}/"
+        if [[ "$sub_path" == "/" ]] || ! validate_webpath "$sub_path" || [[ "$sub_path" == "$panel_path" ]]; then
+            error "Invalid subscription path (cannot be '/' or equal to $panel_path)"
+            return 1
+        fi
+
+        read -rp "  JSON subscription path [${sub_json_path}]: " input_jpath
+        sub_json_path="${input_jpath:-$sub_json_path}"
+        [[ "$sub_json_path" != /* ]] && sub_json_path="/$sub_json_path"
+        [[ "$sub_json_path" != */ ]] && sub_json_path="${sub_json_path}/"
+        if [[ "$sub_json_path" == "/" ]] || ! validate_webpath "$sub_json_path" || [[ "$sub_json_path" == "$panel_path" ]] || [[ "$sub_json_path" == "$sub_path" ]]; then
+            error "Invalid JSON subscription path"
+            return 1
+        fi
+    fi
+
+    local port_sfx=""
+    [[ "$https_port" != "443" ]] && port_sfx=":${https_port}"
+    local ext_panel_url="https://${panel_domain}${port_sfx}${panel_path}"
+    local ext_sub_url="" ext_sub_json_url=""
+    if [[ "$sub_mode" == "dedicated" ]]; then
+        ext_sub_url="https://${sub_domain}${port_sfx}${sub_path}"
+        ext_sub_json_url="https://${sub_domain}${port_sfx}${sub_json_path}"
+    elif [[ "$sub_mode" == "same" ]]; then
+        ext_sub_url="https://${panel_domain}${port_sfx}${sub_path}"
+        ext_sub_json_url="https://${panel_domain}${port_sfx}${sub_json_path}"
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Summary:${NC}"
+    echo -e "    Panel URL    : ${BOLD}${ext_panel_url}${NC} -> 127.0.0.1:${PANEL_PORT}"
+    echo -e "    Camouflage   : https://${panel_domain}${port_sfx}/ -> /srv/site/"
+    if [[ -n "$ext_sub_url" ]]; then
+        echo -e "    Sub URL      : ${BOLD}${ext_sub_url}${NC} -> 127.0.0.1:${sub_port}"
+        echo -e "    Sub JSON URL : ${BOLD}${ext_sub_json_url}${NC} -> 127.0.0.1:${sub_port}"
+    fi
+    confirm "Apply reverse proxy configuration?" || { info "Cancelled"; return 0; }
+
+    info "Locking 3X-UI panel to loopback (127.0.0.1)..."
+    run "docker exec 3xui_app x-ui setting -listenIP 127.0.0.1" >/dev/null || true
+    xui_db_set "webListen" "127.0.0.1" || return 1
+    xui_db_set "webCertFile" "" || return 1
+    xui_db_set "webKeyFile" "" || return 1
+
+    if [[ "$sub_mode" != "none" ]]; then
+        info "Configuring 3X-UI subscription server for proxy..."
+        xui_db_set "subEnable" "true" || return 1
+        xui_db_set "subListen" "127.0.0.1" || return 1
+        xui_db_set "subPort" "$sub_port" || return 1
+        xui_db_set "subPath" "$sub_path" || return 1
+        xui_db_set "subJsonPath" "$sub_json_path" || return 1
+        xui_db_set "subCertFile" "" || return 1
+        xui_db_set "subKeyFile" "" || return 1
+        xui_db_set "subURI" "$ext_sub_url" || return 1
+        xui_db_set "subJsonURI" "$ext_sub_json_url" || return 1
+    fi
+
+    PROXY_ENABLED=true
+    PROXY_DOMAIN="$panel_domain"
+    PROXY_PORT="$https_port"
+    PROXY_EMAIL="$acme_email"
+    SUB_MODE="$sub_mode"
+    SUB_DOMAIN="$sub_domain"
+    SUB_PORT="$sub_port"
+    SUB_PATH="$sub_path"
+    SUB_JSON_PATH="$sub_json_path"
+
+    info "Generating decoy site, Caddyfile, and updating compose.yaml..."
+    generate_decoy_site false || return 1
+    generate_caddyfile "$panel_domain" "$https_port" "$acme_email" "$PANEL_PORT" "$panel_path" \
+        "$sub_mode" "$sub_domain" "$sub_port" "$sub_path" "$sub_json_path" \
+        "$use_existing_panel_cert" "$use_existing_sub_cert" || return 1
+    save_proxy_conf || return 1
+    inject_caddy_compose || return 1
+
+    info "Pulling/starting Caddy and restarting 3X-UI..."
+    compose up -d || { error "Failed to start Caddy container"; return 1; }
+    compose restart 3xui >/dev/null || true
+    if is_caddy_running; then
+        run "docker exec 3xui_caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || true" || true
+    fi
+
+    invalidate_status
+    echo ""
+    success "Caddy reverse proxy is active!"
+    echo -e "  Panel URL : ${BOLD}${ext_panel_url}${NC}"
+    echo -e "  Decoy URL : ${BOLD}https://${panel_domain}${port_sfx}/${NC}"
+    [[ -n "$ext_sub_url" ]] && echo -e "  Sub URL   : ${BOLD}${ext_sub_url}${NC}"
+    echo -e "  ${DIM}Ensure DNS points to this server and firewall allows 80/tcp + ${https_port}/tcp+udp.${NC}"
+}
+
+status_reverse_proxy() {
+    load_proxy_conf
+    echo ""
+    if ! $PROXY_ENABLED || [[ -z "$PROXY_DOMAIN" ]]; then
+        echo -e "  Reverse Proxy : ${DIM}Not configured${NC}\n"
+        return 0
+    fi
+
+    get_panel_info || true
+    local caddy_state="${RED}Stopped${NC}"
+    is_caddy_running && caddy_state="${GREEN}Running${NC}"
+    local port_sfx=""
+    [[ "$PROXY_PORT" != "443" ]] && port_sfx=":${PROXY_PORT}"
+
+    echo -e "  Caddy Status  : $caddy_state"
+    echo -e "  Panel Domain  : ${BOLD}https://${PROXY_DOMAIN}${port_sfx}${PANEL_PATH}${NC}"
+    echo -e "  Decoy Root    : https://${PROXY_DOMAIN}${port_sfx}/"
+    echo -e "  Backend Bind  : ${PANEL_LISTEN:-0.0.0.0}:${PANEL_PORT}"
+    echo -e "  Sub Proxy     : ${SUB_MODE}"
+    if [[ "$SUB_MODE" != "none" && -n "$PROXY_SUB_URL" ]]; then
+        echo -e "  Sub URL       : ${BOLD}${PROXY_SUB_URL}${NC} (127.0.0.1:${SUB_PORT})"
+    fi
+    echo ""
+}
+
+reload_reverse_proxy() {
+    require_deployed || return 1
+    is_caddy_running || { error "Container 3xui_caddy is not running"; return 1; }
+    run "docker exec 3xui_caddy caddy validate --config /etc/caddy/Caddyfile" || return 1
+    run "docker exec 3xui_caddy caddy reload --config /etc/caddy/Caddyfile" || return 1
+    success "Caddy configuration validated & reloaded"
+}
+
+customize_decoy_site() {
+    require_deployed || return 1
+    local index_file="$INSTALL_DIR/caddy/site/index.html"
+
+    tui_select "Camouflage Decoy Site" "File: $index_file" \
+        "Edit index.html interactively (nano / vi)" \
+        "Upload custom local HTML file" \
+        "Reset to default built-in status page" \
+        "Back"
+    local sel=$?
+    clear_screen
+
+    case "$sel" in
+        0)
+            generate_decoy_site false || return 1
+            run_it "ed=\$(command -v nano || command -v vi || true); if [ -n \"\$ed\" ]; then \"\$ed\" $(quote_sh "$index_file"); else echo 'Neither nano nor vi found on host'; fi"
+            success "Saved $index_file"
+            ;;
+        1)
+            echo ""
+            local src_html
+            read -rp "  Path to local HTML file: " src_html
+            src_html="${src_html/#\~/$HOME}"
+            [[ -f "$src_html" ]] || { error "File not found: $src_html"; return 1; }
+            run "mkdir -p $(quote_sh "$INSTALL_DIR/caddy/site") && chmod 755 $(quote_sh "$INSTALL_DIR/caddy/site")"
+            if $REMOTE; then
+                ssh_copy "$src_html" "$index_file" && run "chmod 644 $(quote_sh "$index_file")"
+            else
+                cp "$src_html" "$index_file" && chmod 644 "$index_file"
+            fi
+            success "Uploaded custom decoy site"
+            ;;
+        2)
+            generate_decoy_site true && success "Decoy page reset to default"
+            ;;
+        3|255) return 0 ;;
+    esac
+}
+
+disable_reverse_proxy() {
+    require_deployed || return 1
+    load_proxy_conf
+
+    confirm "Stop Caddy reverse proxy and revert 3X-UI to direct access (0.0.0.0)?" || { info "Cancelled"; return 0; }
+
+    if is_running; then
+        info "Reverting 3X-UI listen IP & subscription URI overrides..."
+        xui_db_set "webListen" "" || warn "Could not clear webListen"
+        if [[ "$SUB_MODE" != "none" ]]; then
+            xui_db_set "subListen" "" || true
+            xui_db_set "subURI" "" || true
+            xui_db_set "subJsonURI" "" || true
+        fi
+    fi
+
+    info "Removing Caddy service from compose.yaml..."
+    run_q "docker rm -f 3xui_caddy" || true
+    remove_caddy_compose || warn "Could not strip caddy from compose.yaml"
+
+    PROXY_ENABLED=false
+    save_proxy_conf || true
+
+    compose up -d --remove-orphans || true
+    is_running && compose restart 3xui >/dev/null || true
+    invalidate_status
+    success "Reverse proxy disabled; 3X-UI restored to direct access."
+}
+
+manage_reverse_proxy() {
+    require_deployed || return 1
+
+    while true; do
+        load_proxy_conf
+        local proxy_state="${DIM}not configured${NC}"
+        if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]]; then
+            if is_caddy_running; then
+                proxy_state="${GREEN}active${NC} (${PROXY_DOMAIN}:${PROXY_PORT})"
+            else
+                proxy_state="${YELLOW}configured, stopped${NC} (${PROXY_DOMAIN}:${PROXY_PORT})"
+            fi
+        fi
+
+        local header_text="  Proxy Status : ${proxy_state}\n  Sub Mode     : ${SUB_MODE}\n  Config Dir   : $INSTALL_DIR/caddy/"
+
+        local opts=(
+            "Setup / Reconfigure Caddy reverse proxy"
+            "Reverse proxy status & URLs"
+            "Customize decoy site (index.html)"
+            "View Caddy logs (last 100 lines)"
+            "Reload Caddy configuration"
+            "Disable reverse proxy & revert to direct access"
+            "Back"
+        )
+
+        tui_select "Reverse Proxy (Caddy)" "$header_text" "${opts[@]}"
+        local sub=$?
+        clear_screen
+        case "$sub" in
+            0) setup_reverse_proxy ;;
+            1) status_reverse_proxy ;;
+            2) customize_decoy_site ;;
+            3) run "docker logs --tail=100 3xui_caddy 2>/dev/null || echo '  (3xui_caddy not running)'" || true ;;
+            4) reload_reverse_proxy ;;
+            5) disable_reverse_proxy ;;
+            6|255) _SKIP_PAUSE=true; return ;;
+        esac
+        echo ""
+        read -rp "  Press Enter..."
+    done
+}
+
 # ─── Xray, GeoIP/GeoSite, Diagnostics & Network Tuning ──────────────────────
 xray_status() {
     require_deployed || return 1
@@ -2504,6 +3336,10 @@ EOF
         get_panel_info || true
         echo ""
         echo -e "  Panel URL     : ${BOLD}$(format_panel_url "$(get_target_ip)")${NC}"
+        if $PROXY_ENABLED && is_caddy_running; then
+            echo -e "  Reverse Proxy : ${GREEN}Caddy Active${NC} (backend ${PANEL_LISTEN:-127.0.0.1}:${PANEL_PORT})"
+            [[ -n "$PROXY_SUB_URL" ]] && echo -e "  Sub URL       : ${BOLD}${PROXY_SUB_URL}${NC}"
+        fi
         echo -e "  Xray Process  : $(run_q "docker exec 3xui_app sh -c 'pgrep -f xray >/dev/null 2>&1 || pidof xray-linux-amd64 >/dev/null 2>&1'" && echo "${GREEN}running${NC}" || echo "${RED}not detected${NC}")"
         local f2b
         f2b=$(run_out "docker exec 3xui_app fail2ban-client status 3x-ui 2>/dev/null | grep 'Currently banned' | tr -d '\t'" || true)
@@ -2613,11 +3449,22 @@ manage_firewall() {
                     echo ""
                     echo "  Will allow:"
                     echo "    * SSH   : ${SSH_PORT}/tcp"
-                    echo "    * Panel : ${PANEL_PORT}/tcp"
+                    if $PROXY_ENABLED && is_caddy_running; then
+                        echo "    * ACME  : 80/tcp (Caddy)"
+                        echo "    * Proxy : ${PROXY_PORT}/tcp + ${PROXY_PORT}/udp (Caddy HTTPS/HTTP3)"
+                    else
+                        echo "    * Panel : ${PANEL_PORT}/tcp"
+                    fi
                     [[ -n "$xray_ports" ]] && echo "    * Xray  : $(echo "$xray_ports" | tr '\n' ' ')"
                     if confirm "Apply these firewall rules?"; then
                         _fw_open_port "$fw" "$SSH_PORT" "tcp" || true
-                        _fw_open_port "$fw" "$PANEL_PORT" "tcp" || true
+                        if $PROXY_ENABLED && is_caddy_running; then
+                            _fw_open_port "$fw" "80" "tcp" || true
+                            _fw_open_port "$fw" "$PROXY_PORT" "tcp" || true
+                            _fw_open_port "$fw" "$PROXY_PORT" "udp" || true
+                        else
+                            _fw_open_port "$fw" "$PANEL_PORT" "tcp" || true
+                        fi
                         local entry proto addr p
                         while IFS= read -r entry; do
                             [[ -z "$entry" ]] && continue
@@ -2806,6 +3653,8 @@ Commands (omit to launch interactive TUI):
   geo-update [std|ir|ru|all]  Update Xray GeoIP & GeoSite databases
   settings                Open Panel Settings & Security menu
   certs                   Open Certificate Management menu
+  proxy [setup|status|reload|disable]
+                          Manage Caddy reverse proxy (HTTPS + decoy + subs)
   self-install            Install this manager globally as ${BIN_INSTALL_PATH}
   self-update             Update this manager script from GitHub main branch
   help                    Show this help message
@@ -2969,6 +3818,7 @@ main_loop() {
         "Lazydocker UI"
         "--- PANEL & SECURITY ---"
         "Panel settings & security"
+        "Reverse proxy (Caddy)"
         "Manage certificates"
         "Xray status"
         "--- BACKUPS ---"
@@ -3010,6 +3860,7 @@ main_loop() {
             "Logs")                      logs_panel ;;
             "Lazydocker UI")             launch_lazydocker ;;
             "Panel settings & security") manage_panel_settings ;;
+            "Reverse proxy (Caddy)")     manage_reverse_proxy ;;
             "Manage certificates")       manage_certs ;;
             "Xray status")               xray_status ;;
             "Backup & restore")          manage_backups ;;
@@ -3092,7 +3943,7 @@ main() {
             self-update)  self_update; exit $? ;;
         esac
 
-        if [[ "$cli_cmd" == "deploy" || "$cli_cmd" == "settings" || "$cli_cmd" == "certs" ]]; then
+        if [[ "$cli_cmd" == "deploy" || "$cli_cmd" == "settings" || "$cli_cmd" == "certs" || "$cli_cmd" == "proxy" ]]; then
             [[ ! -t 0 && -r /dev/tty ]] && exec < /dev/tty
         fi
 
@@ -3119,6 +3970,16 @@ main() {
             geo-update)   manage_geo_assets "${cli_arg:-std}" ;;
             settings)     INTERACTIVE=true; manage_panel_settings ;;
             certs)        INTERACTIVE=true; manage_certs ;;
+            proxy)
+                case "${cli_arg:-}" in
+                    "")      INTERACTIVE=true; manage_reverse_proxy ;;
+                    setup)   INTERACTIVE=true; setup_reverse_proxy ;;
+                    status)  status_reverse_proxy ;;
+                    reload)  reload_reverse_proxy ;;
+                    disable) disable_reverse_proxy ;;
+                    *)       error "Unknown proxy action: $cli_arg (use: setup|status|reload|disable)"; exit 1 ;;
+                esac
+                ;;
             *)            error "Unknown command: $cli_cmd"; usage; exit 1 ;;
         esac
         exit $?

@@ -55,6 +55,21 @@ Under **Panel settings & security** (`manage.sh settings`), `x-ui setting` queri
 
 ---
 
+## Reverse Proxy (Caddy), Camouflage & Subscription Domain
+
+Under **Reverse proxy (Caddy)** (`manage.sh proxy`), `manage.sh` runs `caddy:2-alpine` (`3xui_caddy`) inside `/opt/3x-ui/compose.yaml` with `network_mode: host`:
+
+- **Loopback Isolation**: Automatically locks 3X-UI's panel (`webListen`) and subscription server (`subListen`) to `127.0.0.1`, clearing direct panel/sub TLS so Caddy terminates HTTPS cleanly.
+- **Camouflage Decoy Site (`/`)**: Requires a non-root `webBasePath` (offers to auto-generate one if currently `/`) and serves `/opt/3x-ui/caddy/site/index.html` on `/` so only `/<webBasePath>*` routes reach 3X-UI. Use **Customize decoy site** to edit, upload a custom HTML page, or reset it.
+- **Custom HTTPS Port (Xray Reality Coexistence)**: Defaults to `443`, or lets you choose a custom port (e.g. `8443`) while disabling Caddy's `TLS-ALPN-01` challenge (`disable_tlsalpn_challenge`) so port `443` stays free for Xray VLESS/Reality (uses HTTP-01 on port `80`, or existing certs under `/opt/3x-ui/cert/<domain>/`).
+- **Subscription Proxy Modes**:
+  1. **Dedicated subscription domain** (e.g., `sub.example.com`): Creates an isolated vhost proxying `/sub/*` and `/json/*` to `127.0.0.1:<subPort>`, serving the decoy site on `/`, and setting `subURI` / `subJsonURI` in 3X-UI's database.
+  2. **Same domain as panel** (e.g., `panel.example.com/sub/` & `/json/`): Proxies subscriptions alongside the panel under the same domain.
+  3. **Disabled**: Proxies only the panel.
+- **Auto-Sync**: Changing panel port or `webBasePath` later in **Panel settings & security** automatically regenerates `Caddyfile` and reloads Caddy.
+
+---
+
 ## Certificate Management
 
 Under **Manage certificates** (`manage.sh certs`):
