@@ -219,6 +219,11 @@ get_ip() {
     printf '%s' "${ip:-127.0.0.1}"
 }
 
+_is_private_ipv4() {
+    local ip="${1-}"
+    [[ "$ip" =~ ^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.) ]]
+}
+
 get_target_ip() {
     if $REMOTE; then
         printf '%s' "$SSH_HOST"
@@ -226,12 +231,12 @@ get_target_ip() {
     fi
     local ip=""
     ip=$(get_ip)
-    if [[ "$ip" == "127.0.0.1" ]] && command -v curl &>/dev/null; then
+    if { [[ -z "$ip" ]] || _is_private_ipv4 "$ip"; } && command -v curl &>/dev/null; then
         local pub
         pub=$(curl -4fsS --max-time 2 https://api.ipify.org 2>/dev/null || true)
         validate_ipv4 "$pub" && ip="$pub"
     fi
-    printf '%s' "$ip"
+    printf '%s' "${ip:-127.0.0.1}"
 }
 
 clear_screen() {
@@ -1125,6 +1130,66 @@ save_proxy_conf() {
 }
 
 # ─── Panel Introspection & Settings ─────────────────────────────────────────
+# Note: inside mhsanaei/3x-ui Docker images, /usr/bin/x-ui is the x-ui.sh shell
+# wrapper (no 'setting' subcommand). Always invoke the Go binary (/app/x-ui).
+_xui_setting_cmd() {
+    local args="" a
+    for a in "$@"; do
+        args+=" $(quote_sh "$a")"
+    done
+    printf 'docker exec 3xui_app sh -c '\''b=/app/x-ui; [ -x "$b" ] || b=/usr/local/x-ui/x-ui; exec "$b" setting "$@"'\'' _%s' "$args"
+}
+
+_normalize_webpath() {
+    local p="${1-}"
+    p=$(printf '%s' "$p" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [[ -z "$p" || "$p" == "/" ]]; then
+        printf '/'
+        return 0
+    fi
+    [[ "$p" != /* ]] && p="/$p"
+    [[ "$p" != */ ]] && p="${p}/"
+    printf '%s' "$p"
+}
+
+_parse_panel_outputs() {
+    local show_out="${1-}" listen_out="${2-}" cert_out="${3-}"
+    local clean_show val
+    clean_show=$(printf '%s\n' "$show_out" | sed -E $'s/\x1B\\[[0-9;]*[mK]//g')
+
+    if [[ -n "$clean_show" ]]; then
+        val=$(printf '%s\n' "$clean_show" | awk -F': *' '/^[[:space:]]*port:/ {print $2; exit}' | tr -d '\r ')
+        validate_port "$val" && PANEL_PORT="$val"
+
+        val=$(printf '%s\n' "$clean_show" | awk -F': *' '/^[[:space:]]*webBasePath:/ {print $2; exit}')
+        if [[ -n "$val" ]]; then
+            PANEL_PATH=$(_normalize_webpath "$val")
+        fi
+
+        val=$(printf '%s\n' "$clean_show" | awk -F': *' '/^[[:space:]]*username:/ {print $2; exit}' | tr -d '\r ')
+        [[ -n "$val" ]] && PANEL_USER="$val"
+
+        val=$(printf '%s\n' "$clean_show" | awk -F': *' '/^[[:space:]]*hasDefaultCredential:/ {print $2; exit}' | tr -d '\r ')
+        [[ -n "$val" ]] && PANEL_HAS_DEFAULT="$val"
+    fi
+
+    if [[ -n "$listen_out" ]]; then
+        val=$(printf '%s\n' "$listen_out" | awk -F': *' '/^[[:space:]]*(listenIP|listen):/ {print $2; exit}' | tr -d '\r ')
+        [[ -n "$val" ]] && PANEL_LISTEN="$val"
+    fi
+
+    local cert_path="" key_path=""
+    if [[ -n "$cert_out" ]]; then
+        cert_path=$(printf '%s\n' "$cert_out" | awk -F': *' '/^[[:space:]]*cert:/ {print $2; exit}' | tr -d '\r ')
+        key_path=$(printf '%s\n' "$cert_out"  | awk -F': *' '/^[[:space:]]*key:/  {print $2; exit}' | tr -d '\r ')
+    fi
+    if [[ -n "$cert_path" && -n "$key_path" && "$cert_path" != "none" && "$cert_path" != "<nil>" ]]; then
+        PANEL_PROTO="https"
+    elif printf '%s\n' "$clean_show" | grep -q 'Panel is secure with SSL'; then
+        PANEL_PROTO="https"
+    fi
+}
+
 get_panel_info() {
     PANEL_PORT="2053"
     PANEL_PATH="/"
@@ -1137,37 +1202,23 @@ get_panel_info() {
 
     is_running || return 1
     local out cert_out listen_out
-    out=$(run_out "docker exec 3xui_app x-ui setting -show=true" || true)
-    if [[ -n "$out" ]]; then
-        local val
-        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*port:/ {print $2; exit}' | tr -d '\r')
-        validate_port "$val" && PANEL_PORT="$val"
+    out=$(run_out "$(_xui_setting_cmd -show=true)" || true)
+    listen_out=$(run_out "$(_xui_setting_cmd -getListen=true)" || true)
+    cert_out=$(run_out "$(_xui_setting_cmd -getCert=true)" || true)
 
-        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*webBasePath:/ {print $2; exit}' | tr -d '\r')
-        if [[ -n "$val" ]]; then
-            [[ "$val" != /* ]] && val="/$val"
-            PANEL_PATH="$val"
-        fi
+    _parse_panel_outputs "$out" "$listen_out" "$cert_out"
 
-        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*username:/ {print $2; exit}' | tr -d '\r')
-        [[ -n "$val" ]] && PANEL_USER="$val"
-
-        val=$(printf '%s\n' "$out" | awk -F': *' '/^[[:space:]]*hasDefaultCredential:/ {print $2; exit}' | tr -d '\r')
-        PANEL_HAS_DEFAULT="$val"
-    fi
-
-    listen_out=$(run_out "docker exec 3xui_app x-ui setting -getListen=true" || true)
-    if [[ -n "$listen_out" ]]; then
-        PANEL_LISTEN=$(printf '%s\n' "$listen_out" | awk -F': *' '/(listen|IP)/ {print $2; exit}' | tr -d '\r ')
-    fi
-
-    cert_out=$(run_out "docker exec 3xui_app x-ui setting -getCert=true" || true)
-    if [[ -n "$cert_out" ]]; then
-        local cert_line
-        cert_line=$(printf '%s\n' "$cert_out" | awk -F': *' '/(cert|webCertFile)/ {print $2; exit}' | tr -d '\r ')
-        if [[ -n "$cert_line" && "$cert_line" != "none" && "$cert_line" != "<nil>" ]]; then
-            PANEL_PROTO="https"
-        fi
+    # Read-only DB fallback if /app/x-ui output was unavailable or incomplete.
+    if [[ -z "$out" ]]; then
+        local db_port db_path db_cert db_listen
+        db_port=$(xui_db_get "webPort" | tr -d '\r ' || true)
+        validate_port "$db_port" && PANEL_PORT="$db_port"
+        db_path=$(xui_db_get "webBasePath" || true)
+        [[ -n "$db_path" ]] && PANEL_PATH=$(_normalize_webpath "$db_path")
+        db_cert=$(xui_db_get "webCertFile" | tr -d '\r ' || true)
+        [[ -n "$db_cert" ]] && PANEL_PROTO="https"
+        db_listen=$(xui_db_get "webListen" | tr -d '\r ' || true)
+        [[ -n "$db_listen" ]] && PANEL_LISTEN="$db_listen"
     fi
 
     if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]] && [[ "$SUB_MODE" != "none" ]]; then
@@ -1180,8 +1231,8 @@ get_panel_info() {
 
 format_panel_url() {
     local ip="$1"
-    local path="$PANEL_PATH"
-    [[ "$path" != /* ]] && path="/$path"
+    local path
+    path=$(_normalize_webpath "$PANEL_PATH")
     if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]] && is_caddy_running; then
         local port_sfx=""
         [[ "$PROXY_PORT" != "443" ]] && port_sfx=":${PROXY_PORT}"
@@ -1215,7 +1266,7 @@ reset_credentials() {
     fi
 
     run_masked "Update credentials" \
-        "docker exec 3xui_app x-ui setting -username $(quote_sh "$new_user") -password $(quote_sh "$new_pass")" \
+        "$(_xui_setting_cmd -username "$new_user" -password "$new_pass")" \
         || return 1
     success "Credentials updated (username: $new_user)"
     $auto_pass && echo -e "  Generated password: ${BOLD}${YELLOW}${new_pass}${NC}  (save this now!)"
@@ -1250,7 +1301,7 @@ change_panel_port() {
         error "Invalid port: $new_port"
         return 1
     fi
-    run "docker exec 3xui_app x-ui setting -port $(quote_sh "$new_port")" || return 1
+    run "$(_xui_setting_cmd -port "$new_port")" || return 1
     success "Panel port updated to $new_port (restart required to take effect)"
     if confirm "Restart panel now?"; then
         restart_panel || true
@@ -1281,7 +1332,7 @@ change_panel_webpath() {
         error "Web Base Path cannot be '/' while Caddy camouflage site is active"
         return 1
     fi
-    run "docker exec 3xui_app x-ui setting -webBasePath $(quote_sh "$new_path")" || return 1
+    run "$(_xui_setting_cmd -webBasePath "$new_path")" || return 1
     success "Web Base Path set to ${BOLD}${new_path}${NC}"
     if confirm "Restart panel now?"; then
         restart_panel || true
@@ -1294,7 +1345,7 @@ change_panel_webpath() {
 reset_panel_2fa() {
     require_running || return 1
     confirm "Disable / reset Two-Factor Authentication (2FA) for admin?" || return 0
-    run "docker exec 3xui_app x-ui setting -resetTwoFactor=true" || return 1
+    run "$(_xui_setting_cmd -resetTwoFactor=true)" || return 1
     success "Two-Factor Authentication reset"
     confirm "Restart panel now?" && restart_panel || true
 }
@@ -1310,7 +1361,7 @@ manage_panel_settings() {
         local url
         url=$(format_panel_url "$ip")
 
-        local header_text="  Panel URL : ${BOLD}${url}${NC}\n  Username  : ${BOLD}${PANEL_USER}${NC}"
+        local header_text="  Panel URL : ${BOLD}${url}${NC}\n  Port/Path : ${PANEL_PORT}  ${PANEL_PATH}\n  Listen IP : ${PANEL_LISTEN:-0.0.0.0}"
         if [[ "$PANEL_HAS_DEFAULT" == "true" ]]; then
             header_text+="\n  ${YELLOW}! Default credentials detected — change them!${NC}"
         fi
@@ -1330,9 +1381,11 @@ manage_panel_settings() {
         case "$sub" in
             0)
                 echo ""
-                run_it "docker exec 3xui_app x-ui setting -show=true"
+                run_it "$(_xui_setting_cmd -show=true)"
                 echo ""
-                run_it "docker exec 3xui_app x-ui setting -getCert=true"
+                run_it "$(_xui_setting_cmd -getListen=true)"
+                echo ""
+                run_it "$(_xui_setting_cmd -getCert=true)"
                 echo ""
                 echo -e "  Effective URL: ${BOLD}${url}${NC}"
                 ;;
@@ -1532,8 +1585,8 @@ apply_version() {
 # ─── Deployment & Lifecycle Actions ─────────────────────────────────────────
 post_deploy_harden() {
     local wait_ok=false i
-    for (( i=0; i<10; i++ )); do
-        if run_q "docker exec 3xui_app x-ui setting -show=true"; then
+    for (( i=0; i<15; i++ )); do
+        if run_q "$(_xui_setting_cmd -show=true)"; then
             wait_ok=true
             break
         fi
@@ -1576,12 +1629,15 @@ post_deploy_harden() {
     fi
 
     run_masked "Apply hardening settings" \
-        "docker exec 3xui_app x-ui setting -port $(quote_sh "$h_port") -webBasePath $(quote_sh "$h_path") -username $(quote_sh "$h_user") -password $(quote_sh "$h_pass")" \
+        "$(_xui_setting_cmd -port "$h_port" -webBasePath "$h_path" -username "$h_user" -password "$h_pass")" \
         || { warn "Could not apply settings automatically"; return 0; }
 
     info "Restarting container to apply hardened settings..."
-    compose restart >/dev/null || true
-    sleep 1
+    compose restart 3xui >/dev/null || compose restart >/dev/null || true
+    for (( i=0; i<10; i++ )); do
+        run_q "$(_xui_setting_cmd -show=true)" && break
+        sleep 1
+    done
 
     echo ""
     success "Panel hardened!"
@@ -1666,6 +1722,10 @@ deploy() {
     echo -e "  Database  : ${BOLD}$db_type${NC}"
     $pg_auto && echo -e "  PG Pass   : ${BOLD}${YELLOW}$pg_pass${NC}  (also stored in $INSTALL_DIR/.env)"
     echo -e "  Panel URL : ${BOLD}$url${NC}"
+    if $PROXY_ENABLED && is_caddy_running; then
+        echo -e "  Backend   : ${PANEL_LISTEN:-127.0.0.1}:${PANEL_PORT}${PANEL_PATH}"
+        [[ -n "$PROXY_SUB_URL" ]] && echo -e "  Subs URL  : ${BOLD}${PROXY_SUB_URL}${NC}"
+    fi
     if [[ "$PANEL_HAS_DEFAULT" == "true" ]]; then
         echo -e "  ${YELLOW}Credentials: admin / admin (change immediately!)${NC}"
     fi
@@ -1769,8 +1829,10 @@ status_panel() {
         url=$(format_panel_url "$panel_ip")
         echo -e "  Panel   : ${GREEN}Running${NC} ${ARROW} ${BOLD}${url}${NC}"
         if $PROXY_ENABLED && is_caddy_running; then
-            echo -e "  Proxy   : ${GREEN}Caddy Active${NC} (backend ${PANEL_LISTEN:-127.0.0.1}:${PANEL_PORT})"
+            echo -e "  Proxy   : ${GREEN}Caddy Active${NC} (backend ${PANEL_LISTEN:-127.0.0.1}:${PANEL_PORT}${PANEL_PATH})"
             [[ -n "$PROXY_SUB_URL" ]] && echo -e "  Subs    : ${BOLD}${PROXY_SUB_URL}${NC}"
+        elif [[ -n "$PANEL_LISTEN" ]]; then
+            echo -e "  Listen  : ${PANEL_LISTEN}:${PANEL_PORT}"
         fi
         if [[ "$PANEL_HAS_DEFAULT" == "true" ]]; then
             echo -e "  ${YELLOW}! Default credentials still active — change them in Panel Settings${NC}"
@@ -2361,7 +2423,7 @@ apply_panel_cert() {
     echo -e "  Key : ${BOLD}$key_path${NC}"
     confirm "Configure panel to use these TLS paths?" || return 0
 
-    run "docker exec 3xui_app x-ui setting -webCert $(quote_sh "$cert_path") -webCertKey $(quote_sh "$key_path")" \
+    run "$(_xui_setting_cmd -webCert "$cert_path" -webCertKey "$key_path")" \
         || { error "Failed to set TLS paths"; return 1; }
     success "TLS configured — restart panel to apply."
     confirm "Restart panel now?" && restart_panel || true
@@ -2929,7 +2991,7 @@ setup_reverse_proxy() {
             error "Invalid non-root Web Base Path"
             return 1
         fi
-        run "docker exec 3xui_app x-ui setting -webBasePath $(quote_sh "$new_base")" || return 1
+        run "$(_xui_setting_cmd -webBasePath "$new_base")" || return 1
         panel_path="$new_base"
         success "Panel Web Base Path set to ${BOLD}${panel_path}${NC}"
     fi
@@ -3098,7 +3160,7 @@ setup_reverse_proxy() {
     fi
 
     info "Locking 3X-UI panel to loopback (127.0.0.1)..."
-    run "docker exec 3xui_app x-ui setting -listenIP 127.0.0.1" >/dev/null || true
+    run "$(_xui_setting_cmd -listenIP 127.0.0.1)" >/dev/null || true
     xui_db_set "webListen" "127.0.0.1" || return 1
     xui_db_set "webCertFile" "" || return 1
     xui_db_set "webKeyFile" "" || return 1
@@ -3284,8 +3346,8 @@ xray_status() {
     require_running  || return 1
     echo -e "\n${BOLD}Xray Core Status:${NC}"
 
-    info "Internal panel status (x-ui status)..."
-    run_it "docker exec 3xui_app x-ui status 2>/dev/null || echo 'x-ui status unavailable'"
+    info "Internal panel settings (/app/x-ui setting -show)..."
+    run_it "$(_xui_setting_cmd -show=true) 2>/dev/null || echo 'x-ui CLI unavailable'"
 
     echo -e "\n${DIM}Xray process:${NC}"
     local ps_out
