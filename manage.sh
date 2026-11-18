@@ -1036,9 +1036,9 @@ xui_db_get() {
     else
         local sql="SELECT value FROM settings WHERE key='${key}' LIMIT 1;"
         if is_running && ensure_sqlite_in_container; then
-            run_out "docker exec 3xui_app sqlite3 /etc/x-ui/x-ui.db $(quote_sh "$sql")" || true
+            run_out "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' /etc/x-ui/x-ui.db $(quote_sh "$sql")" || true
         elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
-            run_out "sqlite3 $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")" || true
+            run_out "sqlite3 -cmd '.timeout 5000' $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")" || true
         fi
     fi
 }
@@ -1057,9 +1057,9 @@ xui_db_set() {
     else
         local sql="UPDATE settings SET value='${val_sql}' WHERE key='${key}'; INSERT INTO settings (key, value) SELECT '${key}', '${val_sql}' WHERE (SELECT changes()) = 0;"
         if is_running && ensure_sqlite_in_container; then
-            run "docker exec 3xui_app sqlite3 /etc/x-ui/x-ui.db $(quote_sh "$sql")"
+            run "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' /etc/x-ui/x-ui.db $(quote_sh "$sql")"
         elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
-            run "sqlite3 $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")"
+            run "sqlite3 -cmd '.timeout 5000' $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")"
         else
             error "sqlite3 unavailable to update $INSTALL_DIR/db/x-ui.db"
             return 1
@@ -1115,7 +1115,7 @@ save_proxy_conf() {
         "$PROXY_ENABLED" "$PROXY_DOMAIN" "$PROXY_PORT" "$PROXY_EMAIL" \
         "$SUB_MODE" "$SUB_DOMAIN" "$SUB_PORT" "$SUB_PATH" "$SUB_JSON_PATH")
 
-    run "mkdir -p $(quote_sh "$INSTALL_DIR/caddy") && chmod 700 $(quote_sh "$INSTALL_DIR/caddy")" || return 1
+    run "mkdir -p $(quote_sh "$INSTALL_DIR/caddy") && chmod 755 $(quote_sh "$INSTALL_DIR/caddy")" || return 1
     if $REMOTE; then
         printf '%s' "$conf_body" | ssh_cmd "umask 077 && cat > $(quote_sh "$INSTALL_DIR/caddy/proxy.conf") && chmod 600 $(quote_sh "$INSTALL_DIR/caddy/proxy.conf")"
     else
@@ -1252,8 +1252,12 @@ change_panel_port() {
     fi
     run "docker exec 3xui_app x-ui setting -port $(quote_sh "$new_port")" || return 1
     success "Panel port updated to $new_port (restart required to take effect)"
-    _sync_caddy_if_active "$new_port" "$PANEL_PATH"
-    confirm "Restart panel now?" && restart_panel || true
+    if confirm "Restart panel now?"; then
+        restart_panel || true
+        _sync_caddy_if_active "$new_port" "$PANEL_PATH"
+    elif $PROXY_ENABLED; then
+        warn "Caddy still proxies to port $PANEL_PORT until you restart the panel and run 'Reverse proxy -> Setup/Reconfigure'."
+    fi
 }
 
 change_panel_webpath() {
@@ -1279,8 +1283,12 @@ change_panel_webpath() {
     fi
     run "docker exec 3xui_app x-ui setting -webBasePath $(quote_sh "$new_path")" || return 1
     success "Web Base Path set to ${BOLD}${new_path}${NC}"
-    _sync_caddy_if_active "$PANEL_PORT" "$new_path"
-    confirm "Restart panel now?" && restart_panel || true
+    if confirm "Restart panel now?"; then
+        restart_panel || true
+        _sync_caddy_if_active "$PANEL_PORT" "$new_path"
+    elif $PROXY_ENABLED; then
+        warn "Caddy still routes $PANEL_PATH until you restart the panel and reconfigure Caddy."
+    fi
 }
 
 reset_panel_2fa() {
@@ -2765,9 +2773,20 @@ generate_caddyfile() {
     local sub_no_slash="${sub_path%/}"
     local sub_json_no_slash="${sub_json_path%/}"
 
+    local needs_acme=false
+    [[ "$use_existing_panel_cert" != "true" ]] && needs_acme=true
+    [[ "$sub_mode" == "dedicated" && "$use_existing_sub_cert" != "true" ]] && needs_acme=true
+
+    local global_lines=""
+    if $needs_acme && [[ -n "$acme_email" ]]; then
+        global_lines+="    email ${acme_email}"$'\n'
+    elif ! $needs_acme; then
+        global_lines+="    auto_https disable_redirects"$'\n'
+    fi
+
     local global_opts=""
-    if [[ -n "$acme_email" ]]; then
-        printf -v global_opts '{\n    email %s\n}\n\n' "$acme_email"
+    if [[ -n "$global_lines" ]]; then
+        printf -v global_opts '{\n%s}\n\n' "$global_lines"
     fi
 
     local panel_addr="$panel_domain"
@@ -2936,18 +2955,6 @@ setup_reverse_proxy() {
         confirm "Found existing cert in $INSTALL_DIR/cert/$panel_domain/. Use it instead of Caddy ACME?" && use_existing_panel_cert=true
     fi
 
-    if ! $use_existing_panel_cert; then
-        read -rp "  Email for ACME TLS notices [${PROXY_EMAIL:-blank to skip}]: " acme_email
-        [[ "$acme_email" == "blank to skip" ]] && acme_email=""
-        acme_email="${acme_email:-$PROXY_EMAIL}"
-        if [[ -n "$acme_email" ]] && ! validate_email "$acme_email"; then
-            error "Invalid email address: $acme_email"
-            return 1
-        fi
-    else
-        acme_email=""
-    fi
-
     # 3. Subscription proxy configuration.
     tui_select "Subscription Server Proxy" "How should 3X-UI subscription links be proxied?" \
         "Dedicated subscription domain (e.g. sub.example.com)" \
@@ -3011,6 +3018,22 @@ setup_reverse_proxy() {
         fi
     fi
 
+    local needs_acme=false
+    ! $use_existing_panel_cert && needs_acme=true
+    [[ "$sub_mode" == "dedicated" ]] && ! $use_existing_sub_cert && needs_acme=true
+
+    if $needs_acme; then
+        read -rp "  Email for ACME TLS notices [${PROXY_EMAIL:-blank to skip}]: " acme_email
+        [[ "$acme_email" == "blank to skip" ]] && acme_email=""
+        acme_email="${acme_email:-$PROXY_EMAIL}"
+        if [[ -n "$acme_email" ]] && ! validate_email "$acme_email"; then
+            error "Invalid email address: $acme_email"
+            return 1
+        fi
+    else
+        acme_email=""
+    fi
+
     local port_sfx=""
     [[ "$https_port" != "443" ]] && port_sfx=":${https_port}"
     local ext_panel_url="https://${panel_domain}${port_sfx}${panel_path}"
@@ -3033,23 +3056,19 @@ setup_reverse_proxy() {
     fi
     confirm "Apply reverse proxy configuration?" || { info "Cancelled"; return 0; }
 
-    info "Locking 3X-UI panel to loopback (127.0.0.1)..."
-    run "docker exec 3xui_app x-ui setting -listenIP 127.0.0.1" >/dev/null || true
-    xui_db_set "webListen" "127.0.0.1" || return 1
-    xui_db_set "webCertFile" "" || return 1
-    xui_db_set "webKeyFile" "" || return 1
-
-    if [[ "$sub_mode" != "none" ]]; then
-        info "Configuring 3X-UI subscription server for proxy..."
-        xui_db_set "subEnable" "true" || return 1
-        xui_db_set "subListen" "127.0.0.1" || return 1
-        xui_db_set "subPort" "$sub_port" || return 1
-        xui_db_set "subPath" "$sub_path" || return 1
-        xui_db_set "subJsonPath" "$sub_json_path" || return 1
-        xui_db_set "subCertFile" "" || return 1
-        xui_db_set "subKeyFile" "" || return 1
-        xui_db_set "subURI" "$ext_sub_url" || return 1
-        xui_db_set "subJsonURI" "$ext_sub_json_url" || return 1
+    # Check if HTTPS port (or port 80 for ACME) is already held by another non-Caddy process.
+    local busy_ports=""
+    if ! is_caddy_running; then
+        local check_p
+        for check_p in $https_port $($needs_acme && echo 80); do
+            if run_q "ss -tuln 2>/dev/null | grep -qE ':${check_p}[[:space:]]'"; then
+                busy_ports+=" ${check_p}"
+            fi
+        done
+        if [[ -n "$busy_ports" ]]; then
+            warn "Port(s)${busy_ports} appear to already be listening on this host!"
+            confirm "Continue anyway?" || { info "Cancelled"; return 0; }
+        fi
     fi
 
     PROXY_ENABLED=true
@@ -3070,12 +3089,35 @@ setup_reverse_proxy() {
     save_proxy_conf || return 1
     inject_caddy_compose || return 1
 
-    info "Pulling/starting Caddy and restarting 3X-UI..."
-    compose up -d || { error "Failed to start Caddy container"; return 1; }
-    compose restart 3xui >/dev/null || true
+    info "Pulling and starting Caddy container..."
+    compose up -d || { error "Failed to start Caddy container (3X-UI listenIP not yet changed)"; return 1; }
     if is_caddy_running; then
-        run "docker exec 3xui_caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || true" || true
+        if ! run "docker exec 3xui_caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null && docker exec 3xui_caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null"; then
+            warn "Caddy reload reported an error — check 'View Caddy logs'."
+        fi
     fi
+
+    info "Locking 3X-UI panel to loopback (127.0.0.1)..."
+    run "docker exec 3xui_app x-ui setting -listenIP 127.0.0.1" >/dev/null || true
+    xui_db_set "webListen" "127.0.0.1" || return 1
+    xui_db_set "webCertFile" "" || return 1
+    xui_db_set "webKeyFile" "" || return 1
+
+    if [[ "$sub_mode" != "none" ]]; then
+        info "Configuring 3X-UI subscription server for proxy..."
+        xui_db_set "subEnable" "true" || return 1
+        xui_db_set "subListen" "127.0.0.1" || return 1
+        xui_db_set "subPort" "$sub_port" || return 1
+        xui_db_set "subPath" "$sub_path" || return 1
+        xui_db_set "subJsonPath" "$sub_json_path" || return 1
+        xui_db_set "subCertFile" "" || return 1
+        xui_db_set "subKeyFile" "" || return 1
+        xui_db_set "subURI" "$ext_sub_url" || return 1
+        xui_db_set "subJsonURI" "$ext_sub_json_url" || return 1
+    fi
+
+    info "Restarting 3X-UI to apply loopback & subscription settings..."
+    compose restart 3xui >/dev/null || true
 
     invalidate_status
     echo ""
@@ -3134,8 +3176,12 @@ customize_decoy_site() {
     case "$sel" in
         0)
             generate_decoy_site false || return 1
-            run_it "ed=\$(command -v nano || command -v vi || true); if [ -n \"\$ed\" ]; then \"\$ed\" $(quote_sh "$index_file"); else echo 'Neither nano nor vi found on host'; fi"
-            success "Saved $index_file"
+            if run_q "command -v nano || command -v vi"; then
+                run_it "ed=\$(command -v nano || command -v vi); \"\$ed\" $(quote_sh "$index_file")"
+                success "Edited $index_file"
+            else
+                error "Neither nano nor vi is installed on the target host"
+            fi
             ;;
         1)
             echo ""
@@ -3164,14 +3210,16 @@ disable_reverse_proxy() {
 
     confirm "Stop Caddy reverse proxy and revert 3X-UI to direct access (0.0.0.0)?" || { info "Cancelled"; return 0; }
 
-    if is_running; then
-        info "Reverting 3X-UI listen IP & subscription URI overrides..."
+    info "Reverting 3X-UI listen IP & subscription URI overrides..."
+    if is_running || is_pg_running || run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
         xui_db_set "webListen" "" || warn "Could not clear webListen"
         if [[ "$SUB_MODE" != "none" ]]; then
             xui_db_set "subListen" "" || true
             xui_db_set "subURI" "" || true
             xui_db_set "subJsonURI" "" || true
         fi
+    else
+        warn "Panel/DB unavailable to reset webListen automatically — reset listenIP in Panel settings once started."
     fi
 
     info "Removing Caddy service from compose.yaml..."
