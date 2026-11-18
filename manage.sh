@@ -195,7 +195,8 @@ validate_abs_path() {
 
 has_control_chars() {
     local s="${1-}"
-    [[ "$s" == *$'\n'* || "$s" == *$'\r'* || "$s" == *$'\0'* ]]
+    # Note: do NOT match $'\0' directly in bash (expands to empty string and makes *""* match everything).
+    [[ "$s" == *[$'\x01'-$'\x1f'$'\x7f']* ]]
 }
 
 generate_random_string() {
@@ -1251,7 +1252,7 @@ _probe_panel_http() {
         curl_bin="docker exec 3xui_app curl"
     fi
 
-    local curl_cmd="$curl_bin -kfsSL --max-time 4"
+    local curl_cmd="$curl_bin -ksSL --max-time 4"
     [[ -n "$resolve_arg" ]] && curl_cmd+=" --resolve $(quote_sh "$resolve_arg")"
     curl_cmd+=" -w '\n__HTTP_CODE__:%{http_code}' $(quote_sh "$url")"
 
@@ -1330,12 +1331,15 @@ reset_credentials() {
     require_deployed || return 1
     require_running  || return 1
 
+    get_panel_info || true
+    local default_user="${PANEL_USER:-admin}"
+
     echo ""
-    local new_user new_pass auto_pass=false
-    read -rp "  New username [admin]: " new_user
-    new_user="${new_user:-admin}"
-    if has_control_chars "$new_user"; then
-        error "Invalid characters in username"
+    local new_user new_pass new_pass_confirm auto_pass=false
+    read -rp "  New username [${default_user}]: " new_user
+    new_user="${new_user:-$default_user}"
+    if [[ -z "$new_user" || "$new_user" =~ [[:space:]] ]] || has_control_chars "$new_user"; then
+        error "Invalid username (must be non-empty without spaces or control characters)"
         return 1
     fi
 
@@ -1344,16 +1348,37 @@ reset_credentials() {
     if [[ -z "$new_pass" ]]; then
         new_pass=$(generate_random_string 16)
         auto_pass=true
-    elif has_control_chars "$new_pass"; then
-        error "Invalid control characters in password"
+    else
+        if has_control_chars "$new_pass"; then
+            error "Invalid control characters in password"
+            return 1
+        fi
+        read -rs -p "  Confirm new password: " new_pass_confirm
+        echo ""
+        if [[ "$new_pass" != "$new_pass_confirm" ]]; then
+            error "Passwords do not match"
+            return 1
+        fi
+    fi
+
+    local cred_cmd cred_out="" cred_rc=0
+    cred_cmd=$(_xui_setting_cmd "-username=${new_user}" "-password=${new_pass}")
+    if $REMOTE; then
+        cred_out=$(ssh_cmd "$cred_cmd" 2>&1) || cred_rc=$?
+    else
+        cred_out=$(bash -c "$cred_cmd" 2>&1) || cred_rc=$?
+    fi
+
+    if (( cred_rc != 0 )) || printf '%s' "$cred_out" | grep -qiE '(failed|error)'; then
+        error "Update credentials failed"
+        [[ -n "$cred_out" ]] && echo "  $cred_out"
         return 1
     fi
 
-    run_masked "Update credentials" \
-        "$(_xui_setting_cmd -username "$new_user" -password "$new_pass")" \
-        || return 1
-    success "Credentials updated (username: $new_user)"
+    get_panel_info || true
+    success "Credentials updated (username: ${PANEL_USER:-$new_user})"
     $auto_pass && echo -e "  Generated password: ${BOLD}${YELLOW}${new_pass}${NC}  (save this now!)"
+    confirm "Restart panel now to apply & refresh active sessions?" && restart_panel || true
 }
 
 _sync_caddy_if_active() {
@@ -1445,7 +1470,7 @@ manage_panel_settings() {
         local url
         url=$(format_panel_url "$ip")
 
-        local header_text="  Panel URL : ${BOLD}${url}${NC}\n  Port/Path : ${PANEL_PORT}  ${PANEL_PATH}\n  Listen IP : ${PANEL_LISTEN:-0.0.0.0}"
+        local header_text="  Panel URL : ${BOLD}${url}${NC}\n  Username  : ${BOLD}${PANEL_USER:-admin}${NC}\n  Port/Path : ${PANEL_PORT}  ${PANEL_PATH}\n  Listen IP : ${PANEL_LISTEN:-0.0.0.0}"
         if [[ "$PANEL_HAS_DEFAULT" == "true" ]]; then
             header_text+="\n  ${YELLOW}! Default credentials detected — change them!${NC}"
         fi
@@ -1713,7 +1738,7 @@ post_deploy_harden() {
     fi
 
     run_masked "Apply hardening settings" \
-        "$(_xui_setting_cmd -port "$h_port" -webBasePath "$h_path" -username "$h_user" -password "$h_pass")" \
+        "$(_xui_setting_cmd "-port=${h_port}" "-webBasePath=${h_path}" "-username=${h_user}" "-password=${h_pass}")" \
         || { warn "Could not apply settings automatically"; return 0; }
 
     info "Restarting container to apply hardened settings..."
@@ -3376,8 +3401,8 @@ setup_reverse_proxy() {
     if [[ -n "$inbounds_list" ]]; then
         local i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw
         while IFS='|' read -r i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw; do
-            [[ "$i_en" == "1" || "$i_en" == "true" ]] || continue
-            [[ "$i_listen" == "127.0.0.1" || "$i_listen" == "::1" || "$i_listen" == "localhost" ]] && continue
+            _is_inbound_enabled "$i_en" || continue
+            _is_loopback_addr "${i_listen:-}" && continue
             if [[ "$i_port" == "$https_port" ]] || ( $needs_acme && [[ "$i_port" == "80" ]] ); then
                 inbound_conflicts+="\n    * Inbound #${i_id} (${i_rem:-unnamed}, ${i_proto}/${i_net}) on port ${i_port}"
             fi
@@ -3963,23 +3988,22 @@ sync_inbound_firewall() {
 
 manage_inbounds() {
     while true; do
-        echo ""
-        echo -e "${BOLD}── Inbounds & Multi-Protocol Routing ──${NC}"
-        echo "  1) List all inbounds & live socket status"
-        echo "  2) Verify inbound listeners, conflicts & proxy paths"
-        echo "  3) Sync loopback inbounds (WS/gRPC/XHTTP/HTTPUpgrade) to Caddy"
-        echo "  4) Sync firewall rules for active public inbounds (TCP/UDP)"
-        echo "  0) Back"
-        echo ""
-        local choice=""
-        read -rp "  Select [0-4]: " choice
-        case "$choice" in
-            1) list_inbounds_report ;;
-            2) verify_inbounds_listeners || true ;;
-            3) sync_inbounds_caddy || true ;;
-            4) sync_inbound_firewall ;;
-            0|q|Q|"") _SKIP_PAUSE=true; return ;;
-            *) warn "Invalid selection" ;;
+        local opts=(
+            "List all inbounds & live socket status"
+            "Verify inbound listeners, conflicts & proxy paths"
+            "Sync loopback inbounds (WS/gRPC/XHTTP/HTTPUpgrade) to Caddy"
+            "Sync firewall rules for active public inbounds (TCP/UDP)"
+            "Back"
+        )
+        tui_select "Inbounds & Protocol Routing" "  Inspect SQLite/Postgres inbounds, verify sockets & sync Caddy/firewall" "${opts[@]}"
+        local sub=$?
+        clear_screen
+        case "$sub" in
+            0) list_inbounds_report ;;
+            1) verify_inbounds_listeners || true ;;
+            2) sync_inbounds_caddy || true ;;
+            3) sync_inbound_firewall ;;
+            4|255) _SKIP_PAUSE=true; return ;;
         esac
         echo ""
         read -rp "  Press Enter..."
