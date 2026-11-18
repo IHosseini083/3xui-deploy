@@ -66,7 +66,18 @@ Under **Reverse proxy (Caddy)** (`manage.sh proxy`), `manage.sh` runs `caddy:2-a
   1. **Dedicated subscription domain** (e.g., `sub.example.com`): Creates an isolated vhost proxying `/sub/*` and `/json/*` to `127.0.0.1:<subPort>`, serving the decoy site on `/`, and setting `subURI` / `subJsonURI` in 3X-UI's database.
   2. **Same domain as panel** (e.g., `panel.example.com/sub/` & `/json/`): Proxies subscriptions alongside the panel under the same domain.
   3. **Disabled**: Proxies only the panel.
-- **Auto-Sync**: Changing panel port or `webBasePath` later in **Panel settings & security** automatically regenerates `Caddyfile` and reloads Caddy.
+- **Auto-Sync & Web UI Load Verification**: Changing panel port or `webBasePath` later in **Panel settings & security** automatically regenerates `Caddyfile` and reloads Caddy. `deploy`, `start`, `restart`, `status`, `health`, and `proxy setup` also probe the panel login page (and Caddy HTTPS route when enabled) to confirm HTTP `200` and 3X-UI UI HTML markers rather than serving the decoy page.
+
+---
+
+## Inbounds & Multi-Protocol Routing
+
+Under **Inbounds & protocol routing** (`manage.sh inbounds`), `manage.sh` inspects the 3X-UI SQLite or PostgreSQL `inbounds` table directly alongside host listening sockets (`ss -tulnp`):
+
+- **Inspect inbounds (`inbounds list`)**: Displays each inbound's ID, enabled state, protocol (`vless`, `vmess`, `trojan`, `shadowsocks`, `hysteria2`, `wireguard`, `tuic`, `dokodemo-door`, etc.), bind address, port, transport/security (`tcp`, `ws`, `grpc`, `httpupgrade`, `xhttp`, `kcp`, `tls`, `reality`), firewall layer (`tcp`/`udp`/`both`), live kernel socket status, and Caddy/direct route.
+- **Verify listeners & conflicts (`inbounds verify`)**: Detects duplicate inbound ports, collisions between public inbounds and Caddy (`PROXY_PORT` / TCP `80`) or direct `PANEL_PORT`, empty or colliding Caddy paths, and missing live TCP/UDP sockets.
+- **Sync loopback transports to Caddy (`inbounds sync-proxy`)**: Any enabled inbound bound to loopback (`127.0.0.1` / `::1`) using `ws`, `httpupgrade`, `xhttp`, `splithttp`, or `grpc` with a unique non-root path/serviceName is automatically added to `Caddyfile` (using `h2c://` upstream transport for `grpc`) and reloaded without exposing its backend port publicly.
+- **Sync TCP/UDP firewall rules (`inbounds sync-fw`)**: Automatically opens exact `tcp`, `udp` (`wireguard`, `hysteria`/`hysteria2`, `tuic`, `kcp`/`quic`), or `tcp+udp` (`shadowsocks`, `dokodemo-door`, `mixed`, `socks`) rules in `ufw`/`firewalld` for enabled public inbounds while skipping internal loopback inbounds fronted by Caddy.
 
 ---
 

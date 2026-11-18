@@ -46,6 +46,7 @@ PANEL_USER="admin"
 PANEL_PROTO="http"
 PANEL_LISTEN=""
 PANEL_HAS_DEFAULT=""
+PANEL_LOAD_STATUS=""
 
 PROXY_ENABLED=false
 PROXY_DOMAIN=""
@@ -1242,6 +1243,89 @@ format_panel_url() {
     printf '%s://%s:%s%s' "$PANEL_PROTO" "$ip" "$PANEL_PORT" "$path"
 }
 
+_probe_panel_http() {
+    local url="$1"
+    local resolve_arg="${2:-}"
+    local curl_bin="curl"
+    if ! run_q "command -v curl" && is_running; then
+        curl_bin="docker exec 3xui_app curl"
+    fi
+
+    local curl_cmd="$curl_bin -kfsSL --max-time 4"
+    [[ -n "$resolve_arg" ]] && curl_cmd+=" --resolve $(quote_sh "$resolve_arg")"
+    curl_cmd+=" -w '\n__HTTP_CODE__:%{http_code}' $(quote_sh "$url")"
+
+    local resp code body
+    resp=$(run_out "$curl_cmd" || true)
+    code=$(printf '%s\n' "$resp" | awk -F: '/^__HTTP_CODE__:/ {print $2; exit}' | tr -d '\r ')
+    body=$(printf '%s\n' "$resp" | sed '/^__HTTP_CODE__:/d')
+
+    if [[ "$code" == "200" ]] && printf '%s' "$body" | grep -qiE '(<html|id="app"|3x-ui|assets/)'; then
+        if ! printf '%s' "$body" | grep -q 'Edge Relay Node'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+verify_panel_loaded() {
+    local max_wait="${1:-12}"
+    PANEL_LOAD_STATUS="unknown"
+
+    is_running || { PANEL_LOAD_STATUS="stopped"; return 1; }
+    get_panel_info || true
+
+    local bind_host="127.0.0.1"
+    if [[ -n "$PANEL_LISTEN" && "$PANEL_LISTEN" != "0.0.0.0" && "$PANEL_LISTEN" != "::" ]]; then
+        bind_host="$PANEL_LISTEN"
+    fi
+    local path
+    path=$(_normalize_webpath "$PANEL_PATH")
+    local backend_url="${PANEL_PROTO}://${bind_host}:${PANEL_PORT}${path}"
+
+    local backend_ok=false i
+    local attempts=$(( max_wait > 0 ? max_wait : 1 ))
+    for (( i=0; i<attempts; i++ )); do
+        if _probe_panel_http "$backend_url"; then
+            backend_ok=true
+            break
+        fi
+        (( i + 1 < attempts )) && sleep 1 || true
+    done
+
+    if ! $backend_ok; then
+        PANEL_LOAD_STATUS="backend_unreachable"
+        warn "Panel did not respond with 3X-UI UI at ${backend_url}"
+        return 1
+    fi
+
+    if $PROXY_ENABLED && is_caddy_running && [[ -n "$PROXY_DOMAIN" ]]; then
+        local proxy_url="https://${PROXY_DOMAIN}:${PROXY_PORT}${path}"
+        local resolve_entry="${PROXY_DOMAIN}:${PROXY_PORT}:127.0.0.1"
+        local proxy_ok=false
+        local proxy_attempts=$(( max_wait > 0 ? 4 : 1 ))
+        for (( i=0; i<proxy_attempts; i++ )); do
+            if _probe_panel_http "$proxy_url" "$resolve_entry"; then
+                proxy_ok=true
+                break
+            fi
+            (( i + 1 < proxy_attempts )) && sleep 1 || true
+        done
+        if ! $proxy_ok; then
+            PANEL_LOAD_STATUS="proxy_failed"
+            warn "Backend responds on ${backend_url}, but Caddy proxy probe failed for ${proxy_url}"
+            return 1
+        fi
+        PANEL_LOAD_STATUS="loaded_proxy"
+        success "Panel verified live through Caddy proxy (${proxy_url})"
+        return 0
+    fi
+
+    PANEL_LOAD_STATUS="loaded_direct"
+    success "Panel verified live at ${backend_url}"
+    return 0
+}
+
 reset_credentials() {
     require_deployed || return 1
     require_running  || return 1
@@ -1710,6 +1794,7 @@ deploy() {
     fi
 
     get_panel_info || true
+    verify_panel_loaded 12 || true
     local panel_ip url
     panel_ip=$(get_target_ip)
     url=$(format_panel_url "$panel_ip")
@@ -1805,9 +1890,21 @@ remove_panel() {
     esac
 }
 
-start_panel()   { require_deployed || return 1; compose up -d   || return 1; invalidate_status; success "Started"; }
+start_panel() {
+    require_deployed || return 1
+    compose up -d || return 1
+    invalidate_status
+    success "Started"
+    verify_panel_loaded 10 || true
+}
 stop_panel()    { require_deployed || return 1; compose stop    || return 1; invalidate_status; success "Stopped"; }
-restart_panel() { require_deployed || return 1; compose restart || return 1; invalidate_status; success "Restarted"; }
+restart_panel() {
+    require_deployed || return 1
+    compose restart || return 1
+    invalidate_status
+    success "Restarted"
+    verify_panel_loaded 10 || true
+}
 
 status_panel() {
     echo ""
@@ -1833,6 +1930,11 @@ status_panel() {
             [[ -n "$PROXY_SUB_URL" ]] && echo -e "  Subs    : ${BOLD}${PROXY_SUB_URL}${NC}"
         elif [[ -n "$PANEL_LISTEN" ]]; then
             echo -e "  Listen  : ${PANEL_LISTEN}:${PANEL_PORT}"
+        fi
+        if verify_panel_loaded 2 >/dev/null 2>&1; then
+            echo -e "  Web UI  : ${GREEN}Reachable & serving 3X-UI${NC}"
+        else
+            echo -e "  Web UI  : ${YELLOW}Not verified ($PANEL_LOAD_STATUS)${NC}"
         fi
         if [[ "$PANEL_HAS_DEFAULT" == "true" ]]; then
             echo -e "  ${YELLOW}! Default credentials still active — change them in Panel Settings${NC}"
@@ -2679,6 +2781,141 @@ manage_certs() {
     done
 }
 
+# ─── Inbound Discovery & Multi-Protocol Routing ─────────────────────────────
+_parse_stream_settings() {
+    local json="${1-}"
+    local flat
+    flat=$(printf '%s' "$json" | tr -d '\n\r\t')
+
+    PARSED_NET=$(printf '%s' "$flat" | sed -nE 's/.*"network"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+    PARSED_SEC=$(printf '%s' "$flat" | sed -nE 's/.*"security"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+    PARSED_NET="${PARSED_NET:-tcp}"
+    PARSED_SEC="${PARSED_SEC:-none}"
+    PARSED_PATH=""
+
+    local p=""
+    case "$PARSED_NET" in
+        grpc)
+            p=$(printf '%s' "$flat" | sed -nE 's/.*"serviceName"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+            if [[ -n "$p" ]]; then
+                [[ "$p" != /* ]] && p="/$p"
+                PARSED_PATH="$p"
+            fi
+            ;;
+        ws|httpupgrade|xhttp|splithttp)
+            p=$(printf '%s' "$flat" | sed -nE 's/.*"path"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')
+            p="${p%%\?*}"
+            if [[ -n "$p" ]]; then
+                [[ "$p" != /* ]] && p="/$p"
+                PARSED_PATH="$p"
+            fi
+            ;;
+    esac
+}
+
+_inbound_fw_proto() {
+    local proto="${1-}" net="${2-tcp}"
+    case "$proto" in
+        wireguard|hysteria|hysteria2|tuic)
+            printf 'udp' ;;
+        shadowsocks|dokodemo-door|mixed|socks)
+            printf 'both' ;;
+        *)
+            case "$net" in
+                kcp|mkcp|quic) printf 'udp' ;;
+                *)             printf 'tcp' ;;
+            esac
+            ;;
+    esac
+}
+
+_is_inbound_enabled() {
+    local en="${1:-}"
+    [[ "$en" == "1" || "$en" == "true" || "$en" == "t" ]]
+}
+
+_format_inbound_rows() {
+    local raw_rows="${1-}"
+    [[ -z "$raw_rows" ]] && return 0
+    local line id en proto listen port remark stream fw_proto
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        line="${line//$'\t'/$'\x1f'}"
+        IFS=$'\x1f' read -r id en proto listen port remark stream <<< "$line"
+        [[ -z "$id" ]] && continue
+        validate_port "$port" || continue
+        _parse_stream_settings "$stream"
+        fw_proto=$(_inbound_fw_proto "$proto" "$PARSED_NET")
+        remark="${remark//|//}"
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$id" "$en" "$proto" "$listen" "$port" "$remark" \
+            "$PARSED_NET" "$PARSED_SEC" "$PARSED_PATH" "$fw_proto"
+    done <<< "$raw_rows"
+}
+
+get_xui_inbounds() {
+    local raw_rows=""
+    if _is_postgres_backend; then
+        is_pg_running || return 0
+        get_pg_env
+        local sql="SELECT id, enable, protocol, COALESCE(NULLIF(listen,''), '0.0.0.0'), port, regexp_replace(COALESCE(remark,''), E'[\\r\\n\\t]+', ' ', 'g'), regexp_replace(COALESCE(stream_settings,''), E'[\\r\\n\\t]+', ' ', 'g') FROM inbounds ORDER BY id;"
+        raw_rows=$(run_out "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -F \$'\t' -tA -c $(quote_sh "$sql")" || true)
+    else
+        local sql="SELECT id, enable, protocol, COALESCE(NULLIF(listen,''), '0.0.0.0'), port, replace(replace(replace(COALESCE(remark,''), char(10), ' '), char(13), ''), char(9), ' '), replace(replace(replace(COALESCE(stream_settings,''), char(10), ' '), char(13), ''), char(9), ' ') FROM inbounds ORDER BY id;"
+        if is_running && ensure_sqlite_in_container; then
+            raw_rows=$(run_out "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' -separator \$'\t' /etc/x-ui/x-ui.db $(quote_sh "$sql")" || true)
+        elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
+            raw_rows=$(run_out "sqlite3 -cmd '.timeout 5000' -separator \$'\t' $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")" || true)
+        fi
+    fi
+    _format_inbound_rows "$raw_rows"
+}
+
+_collect_caddy_inbound_blocks() {
+    local panel_path="${1:-/}" sub_path="${2:-/sub/}" sub_json_path="${3:-/json/}"
+    local p_base="${panel_path%/}" s_base="${sub_path%/}" j_base="${sub_json_path%/}"
+    local inbounds="${INBOUNDS_OVERRIDE:-}"
+    [[ -z "$inbounds" ]] && inbounds=$(get_xui_inbounds || true)
+    [[ -z "$inbounds" ]] && return 0
+
+    local seen_paths="|${p_base}|${s_base}|${j_base}|"
+    local id en proto listen port remark net sec path fw_proto
+    while IFS='|' read -r id en proto listen port remark net sec path fw_proto; do
+        _is_inbound_enabled "$en" || continue
+        [[ "$listen" == "127.0.0.1" || "$listen" == "::1" || "$listen" == "localhost" ]] || continue
+        [[ "$net" == "ws" || "$net" == "httpupgrade" || "$net" == "xhttp" || "$net" == "splithttp" || "$net" == "grpc" ]] || continue
+        [[ -n "$path" && "$path" != "/" ]] || continue
+        validate_webpath "$path" || continue
+
+        local p_clean="${path%/}"
+        [[ "$seen_paths" == *"|${p_clean}|"* ]] && continue
+        seen_paths+="${p_clean}|"
+
+        local up_target="127.0.0.1:${port}"
+        local match_expr="${p_clean} ${p_clean}/*"
+        if [[ "$net" == "grpc" ]]; then
+            up_target="h2c://127.0.0.1:${port}"
+            match_expr="${p_clean}/*"
+        fi
+
+        cat <<EOF
+
+    # Inbound #${id} (${remark:-$proto/$net})
+    @inbound_${id} {
+        path ${match_expr}
+    }
+    handle @inbound_${id} {
+        reverse_proxy ${up_target} {
+            header_up Host {http.request.hostport}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+EOF
+    done <<< "$inbounds"
+}
+
 # ─── Reverse Proxy (Caddy) ──────────────────────────────────────────────────
 inject_caddy_compose() {
     local cfg="$INSTALL_DIR/compose.yaml"
@@ -2913,13 +3150,17 @@ ${sub_tls}
 
     handle {
         root * /srv/site
-        try_files {path} /index.html
+        @decoy_root path / /index.html
+        rewrite @decoy_root /index.html
         file_server
     }
 }
 EOF
 )
     fi
+
+    local caddy_inbound_blocks=""
+    caddy_inbound_blocks=$(_collect_caddy_inbound_blocks "$panel_path" "$sub_path" "$sub_json_path" || true)
 
     local caddyfile_body
     caddyfile_body=$(cat <<EOF
@@ -2933,18 +3174,28 @@ ${panel_tls}
         X-Content-Type-Options "nosniff"
         X-Frame-Options "SAMEORIGIN"
         Referrer-Policy "strict-origin-when-cross-origin"
-    }
+    }$(
+        if [[ "$base_no_slash" != "/" ]]; then
+            printf '\n\n    redir %s %s/ 308' "$base_no_slash" "$base_no_slash"
+        fi
+    )
 
     @panel {
-        path ${base_no_slash} ${base_no_slash}/*
+        path $( [[ "$base_no_slash" == "/" ]] && printf '*' || printf '%s/*' "$base_no_slash" )
     }
     handle @panel {
-        reverse_proxy 127.0.0.1:${panel_port}
-    }${same_sub_block}
+        reverse_proxy 127.0.0.1:${panel_port} {
+            header_up Host {http.request.hostport}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }${same_sub_block}${caddy_inbound_blocks}
 
     handle {
         root * /srv/site
-        try_files {path} /index.html
+        @decoy_root path / /index.html
+        rewrite @decoy_root /index.html
         file_server
     }
 }${dedicated_sub_block}
@@ -3118,7 +3369,26 @@ setup_reverse_proxy() {
     fi
     confirm "Apply reverse proxy configuration?" || { info "Cancelled"; return 0; }
 
-    # Check if HTTPS port (or port 80 for ACME) is already held by another non-Caddy process.
+    # Check if HTTPS port (or port 80 for ACME) conflicts with public inbounds or host sockets.
+    local inbound_conflicts=""
+    local inbounds_list=""
+    inbounds_list=$(get_xui_inbounds || true)
+    if [[ -n "$inbounds_list" ]]; then
+        local i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw
+        while IFS='|' read -r i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw; do
+            [[ "$i_en" == "1" || "$i_en" == "true" ]] || continue
+            [[ "$i_listen" == "127.0.0.1" || "$i_listen" == "::1" || "$i_listen" == "localhost" ]] && continue
+            if [[ "$i_port" == "$https_port" ]] || ( $needs_acme && [[ "$i_port" == "80" ]] ); then
+                inbound_conflicts+="\n    * Inbound #${i_id} (${i_rem:-unnamed}, ${i_proto}/${i_net}) on port ${i_port}"
+            fi
+        done <<< "$inbounds_list"
+    fi
+    if [[ -n "$inbound_conflicts" ]]; then
+        warn "Public 3X-UI inbound(s) conflict with Caddy port(s):${inbound_conflicts}"
+        echo "  Tip: Use a custom HTTPS port (e.g. 8443) for Caddy so port 443 remains free for Xray Reality/VLESS."
+        confirm "Continue with Caddy on port ${https_port} anyway?" || { info "Cancelled"; return 0; }
+    fi
+
     local busy_ports=""
     if ! is_caddy_running; then
         local check_p
@@ -3182,6 +3452,7 @@ setup_reverse_proxy() {
     compose restart 3xui >/dev/null || true
 
     invalidate_status
+    verify_panel_loaded 12 || true
     echo ""
     success "Caddy reverse proxy is active!"
     echo -e "  Panel URL : ${BOLD}${ext_panel_url}${NC}"
@@ -3340,6 +3611,381 @@ manage_reverse_proxy() {
     done
 }
 
+# ─── Multi-Protocol Inbounds Discovery, Proxy & Firewall Sync ───────────────
+_is_loopback_addr() {
+    local addr="${1:-}"
+    [[ "$addr" == "127.0.0.1" || "$addr" == "::1" || "$addr" == "[::1]" || "$addr" == "localhost" ]]
+}
+
+list_inbounds_report() {
+    echo ""
+    echo -e "${BOLD}── Xray Inbounds & Protocol Routing ──${NC}"
+    echo ""
+    if ! is_running; then
+        warn "Container is stopped; reading database directly if available."
+    fi
+
+    get_panel_info || true
+    local rows ss_out proxy_active=false
+    rows=$(get_xui_inbounds || true)
+    if [[ -z "$rows" ]]; then
+        info "No inbounds configured in 3x-ui database."
+        echo ""
+        return 0
+    fi
+
+    ss_out=$(run_out "ss -tulnp 2>/dev/null" || true)
+    if $PROXY_ENABLED && is_caddy_running; then
+        proxy_active=true
+    fi
+
+    printf "  %-3s %-4s %-12s %-15s %-6s %-13s %-5s %-11s %-22s %s\n" \
+        "ID" "ON" "Proto" "Listen" "Port" "Net/Sec" "FW" "Live" "Route" "Remark"
+    printf "  %-3s %-4s %-12s %-15s %-6s %-13s %-5s %-11s %-22s %s\n" \
+        "---" "----" "------------" "---------------" "------" "-------------" "-----" "-----------" "----------------------" "------"
+
+    local total=0 enabled=0 loopback_cnt=0
+    local id en proto listen port remark net sec path fw_proto
+    local state_str listen_disp net_sec live_str route_str
+    while IFS='|' read -r id en proto listen port remark net sec path fw_proto; do
+        [[ -z "$id" ]] && continue
+        total=$((total + 1))
+        listen_disp="${listen:-0.0.0.0}"
+        net_sec="${net}/${sec}"
+
+        if _is_inbound_enabled "$en"; then
+            enabled=$((enabled + 1))
+            state_str="${GREEN}ON${NC}  "
+            if [[ -z "$ss_out" ]]; then
+                live_str="unknown"
+            elif [[ "$fw_proto" == "both" ]]; then
+                local has_t=false has_u=false
+                echo "$ss_out" | grep -qE "^tcp[[:space:]].*:${port}([^0-9]|$)" && has_t=true
+                echo "$ss_out" | grep -qE "^udp[[:space:]].*:${port}([^0-9]|$)" && has_u=true
+                if $has_t && $has_u; then
+                    live_str="${GREEN}LISTEN(T+U)${NC}"
+                elif $has_t; then
+                    live_str="${YELLOW}TCP-ONLY${NC}   "
+                elif $has_u; then
+                    live_str="${YELLOW}UDP-ONLY${NC}   "
+                else
+                    live_str="${RED}DOWN${NC}       "
+                fi
+            elif echo "$ss_out" | grep -qE "^${fw_proto}[[:space:]].*:${port}([^0-9]|$)"; then
+                live_str="${GREEN}LISTEN${NC}     "
+            else
+                live_str="${RED}DOWN${NC}       "
+            fi
+        else
+            state_str="${DIM}OFF${NC} "
+            live_str="${DIM}disabled${NC}   "
+        fi
+
+        if _is_loopback_addr "$listen_disp"; then
+            loopback_cnt=$((loopback_cnt + 1))
+            case "$net" in
+                ws|httpupgrade|xhttp|splithttp|grpc)
+                    if $proxy_active; then
+                        route_str="caddy:${path:-(no-path)}"
+                    else
+                        route_str="loopback:${path:-(no-path)}"
+                    fi
+                    ;;
+                *)
+                    route_str="loopback(${net})"
+                    ;;
+            esac
+        else
+            route_str="direct${path:+:${path}}"
+        fi
+
+        printf "  %-3s " "$id"
+        echo -ne "$state_str"
+        printf " %-12s %-15s %-6s %-13s %-5s " \
+            "${proto:0:12}" "${listen_disp:0:15}" "$port" "${net_sec:0:13}" "$fw_proto"
+        echo -ne "$live_str"
+        printf " %-22s %s\n" "${route_str:0:22}" "${remark:-}"
+    done <<< "$rows"
+
+    echo ""
+    info "Summary: ${enabled}/${total} enabled (${loopback_cnt} loopback)."
+    echo ""
+}
+
+verify_inbounds_listeners() {
+    echo ""
+    echo -e "${BOLD}── Inbound Listener & Conflict Verification ──${NC}"
+    echo ""
+
+    get_panel_info || true
+    local rows ss_out proxy_active=false
+    rows=$(get_xui_inbounds || true)
+    if [[ -z "$rows" ]]; then
+        info "No inbounds configured in 3x-ui database."
+        return 0
+    fi
+
+    ss_out=$(run_out "ss -tulnp 2>/dev/null" || true)
+    if $PROXY_ENABLED && is_caddy_running; then
+        proxy_active=true
+    fi
+
+    local issues=0 warnings=0 checked=0
+    local seen_tcp=" " seen_udp=" " seen_paths=" "
+    local id en proto listen port remark net sec path fw_proto listen_disp
+
+    while IFS='|' read -r id en proto listen port remark net sec path fw_proto; do
+        [[ -z "$id" ]] && continue
+        _is_inbound_enabled "$en" || continue
+        checked=$((checked + 1))
+        listen_disp="${listen:-0.0.0.0}"
+
+        # Duplicate enabled port+protocol check
+        if [[ "$fw_proto" == "tcp" || "$fw_proto" == "both" ]]; then
+            if [[ "$seen_tcp" == *" ${port} "* ]]; then
+                error "Inbound #${id} (${remark:-$proto}): duplicate TCP listener on port ${port}"
+                issues=$((issues + 1))
+            fi
+            seen_tcp="${seen_tcp}${port} "
+        fi
+        if [[ "$fw_proto" == "udp" || "$fw_proto" == "both" ]]; then
+            if [[ "$seen_udp" == *" ${port} "* ]]; then
+                error "Inbound #${id} (${remark:-$proto}): duplicate UDP listener on port ${port}"
+                issues=$((issues + 1))
+            fi
+            seen_udp="${seen_udp}${port} "
+        fi
+
+        # Conflict check against Panel / Caddy ports for non-loopback inbounds
+        if ! _is_loopback_addr "$listen_disp"; then
+            if $proxy_active; then
+                if [[ "$port" == "$PROXY_PORT" ]]; then
+                    error "Inbound #${id} (${remark:-$proto}): port ${port}/${fw_proto} conflicts with Caddy HTTPS/HTTP3 port ${PROXY_PORT}"
+                    issues=$((issues + 1))
+                elif [[ "$port" == "80" && "$fw_proto" != "udp" ]]; then
+                    error "Inbound #${id} (${remark:-$proto}): TCP port 80 conflicts with Caddy ACME HTTP-01 listener"
+                    issues=$((issues + 1))
+                fi
+            elif [[ -n "$PANEL_PORT" && "$port" == "$PANEL_PORT" && "$fw_proto" != "udp" ]]; then
+                error "Inbound #${id} (${remark:-$proto}): TCP port ${port} conflicts with 3X-UI Panel port"
+                issues=$((issues + 1))
+            fi
+        else
+            case "$net" in
+                ws|httpupgrade|xhttp|splithttp|grpc)
+                    if [[ -z "$path" || "$path" == "/" ]]; then
+                        warn "Inbound #${id} (${remark:-$proto}): loopback ${net} inbound has empty/root path; Caddy cannot isolate it from decoy."
+                        warnings=$((warnings + 1))
+                    else
+                        local norm_p="/${path#/}"
+                        local p_base="${PANEL_PATH%/}"
+                        [[ -n "$p_base" && ( "${norm_p%/}" == "$p_base" || "$norm_p" == "${p_base}/"* ) ]] && {
+                            error "Inbound #${id}: path ${norm_p} overlaps Panel WebPath ${PANEL_PATH}"
+                            issues=$((issues + 1))
+                        }
+                        if [[ "$seen_paths" == *" ${norm_p} "* ]]; then
+                            error "Inbound #${id}: duplicate reverse-proxy path ${norm_p}"
+                            issues=$((issues + 1))
+                        fi
+                        seen_paths="${seen_paths}${norm_p} "
+                    fi
+                    ;;
+                *)
+                    warn "Inbound #${id} (${remark:-$proto}): listens on loopback (${listen_disp}) with transport '${net}' (not Caddy HTTP-proxiable)."
+                    warnings=$((warnings + 1))
+                    ;;
+            esac
+        fi
+
+        # Live socket verification
+        if [[ -z "$ss_out" ]]; then
+            warn "Inbound #${id} (${remark:-$proto}): could not read host sockets via ss."
+            warnings=$((warnings + 1))
+        else
+            if [[ "$fw_proto" == "tcp" || "$fw_proto" == "both" ]]; then
+                if ! echo "$ss_out" | grep -qE "^tcp[[:space:]].*:${port}([^0-9]|$)"; then
+                    error "Inbound #${id} (${remark:-$proto}): missing live TCP socket on port ${port}"
+                    issues=$((issues + 1))
+                fi
+            fi
+            if [[ "$fw_proto" == "udp" || "$fw_proto" == "both" ]]; then
+                if ! echo "$ss_out" | grep -qE "^udp[[:space:]].*:${port}([^0-9]|$)"; then
+                    error "Inbound #${id} (${remark:-$proto}): missing live UDP socket on port ${port}"
+                    issues=$((issues + 1))
+                fi
+            fi
+        fi
+    done <<< "$rows"
+
+    if (( checked == 0 )); then
+        info "All configured inbounds are currently disabled."
+        return 0
+    fi
+
+    echo ""
+    if (( issues == 0 && warnings == 0 )); then
+        success "Verified ${checked} enabled inbound(s): all listeners active and conflict-free."
+    elif (( issues == 0 )); then
+        warn "Verified ${checked} enabled inbound(s): 0 errors, ${warnings} warning(s)."
+    else
+        error "Inbound verification found ${issues} error(s) and ${warnings} warning(s)."
+        return 1
+    fi
+    return 0
+}
+
+sync_inbounds_caddy() {
+    get_panel_info || true
+    if ! $PROXY_ENABLED && ! is_caddy_running; then
+        warn "Caddy reverse proxy is not enabled/running. Run './manage.sh proxy setup' first."
+        return 1
+    fi
+
+    local blocks
+    blocks=$(_collect_caddy_inbound_blocks "${PANEL_PATH:-/}" "${SUB_PATH:-/sub/}" "${SUB_JSON_PATH:-/json/}" || true)
+    local route_count=0
+    if [[ -n "$blocks" ]]; then
+        route_count=$(echo "$blocks" | grep -c "^[[:space:]]*@inbound_" || true)
+    fi
+
+    info "Detected ${route_count} Caddy-routable loopback inbound(s) (ws/httpupgrade/xhttp/grpc)."
+    _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || return 1
+    verify_panel_loaded 3 || true
+}
+
+sync_inbound_firewall() {
+    local fw="${1:-}"
+    if [[ -z "$fw" ]]; then
+        if run_q "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'"; then
+            fw="ufw"
+        elif run_q "command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null"; then
+            fw="firewalld"
+        else
+            fw="none"
+        fi
+    fi
+
+    if [[ "$fw" == "none" ]]; then
+        warn "Neither ufw nor firewalld is currently active."
+        return 0
+    fi
+
+    get_panel_info || true
+    local rows xray_sockets
+    rows=$(get_xui_inbounds || true)
+    xray_sockets=$(run_out "ss -tulnp 2>/dev/null | awk '/xray/ {print \$1\":\"\$5}'" || true)
+
+    local rules_list=()
+    _add_fw_rule() {
+        local candidate="${1}:${2}"
+        local existing
+        for existing in "${rules_list[@]:-}"; do
+            [[ "$existing" == "$candidate" ]] && return 0
+        done
+        rules_list+=("$candidate")
+    }
+
+    local summary_inbounds="" skipped_loopback=0
+    _add_fw_rule "$SSH_PORT" "tcp"
+
+    if $PROXY_ENABLED && is_caddy_running; then
+        _add_fw_rule "80" "tcp"
+        _add_fw_rule "$PROXY_PORT" "tcp"
+        _add_fw_rule "$PROXY_PORT" "udp"
+    elif validate_port "${PANEL_PORT:-}"; then
+        _add_fw_rule "$PANEL_PORT" "tcp"
+    fi
+
+    local id en proto listen port remark net sec path fw_proto
+    while IFS='|' read -r id en proto listen port remark net sec path fw_proto; do
+        [[ -z "$id" ]] && continue
+        _is_inbound_enabled "$en" || continue
+        validate_port "$port" || continue
+        if _is_loopback_addr "${listen:-}"; then
+            skipped_loopback=$((skipped_loopback + 1))
+            continue
+        fi
+        case "$fw_proto" in
+            tcp)  _add_fw_rule "$port" "tcp";  summary_inbounds="${summary_inbounds} ${port}/tcp(${proto})" ;;
+            udp)  _add_fw_rule "$port" "udp";  summary_inbounds="${summary_inbounds} ${port}/udp(${proto})" ;;
+            both)
+                _add_fw_rule "$port" "tcp"
+                _add_fw_rule "$port" "udp"
+                summary_inbounds="${summary_inbounds} ${port}/tcp+udp(${proto})"
+                ;;
+        esac
+    done <<< "$rows"
+
+    local entry s_proto s_addr s_host s_port extra_xray=""
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        s_proto="${entry%%:*}"
+        s_addr="${entry#*:}"
+        s_port="${s_addr##*:}"
+        s_host="${s_addr%:*}"
+        if _is_loopback_addr "$s_host"; then
+            continue
+        fi
+        [[ "$s_proto" == udp* ]] && s_proto="udp" || s_proto="tcp"
+        if validate_port "$s_port"; then
+            local before_cnt="${#rules_list[@]}"
+            _add_fw_rule "$s_port" "$s_proto"
+            if (( ${#rules_list[@]} > before_cnt )); then
+                extra_xray="${extra_xray} ${s_port}/${s_proto}"
+            fi
+        fi
+    done <<< "$xray_sockets"
+
+    echo ""
+    echo "  Will allow via ${fw}:"
+    echo "    * SSH      : ${SSH_PORT}/tcp"
+    if $PROXY_ENABLED && is_caddy_running; then
+        echo "    * ACME     : 80/tcp (Caddy)"
+        echo "    * Proxy    : ${PROXY_PORT}/tcp + ${PROXY_PORT}/udp (Caddy HTTPS/HTTP3)"
+    else
+        echo "    * Panel    : ${PANEL_PORT}/tcp"
+    fi
+    [[ -n "$summary_inbounds" ]] && echo "    * Inbounds :${summary_inbounds}"
+    [[ -n "$extra_xray" ]] && echo "    * Xray live:${extra_xray}"
+    (( skipped_loopback > 0 )) && echo "    * Skipped  : ${skipped_loopback} loopback inbound(s) served via Caddy"
+
+    if confirm "Apply these firewall rules?"; then
+        local r r_port r_proto
+        for r in "${rules_list[@]}"; do
+            r_port="${r%%:*}"
+            r_proto="${r#*:}"
+            _fw_open_port "$fw" "$r_port" "$r_proto" || true
+        done
+        [[ "$fw" == "firewalld" ]] && run "firewall-cmd --reload >/dev/null" || true
+        success "Firewall rules applied"
+    fi
+}
+
+manage_inbounds() {
+    while true; do
+        echo ""
+        echo -e "${BOLD}── Inbounds & Multi-Protocol Routing ──${NC}"
+        echo "  1) List all inbounds & live socket status"
+        echo "  2) Verify inbound listeners, conflicts & proxy paths"
+        echo "  3) Sync loopback inbounds (WS/gRPC/XHTTP/HTTPUpgrade) to Caddy"
+        echo "  4) Sync firewall rules for active public inbounds (TCP/UDP)"
+        echo "  0) Back"
+        echo ""
+        local choice=""
+        read -rp "  Select [0-4]: " choice
+        case "$choice" in
+            1) list_inbounds_report ;;
+            2) verify_inbounds_listeners || true ;;
+            3) sync_inbounds_caddy || true ;;
+            4) sync_inbound_firewall ;;
+            0|q|Q|"") _SKIP_PAUSE=true; return ;;
+            *) warn "Invalid selection" ;;
+        esac
+        echo ""
+        read -rp "  Press Enter..."
+    done
+}
+
 # ─── Xray, GeoIP/GeoSite, Diagnostics & Network Tuning ──────────────────────
 xray_status() {
     require_deployed || return 1
@@ -3446,10 +4092,23 @@ EOF
         get_panel_info || true
         echo ""
         echo -e "  Panel URL     : ${BOLD}$(format_panel_url "$(get_target_ip)")${NC}"
+        if verify_panel_loaded 2 >/dev/null 2>&1; then
+            echo -e "  Web UI Check  : ${GREEN}Loaded (${PANEL_LOAD_STATUS})${NC}"
+        else
+            echo -e "  Web UI Check  : ${RED}Not verified (${PANEL_LOAD_STATUS:-failed})${NC}"
+        fi
         if $PROXY_ENABLED && is_caddy_running; then
             echo -e "  Reverse Proxy : ${GREEN}Caddy Active${NC} (backend ${PANEL_LISTEN:-127.0.0.1}:${PANEL_PORT})"
             [[ -n "$PROXY_SUB_URL" ]] && echo -e "  Sub URL       : ${BOLD}${PROXY_SUB_URL}${NC}"
         fi
+        local ib_rows ib_total=0 ib_enabled=0 ib_id ib_en ib_rest
+        ib_rows=$(get_xui_inbounds || true)
+        while IFS='|' read -r ib_id ib_en ib_rest; do
+            [[ -z "$ib_id" ]] && continue
+            ib_total=$((ib_total + 1))
+            _is_inbound_enabled "$ib_en" && ib_enabled=$((ib_enabled + 1))
+        done <<< "$ib_rows"
+        echo -e "  Inbounds      : ${ib_enabled}/${ib_total} enabled"
         echo -e "  Xray Process  : $(run_q "docker exec 3xui_app sh -c 'pgrep -f xray >/dev/null 2>&1 || pidof xray-linux-amd64 >/dev/null 2>&1'" && echo "${GREEN}running${NC}" || echo "${RED}not detected${NC}")"
         local f2b
         f2b=$(run_out "docker exec 3xui_app fail2ban-client status 3x-ui 2>/dev/null | grep 'Currently banned' | tr -d '\t'" || true)
@@ -3550,44 +4209,7 @@ manage_firewall() {
                 esac
                 ;;
             1)
-                if [[ "$fw" == "none" ]]; then
-                    warn "Neither ufw nor firewalld is currently active."
-                else
-                    get_panel_info || true
-                    local xray_ports
-                    xray_ports=$(run_out "ss -tulnp 2>/dev/null | awk '/xray/ {print \$1\":\"\$5}'" || true)
-                    echo ""
-                    echo "  Will allow:"
-                    echo "    * SSH   : ${SSH_PORT}/tcp"
-                    if $PROXY_ENABLED && is_caddy_running; then
-                        echo "    * ACME  : 80/tcp (Caddy)"
-                        echo "    * Proxy : ${PROXY_PORT}/tcp + ${PROXY_PORT}/udp (Caddy HTTPS/HTTP3)"
-                    else
-                        echo "    * Panel : ${PANEL_PORT}/tcp"
-                    fi
-                    [[ -n "$xray_ports" ]] && echo "    * Xray  : $(echo "$xray_ports" | tr '\n' ' ')"
-                    if confirm "Apply these firewall rules?"; then
-                        _fw_open_port "$fw" "$SSH_PORT" "tcp" || true
-                        if $PROXY_ENABLED && is_caddy_running; then
-                            _fw_open_port "$fw" "80" "tcp" || true
-                            _fw_open_port "$fw" "$PROXY_PORT" "tcp" || true
-                            _fw_open_port "$fw" "$PROXY_PORT" "udp" || true
-                        else
-                            _fw_open_port "$fw" "$PANEL_PORT" "tcp" || true
-                        fi
-                        local entry proto addr p
-                        while IFS= read -r entry; do
-                            [[ -z "$entry" ]] && continue
-                            proto="${entry%%:*}"
-                            addr="${entry#*:}"
-                            p="${addr##*:}"
-                            [[ "$proto" == udp* ]] && proto="udp" || proto="tcp"
-                            validate_port "$p" && _fw_open_port "$fw" "$p" "$proto" || true
-                        done <<< "$xray_ports"
-                        [[ "$fw" == "firewalld" ]] && run "firewall-cmd --reload >/dev/null" || true
-                        success "Firewall rules applied"
-                    fi
-                fi
+                sync_inbound_firewall "$fw"
                 ;;
             2)
                 if [[ "$fw" == "none" ]]; then
@@ -3765,6 +4387,8 @@ Commands (omit to launch interactive TUI):
   certs                   Open Certificate Management menu
   proxy [setup|status|reload|disable]
                           Manage Caddy reverse proxy (HTTPS + decoy + subs)
+  inbounds [list|verify|sync-proxy|sync-fw]
+                          Inspect inbounds, verify sockets & sync Caddy/firewall
   self-install            Install this manager globally as ${BIN_INSTALL_PATH}
   self-update             Update this manager script from GitHub main branch
   help                    Show this help message
@@ -3929,6 +4553,7 @@ main_loop() {
         "--- PANEL & SECURITY ---"
         "Panel settings & security"
         "Reverse proxy (Caddy)"
+        "Inbounds & protocol routing"
         "Manage certificates"
         "Xray status"
         "--- BACKUPS ---"
@@ -3969,10 +4594,11 @@ main_loop() {
             "Health & diagnostics")      health_check ;;
             "Logs")                      logs_panel ;;
             "Lazydocker UI")             launch_lazydocker ;;
-            "Panel settings & security") manage_panel_settings ;;
-            "Reverse proxy (Caddy)")     manage_reverse_proxy ;;
-            "Manage certificates")       manage_certs ;;
-            "Xray status")               xray_status ;;
+            "Panel settings & security")   manage_panel_settings ;;
+            "Reverse proxy (Caddy)")       manage_reverse_proxy ;;
+            "Inbounds & protocol routing") manage_inbounds ;;
+            "Manage certificates")         manage_certs ;;
+            "Xray status")                 xray_status ;;
             "Backup & restore")          manage_backups ;;
             "BBR & network tuning")      enable_bbr_tuning ;;
             "Firewall helper")           manage_firewall ;;
@@ -4053,7 +4679,7 @@ main() {
             self-update)  self_update; exit $? ;;
         esac
 
-        if [[ "$cli_cmd" == "deploy" || "$cli_cmd" == "settings" || "$cli_cmd" == "certs" || "$cli_cmd" == "proxy" ]]; then
+        if [[ "$cli_cmd" == "deploy" || "$cli_cmd" == "settings" || "$cli_cmd" == "certs" || "$cli_cmd" == "proxy" || "$cli_cmd" == "inbounds" ]]; then
             [[ ! -t 0 && -r /dev/tty ]] && exec < /dev/tty
         fi
 
@@ -4088,6 +4714,16 @@ main() {
                     reload)  reload_reverse_proxy ;;
                     disable) disable_reverse_proxy ;;
                     *)       error "Unknown proxy action: $cli_arg (use: setup|status|reload|disable)"; exit 1 ;;
+                esac
+                ;;
+            inbounds)
+                case "${cli_arg:-}" in
+                    "")         INTERACTIVE=true; manage_inbounds ;;
+                    list)       list_inbounds_report ;;
+                    verify)     verify_inbounds_listeners ;;
+                    sync-proxy) sync_inbounds_caddy ;;
+                    sync-fw)    sync_inbound_firewall ;;
+                    *)          error "Unknown inbounds action: $cli_arg (use: list|verify|sync-proxy|sync-fw)"; exit 1 ;;
                 esac
                 ;;
             *)            error "Unknown command: $cli_cmd"; usage; exit 1 ;;

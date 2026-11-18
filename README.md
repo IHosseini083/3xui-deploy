@@ -11,8 +11,9 @@ A zero-dependency Bash TUI & CLI manager for deploying, hardening, monitoring, a
 
 - **Local & Remote SSH Management**: Auto-detects VPS vs. workstation environments, persists persistent SSH `ControlMaster` sockets (`mux-%C`) with zero password leaks in process lists (`SSHPASS` env mode), and includes a built-in SSH public-key installer.
 - **SQLite or PostgreSQL Deployment**: Automatic Docker & Compose installation, GitHub release resolution without API rate-limit failures, Docker log rotation (`10m` × `3`), loopback-bound PostgreSQL (`127.0.0.1:5432`) with healthchecks, and `.env` credential isolation (`chmod 600`).
-- **Immediate Panel Hardening & Settings**: Guided post-deploy hardening plus a settings menu to change or randomize the listening port, `webBasePath`, admin credentials, and reset 2FA (`x-ui setting`).
+- **Immediate Panel Hardening, Verification & Settings**: Guided post-deploy hardening plus a settings menu to change or randomize the listening port, `webBasePath`, admin credentials, and reset 2FA (`/app/x-ui setting`). Automatically verifies that the 3X-UI Web UI actually loads over HTTP/HTTPS (both direct backend and Caddy reverse proxy).
 - **Caddy Reverse Proxy, Camouflage & Subs Domain**: Deploy a containerized Caddy v2 reverse proxy (`3xui_caddy`) with automatic HTTPS (including custom ports like `8443` when port `443` is occupied by Xray Reality), loopback-locked panel & subscription servers (`127.0.0.1`), a static decoy website on `/`, and support for either a **dedicated subscription domain** (`sub.example.com`) or shared path (`/sub/`, `/json/`).
+- **Multi-Protocol Inbounds & Routing**: Inspect SQLite/PostgreSQL Xray inbounds (`list`), verify live TCP/UDP sockets & port conflicts (`verify`), automatically expose loopback `ws`/`httpupgrade`/`xhttp`/`splithttp`/`grpc` inbounds behind Caddy HTTPS (`sync-proxy`), and sync exact TCP/UDP/both firewall rules for enabled public inbounds (`sync-fw`).
 - **TLS Certificate Lifecycle**: Issue Let's Encrypt standalone certificates (with automatic `/etc/letsencrypt/renewal-hooks/deploy/` sync & container restart), renew/sync all certs, or generate 10-year ECDSA P-256 self-signed certs with SANs.
 - **Online Backups, Upload Restore & Cron**: Consistent SQLite `.backup` and PostgreSQL `pg_dump`, pre-restore safety snapshots, local-to-remote archive upload restores, archive pruning, and daily automated cron backups.
 - **VPS Diagnostics & Network Tuning**: Single-trip health dashboard (CPU/RAM/Swap/Disk, BBR state, container stats, Fail2ban, cert expiry alerts), one-click TCP BBR + socket buffer sysctl tuning, UFW/Firewalld helper, and Xray GeoIP/GeoSite updaters (`Loyalsoldier`, `Iran`, `Russia`).
@@ -110,6 +111,7 @@ manage.sh [OPTIONS] [COMMAND] [ARGS]
 | `settings` | Open the Panel Settings & Security menu |
 | `certs` | Open the Certificate Management menu |
 | `proxy [setup\|status\|reload\|disable]` | Manage the Caddy reverse proxy (HTTPS, decoy site, and subscription domain) |
+| `inbounds [list\|verify\|sync-proxy\|sync-fw]` | List Xray inbounds, verify TCP/UDP sockets, sync Caddy routes & firewall rules |
 | `self-install` | Install `manage.sh` globally to `/usr/local/bin/3xui-deploy` |
 | `self-update` | Update `manage.sh` / `/usr/local/bin/3xui-deploy` from GitHub `main` |
 
