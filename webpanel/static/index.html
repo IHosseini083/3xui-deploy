@@ -1,0 +1,852 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>3xui-deploy · Management Panel</title>
+    <link rel="stylesheet" href="assets/app.css" />
+  </head>
+  <body>
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+    <!-- Confirmation Modal -->
+    <div
+      id="confirm-modal"
+      class="modal-backdrop hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-title"
+    >
+      <div class="modal-card">
+        <h3 id="confirm-title">Confirm Action</h3>
+        <p id="confirm-message" class="muted"></p>
+        <div class="modal-actions">
+          <button id="confirm-cancel" type="button" class="btn btn-ghost">
+            Cancel
+          </button>
+          <button id="confirm-accept" type="button" class="btn btn-primary">
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Login View -->
+    <main id="login-view" class="login-shell">
+      <section class="login-card">
+        <div class="brand-mark">
+          <span class="brand-dot"></span>
+          <span>3xui-deploy</span>
+        </div>
+        <h1>Deployment Console</h1>
+        <p class="muted">
+          Sign in to manage 3x-ui compatibility, decoy camouflage, probe
+          redirection, and lifecycle operations.
+        </p>
+        <div id="login-domain-pill" class="pill pill-neutral hidden"></div>
+        <div
+          id="login-error"
+          class="alert alert-error hidden"
+          role="alert"
+        ></div>
+        <form id="login-form" class="stack-md">
+          <label class="field">
+            <span>Username</span>
+            <input
+              id="login-username"
+              name="username"
+              type="text"
+              autocomplete="username"
+              required
+            />
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input
+              id="login-password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <button
+            id="login-submit"
+            type="submit"
+            class="btn btn-primary btn-full"
+          >
+            Sign In
+          </button>
+        </form>
+        <p class="login-footnote">
+          Access restricted to the configured HTTPS panel domain.
+        </p>
+      </section>
+    </main>
+
+    <!-- Main Dashboard App -->
+    <div id="app-shell" class="app-shell hidden">
+      <aside id="sidebar" class="sidebar" aria-label="Primary Navigation">
+        <div class="sidebar-header">
+          <div class="brand-mark">
+            <span class="brand-dot"></span>
+            <span>3xui-deploy</span>
+          </div>
+          <button
+            id="sidebar-close"
+            type="button"
+            class="icon-btn mobile-only"
+            aria-label="Close menu"
+          >
+            &times;
+          </button>
+        </div>
+
+        <nav class="nav-list">
+          <button type="button" class="nav-item active" data-view="overview">
+            Overview
+          </button>
+          <button type="button" class="nav-item" data-view="compat">
+            Compatibility &amp; Updates
+          </button>
+          <button type="button" class="nav-item" data-view="probe">
+            Decoy &amp; Probe Redirect
+          </button>
+          <button type="button" class="nav-item" data-view="proxy">
+            Proxy, Inbounds &amp; Audit
+          </button>
+          <button type="button" class="nav-item" data-view="backups">
+            Backups &amp; Logs
+          </button>
+          <button type="button" class="nav-item" data-view="settings">
+            Settings &amp; Sessions
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="sidebar-user">
+            <span class="muted">Signed in as</span>
+            <strong id="sidebar-username">admin</strong>
+          </div>
+          <button
+            id="logout-btn"
+            type="button"
+            class="btn btn-ghost btn-sm btn-full"
+          >
+            Sign Out
+          </button>
+        </div>
+      </aside>
+
+      <div id="sidebar-overlay" class="sidebar-overlay hidden"></div>
+
+      <div class="main-column">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button
+              id="sidebar-open"
+              type="button"
+              class="icon-btn mobile-only"
+              aria-label="Open menu"
+            >
+              &#9776;
+            </button>
+            <h2 id="view-title">Overview</h2>
+          </div>
+          <div class="topbar-right">
+            <span id="topbar-domain" class="pill pill-neutral"></span>
+            <button
+              id="theme-toggle"
+              type="button"
+              class="btn btn-ghost btn-sm"
+            >
+              Light
+            </button>
+            <button
+              id="refresh-view-btn"
+              type="button"
+              class="btn btn-ghost btn-sm"
+            >
+              Refresh
+            </button>
+          </div>
+        </header>
+
+        <div class="content-area">
+          <!-- View 1: Overview -->
+          <section id="view-overview" class="view-section">
+            <div class="grid-cards" id="overview-kpis"></div>
+
+            <div class="grid-two">
+              <article class="panel">
+                <div class="panel-header">
+                  <h3>Stack Containers</h3>
+                  <div class="btn-row">
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                      data-lifecycle="start"
+                    >
+                      Start
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                      data-lifecycle="restart"
+                    >
+                      Restart
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-danger-outline"
+                      data-lifecycle="stop"
+                    >
+                      Stop
+                    </button>
+                  </div>
+                </div>
+                <div id="overview-containers" class="stack-sm"></div>
+              </article>
+
+              <article class="panel">
+                <div class="panel-header">
+                  <h3>Exposed Endpoints &amp; Certificates</h3>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-lifecycle="reload_caddy"
+                  >
+                    Reload Caddy
+                  </button>
+                </div>
+                <div id="overview-endpoints" class="kv-list"></div>
+                <hr class="sep" />
+                <h4 class="subheading">TLS Certificates</h4>
+                <div id="overview-certs" class="stack-sm"></div>
+              </article>
+            </div>
+
+            <article class="panel">
+              <div class="panel-header">
+                <h3>Last Operation Output</h3>
+              </div>
+              <pre id="overview-op-output" class="code-box muted">
+No operations executed in this session yet.</pre
+              >
+            </article>
+          </section>
+
+          <!-- View 2: Compatibility & Updates -->
+          <section id="view-compat" class="view-section hidden">
+            <div class="grid-two">
+              <article class="panel">
+                <div class="panel-header">
+                  <h3>3x-ui Version &amp; Capability Contract</h3>
+                  <button
+                    id="compat-refresh-btn"
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                  >
+                    Re-check
+                  </button>
+                </div>
+                <div id="compat-summary" class="kv-list"></div>
+                <pre id="compat-output" class="code-box"></pre>
+              </article>
+
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Pre-flight Test &amp; Safe Upgrade</h3>
+                </div>
+                <form id="compat-test-form" class="inline-form">
+                  <input
+                    id="compat-test-tag"
+                    type="text"
+                    placeholder="e.g. v3.2.0 or v2.6.0"
+                    required
+                  />
+                  <button type="submit" class="btn btn-ghost">
+                    Pre-flight Check
+                  </button>
+                </form>
+                <hr class="sep" />
+                <form id="update-form" class="stack-sm">
+                  <label class="field">
+                    <span
+                      >Target Release Tag (leave blank for latest release)</span
+                    >
+                    <input
+                      id="update-tag-input"
+                      type="text"
+                      placeholder="latest release tag (recommended)"
+                    />
+                  </label>
+                  <label class="checkbox-row">
+                    <input id="update-force-compat" type="checkbox" />
+                    <span
+                      >Override unsupported version block
+                      (<code>--force-compat</code>)</span
+                    >
+                  </label>
+                  <div class="btn-row">
+                    <button type="submit" class="btn btn-primary">
+                      Pull, Verify &amp; Update
+                    </button>
+                    <button
+                      id="rollback-btn"
+                      type="button"
+                      class="btn btn-danger-outline"
+                    >
+                      Rollback Previous
+                    </button>
+                  </div>
+                </form>
+                <pre id="update-output" class="code-box muted">
+Ready for pre-flight check or update.</pre
+                >
+              </article>
+            </div>
+          </section>
+
+          <!-- View 3: Decoy & Probe Redirection -->
+          <section id="view-probe" class="view-section hidden">
+            <div class="grid-two">
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Probe &amp; Bot Redirection</h3>
+                  <span id="probe-state-badge" class="pill pill-neutral"
+                    >unknown</span
+                  >
+                </div>
+                <div
+                  id="probe-health-banner"
+                  class="alert alert-info hidden"
+                ></div>
+
+                <form id="probe-form" class="stack-md">
+                  <label class="checkbox-row strong-toggle">
+                    <input id="probe-enabled" type="checkbox" />
+                    <span>Enable Probe &amp; Scanner Redirection</span>
+                  </label>
+
+                  <label class="field">
+                    <span>Primary Redirect Destination</span>
+                    <div class="inline-form">
+                      <input
+                        id="probe-target"
+                        type="text"
+                        placeholder="https://www.cloudflare.com"
+                        required
+                      />
+                      <button
+                        id="probe-check-btn"
+                        type="button"
+                        class="btn btn-ghost"
+                      >
+                        Test URL
+                      </button>
+                    </div>
+                    <div class="preset-row">
+                      <span class="muted">Quick presets:</span>
+                      <button
+                        type="button"
+                        class="chip-btn"
+                        data-preset="https://www.cloudflare.com"
+                      >
+                        www.cloudflare.com
+                      </button>
+                      <button
+                        type="button"
+                        class="chip-btn"
+                        data-preset="https://www.speedtest.net"
+                      >
+                        www.speedtest.net
+                      </button>
+                      <button
+                        type="button"
+                        class="chip-btn"
+                        data-preset="https://nginx.org"
+                      >
+                        nginx.org
+                      </button>
+                    </div>
+                  </label>
+
+                  <div class="grid-two-tight">
+                    <label class="field">
+                      <span>HTTP Redirect Status</span>
+                      <select id="probe-status">
+                        <option value="302">302 Found (Recommended)</option>
+                        <option value="307">307 Temporary Redirect</option>
+                        <option value="301">301 Moved Permanently</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>Health Check Interval (sec)</span>
+                      <input
+                        id="probe-interval"
+                        type="number"
+                        min="15"
+                        max="3600"
+                        value="60"
+                      />
+                    </label>
+                  </div>
+
+                  <div class="grid-two-tight">
+                    <label class="field">
+                      <span>Safe Fallback When Target Down</span>
+                      <select id="probe-fallback-mode">
+                        <option value="decoy">
+                          Serve Decoy Website (Recommended)
+                        </option>
+                        <option value="secondary_url">
+                          Redirect to Secondary URL
+                        </option>
+                        <option value="not_found">Serve Decoy 404 Page</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>Secondary Fallback URL (optional)</span>
+                      <input
+                        id="probe-fallback-url"
+                        type="text"
+                        placeholder="https://www.speedtest.net"
+                      />
+                    </label>
+                  </div>
+
+                  <div class="rule-toggles">
+                    <span class="field-label">Detection Rules</span>
+                    <label class="checkbox-row"
+                      ><input id="rule-scanners" type="checkbox" /><span
+                        >Vulnerability scanners (nikto, sqlmap, nuclei, nmap,
+                        gobuster, etc.)</span
+                      ></label
+                    >
+                    <label class="checkbox-row"
+                      ><input id="rule-cli" type="checkbox" /><span
+                        >Automated CLI / script clients (curl, wget,
+                        python-requests, go-http)</span
+                      ></label
+                    >
+                    <label class="checkbox-row"
+                      ><input id="rule-empty-ua" type="checkbox" /><span
+                        >Missing or empty User-Agent header</span
+                      ></label
+                    >
+                    <label class="checkbox-row"
+                      ><input id="rule-methods" type="checkbox" /><span
+                        >Unusual HTTP probe methods (TRACE, TRACK, PROPFIND,
+                        CONNECT, DELETE)</span
+                      ></label
+                    >
+                    <label class="checkbox-row"
+                      ><input id="rule-paths" type="checkbox" /><span
+                        >Common exploit/probe paths (/.env, /.git, /wp-admin,
+                        /phpmyadmin)</span
+                      ></label
+                    >
+                    <label class="checkbox-row"
+                      ><input id="rule-crawlers" type="checkbox" /><span
+                        >Aggressive SEO / AI crawlers (ahrefs, semrush, gptbot,
+                        bytespider)</span
+                      ></label
+                    >
+                  </div>
+
+                  <label class="field">
+                    <span
+                      >Custom Suspicious User-Agent Tokens
+                      (comma-separated)</span
+                    >
+                    <input
+                      id="probe-custom-ua"
+                      type="text"
+                      placeholder="masscan, custom-bot"
+                    />
+                  </label>
+                  <label class="field">
+                    <span>Custom Suspicious Paths (comma-separated)</span>
+                    <input
+                      id="probe-custom-paths"
+                      type="text"
+                      placeholder="/admin-login, /backup.zip"
+                    />
+                  </label>
+                  <div class="grid-two-tight">
+                    <label class="field">
+                      <span>Blocked Probe IPs / CIDRs</span>
+                      <input
+                        id="probe-block-cidrs"
+                        type="text"
+                        placeholder="203.0.113.0/24"
+                      />
+                    </label>
+                    <label class="field">
+                      <span>Allowlisted IPs / CIDRs (never redirected)</span>
+                      <input
+                        id="probe-allow-cidrs"
+                        type="text"
+                        placeholder="198.51.100.10/32"
+                      />
+                    </label>
+                  </div>
+
+                  <div>
+                    <span class="field-label"
+                      >Protected Routes (Always Exempt from Redirection)</span
+                    >
+                    <div id="probe-protected-paths" class="pill-wrap"></div>
+                  </div>
+
+                  <div class="btn-row">
+                    <button type="submit" class="btn btn-primary">
+                      Save Rules &amp; Reload Caddy
+                    </button>
+                    <button
+                      id="probe-run-health-btn"
+                      type="button"
+                      class="btn btn-ghost"
+                    >
+                      Run Live Health Check
+                    </button>
+                  </div>
+                </form>
+              </article>
+
+              <div class="stack-md">
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>Rule &amp; Traffic Simulator</h3>
+                  </div>
+                  <p class="muted">
+                    Test how Caddy handles legitimate browsers, panel paths, and
+                    active probes without touching live traffic.
+                  </p>
+                  <form id="sim-form" class="stack-sm">
+                    <div class="grid-two-tight">
+                      <label class="field">
+                        <span>HTTP Method</span>
+                        <select id="sim-method">
+                          <option>GET</option>
+                          <option>HEAD</option>
+                          <option>POST</option>
+                          <option>TRACE</option>
+                          <option>PROPFIND</option>
+                        </select>
+                      </label>
+                      <label class="field">
+                        <span>Request Path</span>
+                        <input id="sim-path" type="text" value="/" />
+                      </label>
+                    </div>
+                    <label class="field">
+                      <span>User-Agent</span>
+                      <input
+                        id="sim-ua"
+                        type="text"
+                        value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0"
+                      />
+                    </label>
+                    <label class="field">
+                      <span>Client IP</span>
+                      <input id="sim-ip" type="text" value="198.51.100.42" />
+                    </label>
+                    <div class="btn-row">
+                      <button type="submit" class="btn btn-ghost">
+                        Simulate Request
+                      </button>
+                      <button
+                        type="button"
+                        class="chip-btn"
+                        id="sim-preset-browser"
+                      >
+                        Browser
+                      </button>
+                      <button
+                        type="button"
+                        class="chip-btn"
+                        id="sim-preset-scanner"
+                      >
+                        Scanner
+                      </button>
+                      <button
+                        type="button"
+                        class="chip-btn"
+                        id="sim-preset-env"
+                      >
+                        /.env Probe
+                      </button>
+                    </div>
+                  </form>
+                  <div id="sim-result" class="alert alert-info hidden"></div>
+                </article>
+
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>Legitimate Decoy Website</h3>
+                    <span
+                      id="decoy-custom-pill"
+                      class="pill pill-neutral"
+                    ></span>
+                  </div>
+                  <form id="decoy-form" class="stack-sm">
+                    <label class="field">
+                      <span>Template Theme</span>
+                      <select id="decoy-theme">
+                        <option value="cloud">
+                          Meridian Cloud Systems (Infrastructure / Edge)
+                        </option>
+                        <option value="studio">
+                          Northstar Digital Studio (Product &amp; Design)
+                        </option>
+                        <option value="docs">
+                          Atlas Engineering Docs (Technical Portal)
+                        </option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>Brand / Organization Name</span>
+                      <input id="decoy-name" type="text" required />
+                    </label>
+                    <label class="field">
+                      <span>Tagline</span>
+                      <input id="decoy-tagline" type="text" required />
+                    </label>
+                    <label class="field">
+                      <span>Contact Email</span>
+                      <input id="decoy-email" type="email" required />
+                    </label>
+                    <label class="field">
+                      <span
+                        >Optional Custom index.html Override (leave blank to
+                        generate multi-page site)</span
+                      >
+                      <textarea
+                        id="decoy-custom-html"
+                        rows="4"
+                        placeholder="Leave blank to use built-in multi-page responsive decoy site..."
+                      ></textarea>
+                    </label>
+                    <button type="submit" class="btn btn-primary">
+                      Apply Decoy Website
+                    </button>
+                  </form>
+                </article>
+              </div>
+            </div>
+          </section>
+
+          <!-- View 4: Proxy, Inbounds & Audit -->
+          <section id="view-proxy" class="view-section hidden">
+            <div class="grid-two">
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Reverse Proxy &amp; Xray Inbounds</h3>
+                  <div class="btn-row">
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                      data-lifecycle="verify_proxy"
+                    >
+                      Verify Proxy
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                      data-lifecycle="sync_inbounds_caddy"
+                    >
+                      Sync Loopback Inbounds
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                      data-lifecycle="verify_inbounds"
+                    >
+                      Verify Listeners
+                    </button>
+                  </div>
+                </div>
+                <pre id="inbounds-output" class="code-box"></pre>
+              </article>
+
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Security &amp; Compliance Audit</h3>
+                  <button
+                    id="run-audit-btn"
+                    type="button"
+                    class="btn btn-primary btn-sm"
+                  >
+                    Run Audit
+                  </button>
+                </div>
+                <div id="audit-counts" class="btn-row"></div>
+                <div id="audit-items" class="stack-sm"></div>
+              </article>
+            </div>
+          </section>
+
+          <!-- View 5: Backups & Logs -->
+          <section id="view-backups" class="view-section hidden">
+            <div class="grid-two">
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Backups &amp; GeoIP Assets</h3>
+                  <button
+                    id="create-backup-btn"
+                    type="button"
+                    class="btn btn-primary btn-sm"
+                  >
+                    Create Backup
+                  </button>
+                </div>
+                <div id="backups-list" class="stack-sm"></div>
+                <form id="prune-form" class="inline-form">
+                  <label class="muted" for="prune-keep">Retain newest:</label>
+                  <input
+                    id="prune-keep"
+                    type="number"
+                    min="1"
+                    max="100"
+                    value="7"
+                  />
+                  <button type="submit" class="btn btn-ghost btn-sm">
+                    Prune Old
+                  </button>
+                </form>
+                <hr class="sep" />
+                <div class="btn-row">
+                  <span class="muted">GeoIP/GeoSite Update:</span>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-geo="std"
+                  >
+                    Standard
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-geo="ir"
+                  >
+                    Iran (+Std)
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-geo="ru"
+                  >
+                    Russia (+Std)
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-geo="all"
+                  >
+                    All
+                  </button>
+                </div>
+              </article>
+
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Diagnostics &amp; Service Logs</h3>
+                  <div class="inline-form">
+                    <select id="log-source">
+                      <option value="deploy">3xui-deploy Log</option>
+                      <option value="audit">WebPanel Audit</option>
+                      <option value="xui">3X-UI Container</option>
+                      <option value="caddy">Caddy Container</option>
+                    </select>
+                    <select id="log-level">
+                      <option value="ALL">All Levels</option>
+                      <option value="INFO">INFO</option>
+                      <option value="WARN">WARN</option>
+                      <option value="ERROR">ERROR</option>
+                      <option value="CRITICAL">CRITICAL</option>
+                    </select>
+                    <button
+                      id="logs-refresh-btn"
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                    >
+                      Load
+                    </button>
+                  </div>
+                </div>
+                <pre id="logs-output" class="code-box code-tall"></pre>
+              </article>
+            </div>
+          </section>
+
+          <!-- View 6: Settings & Sessions -->
+          <section id="view-settings" class="view-section hidden">
+            <div class="grid-two">
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Change WebPanel Password</h3>
+                </div>
+                <form id="password-form" class="stack-sm">
+                  <label class="field">
+                    <span>Current Password</span>
+                    <input
+                      id="pw-current"
+                      type="password"
+                      autocomplete="current-password"
+                      required
+                    />
+                  </label>
+                  <label class="field">
+                    <span
+                      >New Password (min 12 chars, >=2 classes or >=16
+                      chars)</span
+                    >
+                    <input
+                      id="pw-new"
+                      type="password"
+                      autocomplete="new-password"
+                      required
+                    />
+                  </label>
+                  <label class="field">
+                    <span>Confirm New Password</span>
+                    <input
+                      id="pw-confirm"
+                      type="password"
+                      autocomplete="new-password"
+                      required
+                    />
+                  </label>
+                  <button type="submit" class="btn btn-primary">
+                    Update Password &amp; Rotate Sessions
+                  </button>
+                </form>
+                <hr class="sep" />
+                <h4 class="subheading">WebPanel Isolation Summary</h4>
+                <div id="settings-summary" class="kv-list"></div>
+              </article>
+
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Active Admin Sessions</h3>
+                  <button
+                    id="revoke-others-btn"
+                    type="button"
+                    class="btn btn-sm btn-danger-outline"
+                  >
+                    Revoke Other Sessions
+                  </button>
+                </div>
+                <div id="sessions-list" class="stack-sm"></div>
+              </article>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <script src="assets/app.js"></script>
+  </body>
+</html>

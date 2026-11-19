@@ -21,13 +21,16 @@
   - Panel credential resets pipe passwords over `stdin` (`_xui_set_credentials_stdin`) instead of CLI `-password=` arguments.
   - PostgreSQL `XUI_DB_DSN` is stored in `$INSTALL_DIR/.env` (`chmod 600`) and injected via `env_file`, keeping `compose.yaml` free of database passwords and enabling `scram-sha-256` auth.
   - `sshpass` receives passwords via `SSHPASS` env (`sshpass -e`) instead of `-p`, and passwords are not persisted to disk.
-- **Container & Reverse Proxy Hardening**:
+- **Container, Reverse Proxy & WebPanel Hardening**:
   - Containers set `no-new-privileges:true`; `3xui_caddy` additionally applies `cap_drop: ALL` with only `NET_BIND_SERVICE`.
   - Caddy's admin API is isolated to `unix//config/admin.sock` inside a `0700` directory instead of TCP `127.0.0.1:2019`.
-  - Security headers (`HSTS`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, `X-Robots-Tag`, decoy `CSP`, `Cache-Control: no-store` on subscriptions) and request-body limits are enforced automatically.
+  - Security headers (`HSTS`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, `X-Robots-Tag`, decoy `CSP`, `Cache-Control: no-store` on subscriptions and WebPanel responses) and request-body limits are enforced automatically.
+  - Standalone Web Management Panel (`3xui-deploy-web`) binds strictly to `127.0.0.1`, validates `X-Forwarded-Host` / `Host` against the configured panel domain (`403` on raw IP or domain mismatch), hashes credentials with `scrypt` (`auth.json` mode `0600`), enforces `HttpOnly; Secure; SameSite=Strict` cookies + `Origin` + `X-CSRF-Token` checks, rate-limits failed logins (`429` after 5 failures / 15m), and passes all subprocess calls via allowlisted `shell=False` lists.
+  - Probe redirection targets reject SSRF/loopback/private/link-local hosts, exclude loopback/allowlisted clients and all protected panel/subscription/WebPanel/inbound paths, and fall back safely if the redirect destination becomes unreachable.
 - **Tar-Slip & Symlink Protection on Restores**: `_validate_tar_archive` inspects `tar -tzf` and `tar -tvzf` before extraction to reject absolute paths, `..` traversal, symlinks, hardlinks, device nodes, and FIFOs, and extracts with `--no-same-owner --no-same-permissions`.
-- **Private Directories, TLS Downloads & Integrity Checks**:
+- **Private Directories, Log Redaction & Integrity Checks**:
   - SSH ControlMaster sockets use `${XDG_RUNTIME_DIR:-$HOME/.ssh}/3xui_mux/` (`chmod 700`).
   - Temporary directories for backups, restores, uploads, SSL config generation, and downloads use `mktemp -d` (`chmod 700`) and are cleaned up unconditionally.
-  - Sensitive files (`.env`, `compose.yaml`, `compose.yaml.bak`, `privkey.pem`, `~/.3xui-manager.conf`, `caddy/proxy.conf`, backup `.tar.gz` archives) are created under `umask 077` with `0600` permissions.
+  - Sensitive files (`.env`, `compose.yaml`, `compose.yaml.bak`, `privkey.pem`, `~/.3xui-manager.conf`, `caddy/proxy.conf`, `caddy/probe.conf`, `webpanel/webpanel.conf`, `webpanel/auth.json`, backup `.tar.gz` archives) are created under `umask 077` with `0600` permissions.
+  - Operational & audit logs (`logs/3xui-deploy.log`, `logs/webpanel-audit.log`) redact passwords, `XUI_DB_DSN`, and tokens before writing (`0600`).
   - All HTTPS downloads enforce `--proto '=https' --tlsv1.2` (`--https-only --secure-protocol=TLSv1_2` for `wget`); `lazydocker` binaries are verified against release `checksums.txt` (`sha256sum`); and `self-install` / `self-update` validate shebang, marker, and `bash -n` before atomic `install`.

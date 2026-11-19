@@ -158,6 +158,19 @@ test_validators() {
     r48=$(generate_random_string 48)
     assert_eq "20" "${#r20}" "random string 20 length"
     assert_eq "48" "${#r48}" "random string 48 length"
+
+    assert_eq "https://www.cloudflare.com" "$(_normalize_redirect_url "www.cloudflare.com")" "normalize bare host"
+    assert_ok   "valid redirect cloudflare" validate_redirect_url "https://www.cloudflare.com"
+    assert_ok   "valid redirect speedtest"  validate_redirect_url "https://www.speedtest.net:8443/path"
+    assert_fail "reject redirect loopback"  validate_redirect_url "http://127.0.0.1/test"
+    assert_fail "reject redirect private"   validate_redirect_url "https://10.0.0.5"
+    assert_fail "reject redirect 192.168"   validate_redirect_url "https://192.168.1.1"
+    assert_fail "reject redirect localhost" validate_redirect_url "https://localhost:8080"
+    assert_fail "reject redirect semicolon" validate_redirect_url "https://www.cloudflare.com;redir"
+    assert_fail "reject redirect scheme"    validate_redirect_url "ftp://www.cloudflare.com"
+
+    assert_ok   "valid cidr list"           validate_cidr_csv "203.0.113.0/24, 2001:db8::/32"
+    assert_fail "invalid cidr entry"        validate_cidr_csv "203.0.113.0/99"
 }
 
 # ─── 2. Panel Output Parsing & URL Formatting ───────────────────────────────
@@ -196,18 +209,42 @@ test_panel_parsing_and_urls() {
     assert_eq "https://panel.example.com/p/" "$(format_panel_url "1.2.3.4")" "format_panel_url proxy 443"
 }
 
-# ─── 3. Caddyfile & Decoy Site Generation ───────────────────────────────────
+# ─── 3. Caddyfile, Decoy Site, Probe Redirection & WebPanel Routes ─────────
 test_caddy_and_decoy() {
     REMOTE=false
     INBOUNDS_OVERRIDE='1|1|vless|127.0.0.1|10001|bad};comment|ws|none|/ws1/|tcp'
+    PROBE_REDIRECT_ENABLED=false
+    WEBPANEL_ENABLED=false
 
     generate_decoy_site true
     local decoy_html
     decoy_html=$(< "$INSTALL_DIR/caddy/site/index.html")
-    assert_contains "$decoy_html" "Service Status Portal" "decoy neutral title"
+    assert_contains "$decoy_html" "Meridian Cloud Systems" "decoy realistic brand title"
     assert_not_contains "$decoy_html" "Authorized administrative endpoints" "decoy removed info leak"
+    assert_not_contains "$decoy_html" "3x-ui" "decoy omits 3x-ui string"
+    assert_not_contains "$decoy_html" "3xui" "decoy omits 3xui string"
+    assert_not_contains "$decoy_html" "xray" "decoy omits xray string"
+    assert_ok "decoy services.html exists" test -f "$INSTALL_DIR/caddy/site/services.html"
+    assert_ok "decoy docs.html exists"     test -f "$INSTALL_DIR/caddy/site/docs.html"
+    assert_ok "decoy about.html exists"    test -f "$INSTALL_DIR/caddy/site/about.html"
+    assert_ok "decoy contact.html exists"  test -f "$INSTALL_DIR/caddy/site/contact.html"
+    assert_ok "decoy 404.html exists"      test -f "$INSTALL_DIR/caddy/site/404.html"
+    assert_ok "decoy style.css exists"     test -f "$INSTALL_DIR/caddy/site/assets/style.css"
+    assert_ok "decoy app.js exists"        test -f "$INSTALL_DIR/caddy/site/assets/app.js"
+    assert_ok "decoy robots.txt exists"    test -f "$INSTALL_DIR/caddy/site/robots.txt"
+    assert_ok "decoy sitemap.xml exists"   test -f "$INSTALL_DIR/caddy/site/sitemap.xml"
 
-    # Dedicated subscription domain mode
+    # Dedicated subscription domain mode + WebPanel + Probe redirection
+    WEBPANEL_ENABLED=true
+    WEBPANEL_PORT="2059"
+    WEBPANEL_PATH="/deploy/"
+    WEBPANEL_BIND="127.0.0.1"
+    PROBE_REDIRECT_ENABLED=true
+    PROBE_REDIRECT_TARGET="https://www.cloudflare.com"
+    PROBE_REDIRECT_STATUS="302"
+    PROBE_ACTIVE_STATE="primary"
+    PROBE_CUSTOM_PATHS="/sec/overlap,/custom-probe"
+
     generate_caddyfile "panel.example.com" "8443" "ops@example.com" "2053" "/sec/" \
         "dedicated" "sub.example.com" "2096" "/sub/" "/json/" "false" "false"
     local cf
@@ -227,7 +264,44 @@ test_caddy_and_decoy() {
     assert_contains "$cf" "# Inbound #1 (badcomment)" "caddyfile sanitized inbound remark"
     assert_not_contains "$cf" "bad};comment" "caddyfile stripped dangerous remark chars"
 
-    # Same-domain subscription mode
+    # WebPanel route checks: present in panel vhost, stripped prefix, absent from dedicated sub vhost
+    assert_contains "$cf" "redir /deploy /deploy/ 308" "caddyfile webpanel trailing slash redir"
+    assert_contains "$cf" "@webpanel {" "caddyfile webpanel matcher"
+    assert_contains "$cf" "uri strip_prefix /deploy" "caddyfile webpanel prefix strip"
+    assert_contains "$cf" "reverse_proxy 127.0.0.1:2059 {" "caddyfile webpanel upstream"
+    assert_contains "$cf" "header_up X-Forwarded-Prefix /deploy" "caddyfile webpanel X-Forwarded-Prefix"
+    local sub_section="${cf#*sub.example.com:8443}"
+    assert_not_contains "$sub_section" "127.0.0.1:2059" "webpanel excluded from dedicated sub vhost"
+
+    # Probe redirection checks
+    assert_contains "$cf" "not remote_ip 127.0.0.1 ::1" "probe allows loopback"
+    assert_contains "$cf" "not header User-Agent *" "probe uses valid Caddy v2 missing header syntax"
+    assert_contains "$cf" 'header User-Agent ""' "probe checks empty User-Agent"
+    assert_contains "$cf" "header_regexp User-Agent" "probe checks suspicious UA patterns"
+    assert_contains "$cf" "redir https://www.cloudflare.com 302" "probe redirects to configured target"
+    assert_contains "$cf" "/custom-probe" "probe includes non-overlapping custom path"
+    assert_not_contains "$cf" "/sec/overlap" "probe excludes path overlapping panel route"
+    assert_contains "$cf" "try_files {path} {path}.html {path}/index.html" "decoy multi-page try_files"
+
+    # Safe fallback: primary down -> fallback_decoy removes redirects cleanly
+    PROBE_ACTIVE_STATE="fallback_decoy"
+    generate_caddyfile "panel.example.com" "8443" "ops@example.com" "2053" "/sec/" \
+        "dedicated" "sub.example.com" "2096" "/sub/" "/json/" "false" "false"
+    cf=$(< "$INSTALL_DIR/caddy/Caddyfile")
+    assert_not_contains "$cf" "redir https://www.cloudflare.com" "fallback_decoy disables broken redirect"
+
+    # Safe fallback: secondary_url
+    PROBE_ACTIVE_STATE="fallback_secondary"
+    PROBE_FALLBACK_URL="https://www.speedtest.net"
+    generate_caddyfile "panel.example.com" "8443" "ops@example.com" "2053" "/sec/" \
+        "dedicated" "sub.example.com" "2096" "/sub/" "/json/" "false" "false"
+    cf=$(< "$INSTALL_DIR/caddy/Caddyfile")
+    assert_contains "$cf" "redir https://www.speedtest.net 302" "fallback_secondary redirects to secondary URL"
+
+    # Same-domain subscription mode (reset probe/webpanel for baseline check)
+    PROBE_REDIRECT_ENABLED=false
+    PROBE_ACTIVE_STATE="primary"
+    WEBPANEL_ENABLED=false
     generate_caddyfile "panel.example.com" "443" "" "2053" "/sec/" \
         "same" "" "2096" "/sub/" "/json/" "true" "false"
     cf=$(< "$INSTALL_DIR/caddy/Caddyfile")
@@ -237,6 +311,7 @@ test_caddy_and_decoy() {
     assert_contains "$cf" "reverse_proxy 127.0.0.1:2096 {" "caddyfile same-domain sub reverse_proxy block"
 
     INBOUNDS_OVERRIDE=""
+    PROBE_CUSTOM_PATHS=""
 }
 
 # ─── 4. Compose Generation & Secrets Isolation ──────────────────────────────

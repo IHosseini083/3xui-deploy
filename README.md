@@ -12,8 +12,10 @@ A zero-dependency Bash TUI & CLI manager for deploying, hardening, monitoring, a
 - **Local & Remote SSH Management**: Auto-detects VPS vs. workstation environments, persists short-lived SSH `ControlMaster` sockets (`mux-%C`, `ControlPersist=15m`, forwarding disabled) without saving SSH passwords to disk, and includes a built-in SSH public-key installer.
 - **SQLite or PostgreSQL Deployment**: Automatic Docker & Compose installation, GitHub release resolution without API rate-limit failures, Docker log rotation (`10m` × `3`), loopback-bound PostgreSQL (`127.0.0.1:5432`) with `scram-sha-256` auth, `XUI_DB_DSN` isolated in `.env` (`chmod 600`), and `XRAY_VMESS_AEAD_FORCED: "true"`.
 - **Immediate Panel Hardening, Verification & Settings**: Guided post-deploy hardening (stdin credential passing, password strength policy, 60-minute `sessionMaxAge`) plus a settings menu to change the port, listening IP (`webListen`), `webBasePath`, subscription domain/listen IP/URIs, `webDomain`, session timeout, admin credentials, and reset 2FA. Automatically verifies that the 3X-UI Web UI and subscription endpoints actually respond.
-- **Caddy Reverse Proxy, Camouflage & Subs Domain**: Deploy a hardened containerized Caddy v2 reverse proxy (`3xui_caddy` with `cap_drop: ALL` + `no-new-privileges`, admin API isolated to `unix//config/admin.sock`), automatic HTTPS (including custom ports like `8443` when port `443` is occupied by Xray Reality), loopback-locked panel & subscription servers (`127.0.0.1`) with synced `webDomain`, `subDomain`, `subJsonEnable`, `subURI`, `subJsonURI`, and `X-Forwarded-Host` headers, a neutral decoy site on `/`, and support for either a **dedicated subscription domain** (`sub.example.com`) or shared path (`/sub/`, `/json/`).
-- **Security Audit (`audit`)**: Built-in compliance & configuration audit verifying default credentials, 2FA, session timeouts, TLS/loopback isolation, subscription domain consistency, Caddy socket/header hardening, secret file permissions, Fail2ban, and firewall status.
+- **Forward Compatibility, Diagnostics & Auto-Rollback (`compat`)**: Probes `3xui_app` binary paths, DB schemas (`settings` / `inbounds`), and `setting` CLI flags before applying changes; explicitly blocks unsupported releases unless `--force-compat` is passed; pulls and runs read-only preflight container checks before touching `compose.yaml`; logs staged operations (`INFO`, `WARN`, `ERROR`, `CRITICAL`) with secret redaction to `logs/3xui-deploy.log`; and automatically rolls back failed updates or Caddy reloads.
+- **Caddy Reverse Proxy, Legitimate Multi-Page Decoy & Probe Redirection**: Deploy a hardened containerized Caddy v2 reverse proxy (`3xui_caddy` with `cap_drop: ALL` + `no-new-privileges`, admin API isolated to `unix//config/admin.sock`), automatic HTTPS (including custom ports like `8443` when port `443` is occupied by Xray Reality), loopback-locked panel & subscription servers (`127.0.0.1`), a multi-page responsive decoy website (`Meridian Cloud Systems` / `Northstar Digital Studio` / `Atlas Engineering Docs`) on `/`, configurable probe/scanner redirection (e.g., `https://www.cloudflare.com`, `https://www.speedtest.net`) with automatic safe fallback when targets are unreachable, and support for either a **dedicated subscription domain** (`sub.example.com`) or shared path (`/sub/`, `/json/`).
+- **Standalone Web Management Panel (`/deploy/`)**: Automatically enabled when a domain is configured for the main panel and served exclusively over HTTPS on that domain at `/deploy/` (never modifying 3X-UI routes or exposing on subscription domains). Built with zero-dependency Python 3 stdlib + minimal responsive UI featuring scrypt authentication, CSRF/Origin checks, session management, rate limiting, compatibility/update controls, probe-redirection manager + live simulator, decoy theme designer, audit runner, and log viewer.
+- **Security Audit (`audit`)**: Built-in compliance & configuration audit verifying default credentials, 2FA, session timeouts, TLS/loopback isolation, subscription domain consistency, 3X-UI compatibility status, WebPanel isolation & permissions, probe-redirect config validity, Caddy socket/header hardening, secret file permissions, Fail2ban, and firewall status.
 - **Multi-Protocol Inbounds & Routing**: Inspect SQLite/PostgreSQL Xray inbounds (`list`), verify live TCP/UDP sockets & port conflicts (`verify`), automatically expose loopback `ws`/`httpupgrade`/`xhttp`/`splithttp`/`grpc` inbounds behind Caddy HTTPS (`sync-proxy`), and sync exact TCP/UDP/both firewall rules for enabled public inbounds (`sync-fw`).
 - **TLS Certificate Lifecycle**: Issue Let's Encrypt standalone certificates (with automatic `/etc/letsencrypt/renewal-hooks/deploy/` sync & container restart), renew/sync all certs, or generate 10-year ECDSA P-256 self-signed certs with SANs.
 - **Online Backups, Upload Restore & Cron**: Consistent SQLite `.backup` and PostgreSQL `pg_dump`, pre-restore safety snapshots, local-to-remote archive upload restores, archive pruning, and daily automated cron backups.
@@ -91,6 +93,8 @@ manage.sh [OPTIONS] [COMMAND] [ARGS]
 | `-l, --local` | Force local execution mode |
 | `-d, --dir <path>` | Override installation directory (default: `/opt/3x-ui`) |
 | `-y, --yes` | Auto-confirm confirmation prompts |
+| `-v, --verbose` | Enable debug logging output |
+| `--force-compat` | Override unsupported 3X-UI version or preflight checks |
 | `-h, --help` | Show CLI help |
 
 ### Commands
@@ -101,17 +105,19 @@ manage.sh [OPTIONS] [COMMAND] [ARGS]
 | `deploy` | Install Docker if missing and deploy 3X-UI |
 | `status` | Show container status and live panel URL |
 | `start` / `stop` / `restart` | Control the Docker Compose stack |
-| `update` | Pull and apply the latest 3X-UI release tag |
+| `update [tag]` | Pull, preflight-check, and apply 3X-UI release with automatic rollback |
 | `rollback` | Restore `compose.yaml.bak` and recreate containers |
-| `logs [follow\|all\|N]` | View container logs (default: last `100` lines) |
+| `compat [check\|matrix\|test <tag>]` | Inspect 3X-UI version compatibility, DB schema & preflight image contract |
+| `logs [follow\|all\|N\|deploy]` | View container logs or `3xui-deploy` diagnostic log (`logs deploy`) |
 | `backup` | Create a timestamped backup in `/opt/3x-ui-backups` |
 | `restore [archive]` | Restore a backup archive (with pre-restore safety snapshot) |
 | `health` | Run system, Docker, Xray, Fail2ban, and cert diagnostics |
 | `bbr` | Enable TCP BBR + FQ + proxy socket tuning (`/etc/sysctl.d/99-3xui-optimizer.conf`) |
-| `geo-update [std\|ir\|ru\|all]` | Update Xray `geoip*.dat` and `geosite*.dat` inside `3xui_app:/app/bin/` |
+| `geo-update [std\|ir\|ru\|all]` | Update Xray `geoip*.dat` and `geosite*.dat` with automatic rollback |
 | `settings` | Open the Panel Settings & Security menu |
 | `certs` | Open the Certificate Management menu |
-| `proxy [setup\|status\|verify\|reload\|disable]` | Manage the Caddy reverse proxy (HTTPS, decoy site, and subscription domain) |
+| `proxy [setup\|status\|verify\|reload\|probe\|check-redirect\|disable]` | Manage Caddy reverse proxy, multi-page decoy site, probe redirection & subscription domains |
+| `webpanel [enable\|disable\|status\|reset-password\|logs]` | Manage standalone Web Management Panel (`/deploy/`) |
 | `inbounds [list\|verify\|sync-proxy\|sync-fw]` | List Xray inbounds, verify TCP/UDP sockets, sync Caddy routes & firewall rules |
 | `audit` | Run the built-in security & configuration audit |
 | `self-install` | Install `manage.sh` globally to `/usr/local/bin/3xui-deploy` |

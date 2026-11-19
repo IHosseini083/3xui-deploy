@@ -17,12 +17,30 @@ set -uo pipefail
 # ─── Globals & Defaults ─────────────────────────────────────────────────────
 REPO_URL="https://github.com/IHosseini083/3xui-deploy"
 REPO_RAW_URL="https://raw.githubusercontent.com/IHosseini083/3xui-deploy/main/manage.sh"
+REPO_RAW_BASE="https://raw.githubusercontent.com/IHosseini083/3xui-deploy/main"
 BIN_INSTALL_PATH="/usr/local/bin/3xui-deploy"
 
 INSTALL_DIR="${XUI_INSTALL_DIR:-/opt/3x-ui}"
 BACKUP_DIR="${XUI_BACKUP_DIR:-/opt/3x-ui-backups}"
 CONFIG_FILE="${HOME}/.3xui-manager.conf"
 COMPOSE_CMD=""
+
+XUI_LOG_FILE="${XUI_LOG_FILE:-}"
+XUI_DEBUG="${XUI_DEBUG:-0}"
+FORCE_COMPAT=false
+CURRENT_OP="init"
+CURRENT_STAGE="startup"
+
+XUI_COMPAT_MIN_VERSION="2.0.0"
+XUI_COMPAT_SUPPORTED_MAJORS="2 3"
+XUI_COMPAT_MAX_TESTED_MAJOR="3"
+XUI_DETECTED_VERSION=""
+XUI_COMPAT_STATUS=""
+XUI_CAPS_BIN=""
+XUI_CAPS_BIN_DIR=""
+XUI_CAPS_DB_PATH=""
+XUI_CAPS_SCHEMA_OK="unknown"
+XUI_CAPS_FLAGS=""
 
 _STATUS=""          # "not_deployed" | "stopped" | "running"
 _SKIP_PAUSE=false
@@ -61,6 +79,37 @@ SUB_PORT="2096"
 SUB_PATH="/sub/"
 SUB_JSON_PATH="/json/"
 PROXY_SUB_URL=""
+
+DECOY_THEME="cloud"
+DECOY_SITE_NAME="Meridian Cloud Systems"
+DECOY_SITE_TAGLINE="Managed Edge Infrastructure & Reliability Engineering"
+DECOY_CONTACT_EMAIL="hello@meridiancloud.example"
+
+PROBE_REDIRECT_ENABLED=false
+PROBE_REDIRECT_TARGET="https://www.cloudflare.com"
+PROBE_REDIRECT_STATUS="302"
+PROBE_FALLBACK_MODE="decoy"
+PROBE_FALLBACK_URL=""
+PROBE_CHECK_INTERVAL="60"
+PROBE_ACTIVE_STATE="primary"
+PROBE_DETECT_SCANNERS=true
+PROBE_DETECT_CRAWLERS=false
+PROBE_DETECT_CLI=true
+PROBE_DETECT_EMPTY_UA=true
+PROBE_DETECT_BAD_METHODS=true
+PROBE_DETECT_PATHS=true
+PROBE_CUSTOM_UA=""
+PROBE_CUSTOM_PATHS=""
+PROBE_BLOCK_CIDRS=""
+PROBE_ALLOW_CIDRS=""
+
+WEBPANEL_ENABLED=false
+WEBPANEL_PORT="2059"
+WEBPANEL_PATH="/deploy/"
+WEBPANEL_USER="admin"
+WEBPANEL_SESSION_IDLE="30"
+WEBPANEL_BIND="127.0.0.1"
+WEBPANEL_DOMAIN=""
 
 SUB_ENABLE_DB=""
 SUB_LISTEN_DB=""
@@ -128,10 +177,104 @@ setup_terminal() {
 }
 
 # ─── Logging, Quoting & Input Validation ────────────────────────────────────
-info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
-success() { echo -e "${GREEN}[OK]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+_resolve_log_file() {
+    if [[ -n "${XUI_LOG_FILE:-}" ]]; then
+        printf '%s' "$XUI_LOG_FILE"
+        return 0
+    fi
+    if [[ -d "${INSTALL_DIR:-/opt/3x-ui}" && -w "${INSTALL_DIR:-/opt/3x-ui}" ]]; then
+        printf '%s/logs/3xui-deploy.log' "$INSTALL_DIR"
+        return 0
+    fi
+    printf '%s/.3xui-deploy.log' "${HOME:-/tmp}"
+}
+
+_sanitize_log_text() {
+    local txt="${1-}"
+    txt=$(printf '%s' "$txt" | tr '\r\n\t' '   ')
+    printf '%s' "$txt" | sed -E \
+        -e 's/(XUI_DB_DSN=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
+        -e 's/(POSTGRES_PASSWORD=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
+        -e 's/(-password=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
+        -e 's/(SSH_PASS(_B64)?=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
+        -e 's/(SSHPASS=)[^[:space:]'\''"]+/\1[REDACTED]/g'
+}
+
+_log_write() {
+    local level="$1"
+    shift
+    local raw_msg="$*"
+    local log_path log_dir ts safe_msg
+    log_path=$(_resolve_log_file) || return 0
+    [[ -n "$log_path" ]] || return 0
+    log_dir=$(dirname "$log_path")
+    mkdir -p "$log_dir" 2>/dev/null || return 0
+    chmod 700 "$log_dir" 2>/dev/null || true
+
+    if [[ -f "$log_path" ]]; then
+        local sz=0
+        sz=$(wc -c < "$log_path" 2>/dev/null || echo 0)
+        if [[ "$sz" =~ ^[0-9]+$ ]] && (( sz > 5242880 )); then
+            mv -f "$log_path" "${log_path}.1" 2>/dev/null || true
+        fi
+    fi
+
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S")
+    safe_msg=$(_sanitize_log_text "$raw_msg")
+    (
+        umask 077
+        printf '%s [%s] [op=%s stage=%s] %s\n' \
+            "$ts" "$level" "${CURRENT_OP:-init}" "${CURRENT_STAGE:-run}" "$safe_msg" >> "$log_path" 2>/dev/null || true
+    )
+    chmod 600 "$log_path" 2>/dev/null || true
+}
+
+log_debug() {
+    _log_write "DEBUG" "$*"
+    if [[ "${XUI_DEBUG:-0}" == "1" ]]; then
+        echo -e "${DIM}[DEBUG]${NC} $*" >&2
+    fi
+}
+info()     { _log_write "INFO" "$*"; echo -e "${BLUE}[INFO]${NC} $*"; }
+success()  { _log_write "OK" "$*"; echo -e "${GREEN}[OK]${NC} $*"; }
+warn()     { _log_write "WARN" "$*"; echo -e "${YELLOW}[WARN]${NC} $*"; }
+error()    { _log_write "ERROR" "$*"; echo -e "${RED}[ERROR]${NC} $*" >&2; }
+critical() { _log_write "CRITICAL" "$*"; echo -e "${RED}${BOLD}[CRITICAL]${NC} $*" >&2; }
+
+log_stage() {
+    CURRENT_OP="${1:-op}"
+    CURRENT_STAGE="${2:-stage}"
+    shift 2 || true
+    info "[${CURRENT_OP}:${CURRENT_STAGE}] $*"
+}
+
+report_diagnostic() {
+    local severity="${1:-ERROR}"
+    local operation="${2:-unknown}"
+    local root_cause="${3:-unspecified}"
+    local components="${4:-unknown}"
+    local resolution="${5:-Check logs for details}"
+    local detail="${6:-}"
+
+    case "$severity" in
+        CRITICAL|critical) critical "${operation} failed" ;;
+        WARN|warn)         warn "${operation} warning" ;;
+        *)                 error "${operation} failed" ;;
+    esac
+
+    local out_fd=2
+    [[ "$severity" == "WARN" || "$severity" == "warn" ]] && out_fd=1
+
+    {
+        printf '  Operation  : %s\n' "$operation"
+        printf '  Root Cause : %s\n' "$root_cause"
+        printf '  Components : %s\n' "$components"
+        printf '  Resolution : %s\n' "$resolution"
+        [[ -n "$detail" ]] && printf '  Details    : %s\n' "$detail"
+    } >&"$out_fd"
+
+    _log_write "$severity" "DIAG op=${operation} cause=${root_cause} components=${components} resolution=${resolution}${detail:+ detail=$detail}"
+}
 
 # Safely single-quote a string for POSIX sh / bash remote or local execution.
 quote_sh() {
@@ -248,6 +391,90 @@ validate_domain() {
 validate_domain_or_ip() {
     local v="${1-}"
     validate_ipv4 "$v" || validate_ipv6 "$v" || validate_domain "$v"
+}
+
+_normalize_redirect_url() {
+    local u="${1-}"
+    u=$(printf '%s' "$u" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [[ -z "$u" ]] && return 0
+    if [[ "$u" != *"://"* ]]; then
+        u="https://${u}"
+    fi
+    printf '%s' "$u"
+}
+
+validate_redirect_url() {
+    local url="${1-}"
+    [[ -n "$url" && ${#url} -le 512 ]] || return 1
+    has_control_chars "$url" && return 1
+    [[ "$url" =~ [[:space:]\"\'\{\}\;\<\>\\\`\#] ]] && return 1
+    [[ "$url" =~ ^https?:// ]] || return 1
+
+    local rest="${url#*://}"
+    local authority="${rest%%/*}"
+    authority="${authority%%\?*}"
+    [[ -n "$authority" && "$authority" != *@* ]] || return 1
+
+    local host="" port=""
+    if [[ "$authority" =~ ^\[([0-9a-fA-F:]+)\](:([0-9]+))?$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[3]}"
+        validate_ipv6 "$host" || return 1
+        local hlow
+        hlow=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+        [[ "$hlow" == "::" || "$hlow" == "::1" || "$hlow" == fe80:* || "$hlow" == fc* || "$hlow" == fd* ]] && return 1
+    else
+        host="${authority%%:*}"
+        [[ "$authority" == *:* ]] && port="${authority#*:}"
+        [[ -n "$host" ]] || return 1
+        local hlow
+        hlow=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+        case "$hlow" in
+            localhost|*.localhost|*.local|*.internal) return 1 ;;
+        esac
+        if validate_ipv4 "$host"; then
+            _is_private_ipv4 "$host" && return 1
+            [[ "$host" == 0.* ]] && return 1
+        elif ! validate_domain "$host"; then
+            return 1
+        fi
+    fi
+
+    if [[ -n "$port" ]]; then
+        validate_port "$port" || return 1
+    fi
+    return 0
+}
+
+validate_cidr_entry() {
+    local item="${1-}"
+    [[ -n "$item" ]] || return 1
+    local addr="$item" prefix=""
+    if [[ "$item" == */* ]]; then
+        addr="${item%%/*}"
+        prefix="${item#*/}"
+        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    fi
+    if validate_ipv4 "$addr"; then
+        [[ -z "$prefix" ]] || (( 10#$prefix >= 0 && 10#$prefix <= 32 ))
+    elif validate_ipv6 "$addr"; then
+        [[ -z "$prefix" ]] || (( 10#$prefix >= 0 && 10#$prefix <= 128 ))
+    else
+        return 1
+    fi
+}
+
+validate_cidr_csv() {
+    local csv="${1-}"
+    [[ -z "$csv" ]] && return 0
+    local part trimmed
+    local IFS=','
+    for part in $csv; do
+        trimmed=$(printf '%s' "$part" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [[ -z "$trimmed" ]] && continue
+        validate_cidr_entry "$trimmed" || return 1
+    done
+    return 0
 }
 
 validate_email() {
@@ -758,7 +985,15 @@ run_q() {
     fi
 }
 
-invalidate_status() { _STATUS=""; }
+invalidate_status() {
+    _STATUS=""
+    XUI_DETECTED_VERSION=""
+    XUI_CAPS_BIN=""
+    XUI_CAPS_BIN_DIR=""
+    XUI_CAPS_DB_PATH=""
+    XUI_CAPS_SCHEMA_OK="unknown"
+    XUI_CAPS_FLAGS=""
+}
 
 refresh_status() {
     if is_deployed; then
@@ -1224,8 +1459,61 @@ _is_postgres_backend() {
 ensure_sqlite_in_container() {
     run_q "docker exec 3xui_app sh -c 'command -v sqlite3 >/dev/null 2>&1'" && return 0
     info "Installing sqlite3 in container for database configuration..."
-    run_q "docker exec 3xui_app sh -c 'apk update >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1'" \
+    run_q "docker exec 3xui_app sh -c 'if command -v apk >/dev/null 2>&1; then apk update >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq sqlite3 >/dev/null 2>&1; else exit 1; fi'" \
         || return 1
+}
+
+_xui_detect_db_path() {
+    if [[ -n "${XUI_CAPS_DB_PATH:-}" ]]; then
+        printf '%s' "$XUI_CAPS_DB_PATH"
+        return 0
+    fi
+    local detected=""
+    if is_running; then
+        detected=$(run_out "docker exec 3xui_app sh -c 'd=\${XUI_DB_FOLDER:-/etc/x-ui}; if [ -f \"\$d/x-ui.db\" ]; then printf \"%s\" \"\$d/x-ui.db\"; else ls \"\$d\"/*.db 2>/dev/null | head -n 1; fi'" || true)
+    fi
+    XUI_CAPS_DB_PATH="${detected:-/etc/x-ui/x-ui.db}"
+    printf '%s' "$XUI_CAPS_DB_PATH"
+}
+
+_xui_host_db_path() {
+    local cdb base
+    cdb=$(_xui_detect_db_path)
+    base=$(basename "$cdb")
+    if [[ -n "$base" && "$base" != "." && "$base" != "/" ]]; then
+        printf '%s/db/%s' "$INSTALL_DIR" "$base"
+    else
+        printf '%s/db/x-ui.db' "$INSTALL_DIR"
+    fi
+}
+
+_xui_detect_bin_dir() {
+    if [[ -n "${XUI_CAPS_BIN_DIR:-}" ]]; then
+        printf '%s' "$XUI_CAPS_BIN_DIR"
+        return 0
+    fi
+    local detected=""
+    if is_running; then
+        detected=$(run_out "docker exec 3xui_app sh -c 'if [ -n \"\${XUI_BIN_FOLDER:-}\" ] && [ -d \"\$XUI_BIN_FOLDER\" ]; then printf \"%s\" \"\$XUI_BIN_FOLDER\"; elif [ -d /app/bin ]; then printf /app/bin; elif [ -d /usr/local/x-ui/bin ]; then printf /usr/local/x-ui/bin; fi'" || true)
+    fi
+    XUI_CAPS_BIN_DIR="${detected:-/app/bin}"
+    printf '%s' "$XUI_CAPS_BIN_DIR"
+}
+
+_xui_sqlite_query() {
+    local sql="$1"
+    local sep="${2:-}"
+    local host_db container_db sep_flag=""
+    [[ -n "$sep" ]] && sep_flag="-separator $(quote_sh "$sep") "
+    host_db=$(_xui_host_db_path)
+    container_db=$(_xui_detect_db_path)
+
+    # Prefer host sqlite3 when available to avoid mutating 3x-ui container internals.
+    if run_q "command -v sqlite3 && test -f $(quote_sh "$host_db")"; then
+        run_out "sqlite3 -cmd '.timeout 5000' ${sep_flag}$(quote_sh "$host_db") $(quote_sh "$sql")" || true
+    elif is_running && ensure_sqlite_in_container; then
+        run_out "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' ${sep_flag}$(quote_sh "$container_db") $(quote_sh "$sql")" || true
+    fi
 }
 
 xui_db_get() {
@@ -1238,11 +1526,7 @@ xui_db_get() {
         run_out "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -tAc $(quote_sh "SELECT value FROM settings WHERE key='${key}' LIMIT 1;")" || true
     else
         local sql="SELECT value FROM settings WHERE key='${key}' LIMIT 1;"
-        if is_running && ensure_sqlite_in_container; then
-            run_out "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' /etc/x-ui/x-ui.db $(quote_sh "$sql")" || true
-        elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
-            run_out "sqlite3 -cmd '.timeout 5000' $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")" || true
-        fi
+        _xui_sqlite_query "$sql"
     fi
 }
 
@@ -1271,11 +1555,7 @@ xui_db_get_many() {
         run_out "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -F \$'\t' -tA -c $(quote_sh "$sql")" || true
     else
         local sql="SELECT key, replace(replace(replace(COALESCE(value,''), char(10), ' '), char(13), ''), char(9), ' ') FROM settings WHERE key IN (${sql_list});"
-        if is_running && ensure_sqlite_in_container; then
-            run_out "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' -separator \$'\t' /etc/x-ui/x-ui.db $(quote_sh "$sql")" || true
-        elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
-            run_out "sqlite3 -cmd '.timeout 5000' -separator \$'\t' $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")" || true
-        fi
+        _xui_sqlite_query "$sql" $'\t'
     fi
 }
 
@@ -1292,12 +1572,18 @@ xui_db_set() {
         run_masked "Update 3X-UI setting ($key)" "docker exec 3xui_postgres psql -v ON_ERROR_STOP=1 -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -c $(quote_sh "$sql") >/dev/null"
     else
         local sql="UPDATE settings SET value='${val_sql}' WHERE key='${key}'; INSERT INTO settings (key, value) SELECT '${key}', '${val_sql}' WHERE (SELECT changes()) = 0;"
-        if is_running && ensure_sqlite_in_container; then
-            run_masked "Update 3X-UI setting ($key)" "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' /etc/x-ui/x-ui.db $(quote_sh "$sql")"
-        elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
-            run_masked "Update 3X-UI setting ($key)" "sqlite3 -cmd '.timeout 5000' $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")"
+        local host_db container_db
+        host_db=$(_xui_host_db_path)
+        container_db=$(_xui_detect_db_path)
+        if run_q "command -v sqlite3 && test -f $(quote_sh "$host_db")"; then
+            run_masked "Update 3X-UI setting ($key)" "sqlite3 -cmd '.timeout 5000' $(quote_sh "$host_db") $(quote_sh "$sql")"
+        elif is_running && ensure_sqlite_in_container; then
+            run_masked "Update 3X-UI setting ($key)" "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' $(quote_sh "$container_db") $(quote_sh "$sql")"
         else
-            error "sqlite3 unavailable to update $INSTALL_DIR/db/x-ui.db"
+            report_diagnostic "ERROR" "xui_db_set" \
+                "sqlite3 unavailable on host and inside container" \
+                "3xui database ($host_db)" \
+                "Install sqlite3 on the host (apt install sqlite3) and retry."
             return 1
         fi
     fi
@@ -1360,22 +1646,485 @@ save_proxy_conf() {
     fi
 }
 
+load_probe_conf() {
+    DECOY_THEME="cloud"
+    DECOY_SITE_NAME="Meridian Cloud Systems"
+    DECOY_SITE_TAGLINE="Managed Edge Infrastructure & Reliability Engineering"
+    DECOY_CONTACT_EMAIL="hello@meridiancloud.example"
+
+    PROBE_REDIRECT_ENABLED=false
+    PROBE_REDIRECT_TARGET="https://www.cloudflare.com"
+    PROBE_REDIRECT_STATUS="302"
+    PROBE_FALLBACK_MODE="decoy"
+    PROBE_FALLBACK_URL=""
+    PROBE_CHECK_INTERVAL="60"
+    PROBE_ACTIVE_STATE="primary"
+    PROBE_DETECT_SCANNERS=true
+    PROBE_DETECT_CRAWLERS=false
+    PROBE_DETECT_CLI=true
+    PROBE_DETECT_EMPTY_UA=true
+    PROBE_DETECT_BAD_METHODS=true
+    PROBE_DETECT_PATHS=true
+    PROBE_CUSTOM_UA=""
+    PROBE_CUSTOM_PATHS=""
+    PROBE_BLOCK_CIDRS=""
+    PROBE_ALLOW_CIDRS=""
+
+    local conf_raw
+    conf_raw=$(run_out "cat $(quote_sh "$INSTALL_DIR/caddy/probe.conf")" || true)
+    if [[ -n "$conf_raw" ]]; then
+        local line key val
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            if [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                val="${BASH_REMATCH[2]}"
+                if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+                    val="${BASH_REMATCH[1]}"
+                elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+                    val="${BASH_REMATCH[1]}"
+                fi
+                has_control_chars "$val" && continue
+                case "$key" in
+                    DECOY_THEME)              [[ "$val" =~ ^(cloud|studio|docs)$ ]] && DECOY_THEME="$val" ;;
+                    DECOY_SITE_NAME)          [[ -n "$val" && ${#val} -le 80 && ! "$val" =~ [\<\>\"\'\{\}\;\`] ]] && DECOY_SITE_NAME="$val" ;;
+                    DECOY_SITE_TAGLINE)       [[ -n "$val" && ${#val} -le 140 && ! "$val" =~ [\<\>\"\'\{\}\;\`] ]] && DECOY_SITE_TAGLINE="$val" ;;
+                    DECOY_CONTACT_EMAIL)      validate_email "$val" && DECOY_CONTACT_EMAIL="$val" ;;
+                    PROBE_REDIRECT_ENABLED)   [[ "$val" == "true" ]] && PROBE_REDIRECT_ENABLED=true || PROBE_REDIRECT_ENABLED=false ;;
+                    PROBE_REDIRECT_TARGET)    validate_redirect_url "$val" && PROBE_REDIRECT_TARGET="$val" ;;
+                    PROBE_REDIRECT_STATUS)    [[ "$val" =~ ^(301|302|307)$ ]] && PROBE_REDIRECT_STATUS="$val" ;;
+                    PROBE_FALLBACK_MODE)      [[ "$val" =~ ^(decoy|secondary_url|not_found)$ ]] && PROBE_FALLBACK_MODE="$val" ;;
+                    PROBE_FALLBACK_URL)       [[ -z "$val" ]] && PROBE_FALLBACK_URL="" || { validate_redirect_url "$val" && PROBE_FALLBACK_URL="$val"; } ;;
+                    PROBE_CHECK_INTERVAL)     [[ "$val" =~ ^[0-9]+$ ]] && (( 10#$val >= 15 && 10#$val <= 3600 )) && PROBE_CHECK_INTERVAL="$((10#$val))" ;;
+                    PROBE_DETECT_SCANNERS)    [[ "$val" == "true" ]] && PROBE_DETECT_SCANNERS=true || PROBE_DETECT_SCANNERS=false ;;
+                    PROBE_DETECT_CRAWLERS)    [[ "$val" == "true" ]] && PROBE_DETECT_CRAWLERS=true || PROBE_DETECT_CRAWLERS=false ;;
+                    PROBE_DETECT_CLI)         [[ "$val" == "true" ]] && PROBE_DETECT_CLI=true || PROBE_DETECT_CLI=false ;;
+                    PROBE_DETECT_EMPTY_UA)    [[ "$val" == "true" ]] && PROBE_DETECT_EMPTY_UA=true || PROBE_DETECT_EMPTY_UA=false ;;
+                    PROBE_DETECT_BAD_METHODS) [[ "$val" == "true" ]] && PROBE_DETECT_BAD_METHODS=true || PROBE_DETECT_BAD_METHODS=false ;;
+                    PROBE_DETECT_PATHS)       [[ "$val" == "true" ]] && PROBE_DETECT_PATHS=true || PROBE_DETECT_PATHS=false ;;
+                    PROBE_CUSTOM_UA)          [[ ! "$val" =~ [\{\}\;\<\>\"\'\\\`] ]] && PROBE_CUSTOM_UA="$val" ;;
+                    PROBE_CUSTOM_PATHS)       [[ ! "$val" =~ [\{\}\;\<\>\"\'\\\`] ]] && PROBE_CUSTOM_PATHS="$val" ;;
+                    PROBE_BLOCK_CIDRS)        validate_cidr_csv "$val" && PROBE_BLOCK_CIDRS="$val" ;;
+                    PROBE_ALLOW_CIDRS)        validate_cidr_csv "$val" && PROBE_ALLOW_CIDRS="$val" ;;
+                esac
+            fi
+        done <<< "$conf_raw"
+    fi
+
+    local state_raw st_val
+    state_raw=$(run_out "cat $(quote_sh "$INSTALL_DIR/caddy/probe-state.json")" || true)
+    if [[ -n "$state_raw" ]]; then
+        st_val=$(printf '%s' "$state_raw" | sed -nE 's/.*"active_state"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1)
+        case "$st_val" in
+            primary|fallback_secondary|fallback_decoy|fallback_404|disabled) PROBE_ACTIVE_STATE="$st_val" ;;
+        esac
+    fi
+}
+
+save_probe_conf() {
+    local conf_body
+    conf_body=$(cat <<EOF
+DECOY_THEME="${DECOY_THEME}"
+DECOY_SITE_NAME="${DECOY_SITE_NAME}"
+DECOY_SITE_TAGLINE="${DECOY_SITE_TAGLINE}"
+DECOY_CONTACT_EMAIL="${DECOY_CONTACT_EMAIL}"
+PROBE_REDIRECT_ENABLED="${PROBE_REDIRECT_ENABLED}"
+PROBE_REDIRECT_TARGET="${PROBE_REDIRECT_TARGET}"
+PROBE_REDIRECT_STATUS="${PROBE_REDIRECT_STATUS}"
+PROBE_FALLBACK_MODE="${PROBE_FALLBACK_MODE}"
+PROBE_FALLBACK_URL="${PROBE_FALLBACK_URL}"
+PROBE_CHECK_INTERVAL="${PROBE_CHECK_INTERVAL}"
+PROBE_DETECT_SCANNERS="${PROBE_DETECT_SCANNERS}"
+PROBE_DETECT_CRAWLERS="${PROBE_DETECT_CRAWLERS}"
+PROBE_DETECT_CLI="${PROBE_DETECT_CLI}"
+PROBE_DETECT_EMPTY_UA="${PROBE_DETECT_EMPTY_UA}"
+PROBE_DETECT_BAD_METHODS="${PROBE_DETECT_BAD_METHODS}"
+PROBE_DETECT_PATHS="${PROBE_DETECT_PATHS}"
+PROBE_CUSTOM_UA="${PROBE_CUSTOM_UA}"
+PROBE_CUSTOM_PATHS="${PROBE_CUSTOM_PATHS}"
+PROBE_BLOCK_CIDRS="${PROBE_BLOCK_CIDRS}"
+PROBE_ALLOW_CIDRS="${PROBE_ALLOW_CIDRS}"
+EOF
+)
+    run "mkdir -p $(quote_sh "$INSTALL_DIR/caddy") && chmod 755 $(quote_sh "$INSTALL_DIR/caddy")" || return 1
+    if $REMOTE; then
+        printf '%s\n' "$conf_body" | ssh_cmd "umask 077 && cat > $(quote_sh "$INSTALL_DIR/caddy/probe.conf") && chmod 600 $(quote_sh "$INSTALL_DIR/caddy/probe.conf")"
+    else
+        ( umask 077; printf '%s\n' "$conf_body" > "$INSTALL_DIR/caddy/probe.conf" )
+        chmod 600 "$INSTALL_DIR/caddy/probe.conf"
+    fi
+}
+
+load_webpanel_conf() {
+    WEBPANEL_ENABLED=false
+    WEBPANEL_PORT="2059"
+    WEBPANEL_PATH="/deploy/"
+    WEBPANEL_USER="admin"
+    WEBPANEL_SESSION_IDLE="30"
+    WEBPANEL_BIND="127.0.0.1"
+    WEBPANEL_DOMAIN=""
+
+    local conf_raw
+    conf_raw=$(run_out "cat $(quote_sh "$INSTALL_DIR/webpanel/webpanel.conf")" || true)
+    [[ -z "$conf_raw" ]] && return 0
+
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            case "$key" in
+                WEBPANEL_ENABLED)      [[ "$val" == "true" ]] && WEBPANEL_ENABLED=true || WEBPANEL_ENABLED=false ;;
+                WEBPANEL_PORT)         validate_port "$val" && WEBPANEL_PORT="$val" ;;
+                WEBPANEL_PATH)         validate_webpath "$val" && WEBPANEL_PATH=$(_normalize_webpath "$val") ;;
+                WEBPANEL_USER)         [[ "$val" =~ ^[a-zA-Z0-9._-]{1,64}$ ]] && WEBPANEL_USER="$val" ;;
+                WEBPANEL_SESSION_IDLE) [[ "$val" =~ ^[0-9]+$ ]] && (( 10#$val >= 5 && 10#$val <= 1440 )) && WEBPANEL_SESSION_IDLE="$((10#$val))" ;;
+                WEBPANEL_BIND)         [[ "$val" == "127.0.0.1" || "$val" == "::1" ]] && WEBPANEL_BIND="$val" ;;
+                WEBPANEL_DOMAIN)       validate_domain "$val" && WEBPANEL_DOMAIN="$val" ;;
+            esac
+        fi
+    done <<< "$conf_raw"
+}
+
+save_webpanel_conf() {
+    local conf_body
+    conf_body=$(cat <<EOF
+WEBPANEL_ENABLED="${WEBPANEL_ENABLED}"
+WEBPANEL_BIND="${WEBPANEL_BIND:-127.0.0.1}"
+WEBPANEL_PORT="${WEBPANEL_PORT}"
+WEBPANEL_PATH="${WEBPANEL_PATH}"
+WEBPANEL_USER="${WEBPANEL_USER}"
+WEBPANEL_SESSION_IDLE="${WEBPANEL_SESSION_IDLE}"
+WEBPANEL_DOMAIN="${WEBPANEL_DOMAIN:-$PROXY_DOMAIN}"
+EOF
+)
+    run "mkdir -p $(quote_sh "$INSTALL_DIR/webpanel") && chmod 700 $(quote_sh "$INSTALL_DIR/webpanel")" || return 1
+    if $REMOTE; then
+        printf '%s\n' "$conf_body" | ssh_cmd "umask 077 && cat > $(quote_sh "$INSTALL_DIR/webpanel/webpanel.conf") && chmod 600 $(quote_sh "$INSTALL_DIR/webpanel/webpanel.conf")"
+    else
+        ( umask 077; printf '%s\n' "$conf_body" > "$INSTALL_DIR/webpanel/webpanel.conf" )
+        chmod 600 "$INSTALL_DIR/webpanel/webpanel.conf"
+    fi
+}
+
+# ─── 3X-UI Forward Compatibility & Capability Adapter Layer ─────────────────
+_semver_parse() {
+    local raw="${1-}"
+    raw="${raw#v}"
+    raw="${raw#V}"
+    raw="${raw%%-*}"
+    raw="${raw%%+*}"
+    if [[ "$raw" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))?$ ]]; then
+        printf '%d %d %d' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[4]:-0}))"
+        return 0
+    fi
+    return 1
+}
+
+_semver_compare() {
+    local p1 p2
+    p1=$(_semver_parse "$1") || return 1
+    p2=$(_semver_parse "$2") || return 1
+    local a1 b1 c1 a2 b2 c2
+    read -r a1 b1 c1 <<< "$p1"
+    read -r a2 b2 c2 <<< "$p2"
+    if (( a1 != a2 )); then (( a1 > a2 )) && echo "1" || echo "-1"; return 0; fi
+    if (( b1 != b2 )); then (( b1 > b2 )) && echo "1" || echo "-1"; return 0; fi
+    if (( c1 != c2 )); then (( c1 > c2 )) && echo "1" || echo "-1"; return 0; fi
+    echo "0"
+}
+
+xui_classify_version() {
+    local target="${1-}" current="${2-}"
+    local parsed
+    if ! parsed=$(_semver_parse "$target"); then
+        XUI_COMPAT_STATUS="unknown_tag"
+        printf 'unknown_tag'
+        return 0
+    fi
+    local maj min pat
+    read -r maj min pat <<< "$parsed"
+    if (( maj < 2 )); then
+        XUI_COMPAT_STATUS="unsupported_legacy"
+        printf 'unsupported_legacy'
+        return 0
+    fi
+    if (( maj > XUI_COMPAT_MAX_TESTED_MAJOR )); then
+        XUI_COMPAT_STATUS="unsupported_major"
+        printf 'unsupported_major'
+        return 0
+    fi
+    if [[ -n "$current" ]]; then
+        local cparsed cmaj cmin cpat
+        if cparsed=$(_semver_parse "$current"); then
+            read -r cmaj cmin cpat <<< "$cparsed"
+            if (( maj > cmaj )); then
+                XUI_COMPAT_STATUS="major_upgrade"
+                printf 'major_upgrade'
+                return 0
+            fi
+        fi
+    fi
+    XUI_COMPAT_STATUS="supported"
+    printf 'supported'
+}
+
+_xui_find_binary() {
+    if [[ -n "${XUI_CAPS_BIN:-}" ]]; then
+        printf '%s' "$XUI_CAPS_BIN"
+        return 0
+    fi
+    local found=""
+    if is_running; then
+        found=$(run_out "docker exec 3xui_app sh -c 'for p in /app/x-ui /usr/local/x-ui/x-ui /app/3x-ui; do if [ -x \"\$p\" ] && [ \"\$(head -c 2 \"\$p\" 2>/dev/null)\" != \"#!\" ]; then printf \"%s\" \"\$p\"; exit 0; fi; done; exe=\$(readlink -f /proc/1/exe 2>/dev/null || true); case \"\$exe\" in *x-ui*|*3x-ui*) [ -x \"\$exe\" ] && printf \"%s\" \"\$exe\" ;; esac'" || true)
+    fi
+    XUI_CAPS_BIN="$found"
+    printf '%s' "$found"
+}
+
+xui_detect_version() {
+    local tag="" oci_ver="" bin_ver="" bin_path=""
+    if is_deployed; then
+        tag=$(run_out "awk -F: '/image:[[:space:]]*ghcr\\.io\\/mhsanaei\\/3x-ui:/ {print \$NF; exit}' $(quote_sh "$INSTALL_DIR/compose.yaml")" | tr -d '\r ' || true)
+    fi
+    if is_running; then
+        oci_ver=$(run_out "docker inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' 3xui_app 2>/dev/null" | tr -d '\r ' || true)
+        [[ "$oci_ver" == "<no value>" ]] && oci_ver=""
+        if [[ -z "$oci_ver" ]] && { [[ -z "$tag" || "$tag" == "latest" ]]; }; then
+            bin_path=$(_xui_find_binary)
+            if [[ -n "$bin_path" ]]; then
+                bin_ver=$(run_out "docker exec 3xui_app $(quote_sh "$bin_path") -v 2>/dev/null || docker exec 3xui_app $(quote_sh "$bin_path") version 2>/dev/null" | grep -Eo 'v?[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)
+            fi
+        fi
+    fi
+
+    if _semver_parse "$oci_ver" >/dev/null 2>&1 && { [[ -z "$tag" || "$tag" == "latest" ]]; }; then
+        XUI_DETECTED_VERSION="$oci_ver"
+    elif [[ -n "$bin_ver" ]] && { [[ -z "$tag" || "$tag" == "latest" ]]; }; then
+        XUI_DETECTED_VERSION="$bin_ver"
+    else
+        XUI_DETECTED_VERSION="${tag:-${oci_ver:-${bin_ver:-unknown}}}"
+    fi
+    printf '%s' "$XUI_DETECTED_VERSION"
+}
+
+_xui_check_db_schema() {
+    local issues=""
+    if _is_postgres_backend; then
+        if ! is_pg_running; then
+            XUI_CAPS_SCHEMA_OK="unavailable"
+            return 0
+        fi
+        get_pg_env
+        local s_cols i_cols
+        s_cols=$(run_out "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -tAc \"SELECT column_name FROM information_schema.columns WHERE table_name='settings';\"" || true)
+        i_cols=$(run_out "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -tAc \"SELECT column_name FROM information_schema.columns WHERE table_name='inbounds';\"" || true)
+        [[ -z "$s_cols" ]] && issues+="missing table 'settings'; "
+        if [[ -n "$s_cols" ]]; then
+            printf '%s\n' "$s_cols" | grep -qx 'key' || issues+="settings.key missing; "
+            printf '%s\n' "$s_cols" | grep -qx 'value' || issues+="settings.value missing; "
+        fi
+        [[ -z "$i_cols" ]] && issues+="missing table 'inbounds'; "
+        if [[ -n "$i_cols" ]]; then
+            for col in id enable protocol listen port remark; do
+                printf '%s\n' "$i_cols" | grep -qx "$col" || issues+="inbounds.${col} missing; "
+            done
+            if ! printf '%s\n' "$i_cols" | grep -qxE 'stream_settings|streamSettings'; then
+                issues+="inbounds.stream_settings missing; "
+            fi
+        fi
+    else
+        local s_info i_info
+        s_info=$(_xui_sqlite_query "PRAGMA table_info(settings);" "|" || true)
+        i_info=$(_xui_sqlite_query "PRAGMA table_info(inbounds);" "|" || true)
+        if [[ -z "$s_info" && -z "$i_info" ]]; then
+            XUI_CAPS_SCHEMA_OK="unavailable"
+            return 0
+        fi
+        [[ -z "$s_info" ]] && issues+="missing table 'settings'; "
+        if [[ -n "$s_info" ]]; then
+            printf '%s\n' "$s_info" | cut -d'|' -f2 | grep -qx 'key' || issues+="settings.key missing; "
+            printf '%s\n' "$s_info" | cut -d'|' -f2 | grep -qx 'value' || issues+="settings.value missing; "
+        fi
+        [[ -z "$i_info" ]] && issues+="missing table 'inbounds'; "
+        if [[ -n "$i_info" ]]; then
+            for col in id enable protocol listen port remark; do
+                printf '%s\n' "$i_info" | cut -d'|' -f2 | grep -qx "$col" || issues+="inbounds.${col} missing; "
+            done
+            if ! printf '%s\n' "$i_info" | cut -d'|' -f2 | grep -qxE 'stream_settings|streamSettings'; then
+                issues+="inbounds.stream_settings missing; "
+            fi
+        fi
+    fi
+
+    if [[ -n "$issues" ]]; then
+        XUI_CAPS_SCHEMA_OK="drift"
+        report_diagnostic "ERROR" "db_schema_check" \
+            "3x-ui database schema differs from expected contract: ${issues}" \
+            "3x-ui settings / inbounds tables" \
+            "Check 3x-ui release notes for DB schema changes and update 3xui-deploy before applying settings."
+        return 1
+    fi
+    XUI_CAPS_SCHEMA_OK="ok"
+    return 0
+}
+
+xui_probe_capabilities() {
+    XUI_CAPS_FLAGS=""
+    local bin=""
+    if is_running; then
+        bin=$(_xui_find_binary)
+        XUI_CAPS_BIN="$bin"
+        _xui_detect_db_path >/dev/null || true
+        _xui_detect_bin_dir >/dev/null || true
+        if [[ -z "$bin" ]]; then
+            report_diagnostic "ERROR" "capability_probe" \
+                "No executable 3x-ui Go binary found in running container (checked /app/x-ui, /usr/local/x-ui/x-ui, /app/3x-ui)" \
+                "3xui_app CLI integration" \
+                "Verify the container image layout or run '3xui-deploy compat matrix'."
+            return 1
+        fi
+        local help_out
+        help_out=$(run_out "docker exec 3xui_app $(quote_sh "$bin") setting -h 2>&1 || docker exec 3xui_app $(quote_sh "$bin") setting --help 2>&1" || true)
+        local flag found_flags=""
+        for flag in show getListen getCert port listenIP webBasePath username password resetTwoFactor webCert webCertKey; do
+            if printf '%s' "$help_out" | grep -qE -- "[-]{1,2}${flag}\\b"; then
+                found_flags+="${found_flags:+,}${flag}"
+            fi
+        done
+        XUI_CAPS_FLAGS="$found_flags"
+        if [[ -z "$found_flags" ]]; then
+            warn "Could not detect known flags in '${bin} setting -h' (future CLI contract drift possible)."
+        fi
+    fi
+    _xui_check_db_schema || return 1
+    return 0
+}
+
+xui_preflight_image() {
+    local tag="$1"
+    validate_tag "$tag" || { error "Invalid tag for preflight: $tag"; return 1; }
+    local img="ghcr.io/mhsanaei/3x-ui:${tag}"
+    local probe_script='
+b=""
+for p in /app/x-ui /usr/local/x-ui/x-ui /app/3x-ui; do
+    if [ -x "$p" ] && [ "$(head -c 2 "$p" 2>/dev/null)" != "#!" ]; then
+        b="$p"; break
+    fi
+done
+[ -n "$b" ] || { echo "PREFLIGHT_ERR:no_go_binary"; exit 2; }
+help_out=$("$b" setting -h 2>&1 || "$b" setting --help 2>&1 || true)
+printf "PREFLIGHT_BIN=%s\n" "$b"
+printf "%s\n" "$help_out" | grep -qE -- "-show|-port|-username" || { echo "PREFLIGHT_ERR:setting_cli_changed"; exit 3; }
+echo "PREFLIGHT_OK=1"
+'
+    local out rc=0
+    out=$(run_out "docker run --rm --entrypoint sh $(quote_sh "$img") -c $(quote_sh "$probe_script") 2>&1") || rc=$?
+    if (( rc != 0 )) || ! printf '%s\n' "$out" | grep -q 'PREFLIGHT_OK=1'; then
+        report_diagnostic "ERROR" "image_preflight" \
+            "Image ${img} failed pre-deployment binary/CLI compatibility inspection" \
+            "ghcr.io/mhsanaei/3x-ui:${tag}" \
+            "Inspect release notes for breaking changes or re-run with --force-compat if intentional." \
+            "$(printf '%s' "$out" | tr '\n' ' ')"
+        return 1
+    fi
+    log_debug "Preflight OK for $img: $(printf '%s' "$out" | tr '\n' ' ')"
+    return 0
+}
+
+xui_check_compatibility() {
+    local subcmd="${1:-check}"
+    local arg="${2:-}"
+
+    if [[ "$subcmd" == "matrix" ]]; then
+        echo ""
+        echo -e "  ${BOLD}3x-ui Compatibility Contract Matrix${NC}"
+        echo -e "  ${DIM}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${NC}"
+        echo "  Supported Versions : v2.0.0 .. v3.x (majors: ${XUI_COMPAT_SUPPORTED_MAJORS})"
+        echo "  Legacy Unsupported : < v${XUI_COMPAT_MIN_VERSION} (blocked unless --force-compat)"
+        echo "  Future Major       : >= v$(( XUI_COMPAT_MAX_TESTED_MAJOR + 1 )).0.0 (blocked unless --force-compat)"
+        echo "  Binary Candidates  : /app/x-ui, /usr/local/x-ui/x-ui, /app/3x-ui"
+        echo "  DB Tables Required : settings(key,value), inbounds(id,enable,protocol,listen,port,remark,stream_settings)"
+        echo "  Setting CLI Flags  : show, getListen, getCert, port, listenIP, webBasePath, username, password, resetTwoFactor, webCert, webCertKey"
+        echo ""
+        return 0
+    fi
+
+    if [[ "$subcmd" == "test" ]]; then
+        [[ -n "$arg" ]] || { error "Usage: manage.sh compat test <version-tag>"; return 1; }
+        validate_tag "$arg" || { error "Invalid tag: $arg"; return 1; }
+        local cur cls
+        cur=$(xui_detect_version || true)
+        cls=$(xui_classify_version "$arg" "$cur")
+        info "Target tag '$arg' classified as: $cls (current: ${cur:-none})"
+        if [[ "$cls" == "unsupported_legacy" || "$cls" == "unsupported_major" ]]; then
+            report_diagnostic "CRITICAL" "compat_test" \
+                "Target 3x-ui tag '${arg}' is classified as '${cls}' outside tested majors (${XUI_COMPAT_SUPPORTED_MAJORS})." \
+                "3xui_app / compose.yaml" \
+                "Choose a supported v2.x/v3.x release tag or pass --force-compat at your own risk."
+            $FORCE_COMPAT || return 1
+        fi
+        if run_q "command -v docker"; then
+            info "Pulling ghcr.io/mhsanaei/3x-ui:${arg} for read-only preflight..."
+            run "docker pull $(quote_sh "ghcr.io/mhsanaei/3x-ui:${arg}")" || return 1
+            xui_preflight_image "$arg" || return 1
+            success "Pre-flight compatibility check passed for ${arg}"
+        else
+            warn "Docker not installed; skipping image pull preflight (classification=${cls})."
+        fi
+        return 0
+    fi
+
+    local ver cls probe_rc=0
+    ver=$(xui_detect_version)
+    cls=$(xui_classify_version "$ver")
+    xui_probe_capabilities || probe_rc=$?
+
+    echo ""
+    echo -e "  ${BOLD}3x-ui Compatibility & Capability Report${NC}"
+    echo -e "  ${DIM}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${NC}"
+    echo "  Detected Version : ${ver:-unknown}"
+    echo "  Classification   : ${cls}"
+    echo "  Binary           : ${XUI_CAPS_BIN:-not detected}"
+    echo "  DB Path          : ${XUI_CAPS_DB_PATH:-/etc/x-ui/x-ui.db}"
+    echo "  Bin Dir          : ${XUI_CAPS_BIN_DIR:-/app/bin}"
+    echo "  Schema           : ${XUI_CAPS_SCHEMA_OK:-unknown}"
+    echo "  CLI Flags        : ${XUI_CAPS_FLAGS:-none detected}"
+    echo ""
+
+    if [[ "$cls" == "unsupported_legacy" || "$cls" == "unsupported_major" ]]; then
+        report_diagnostic "CRITICAL" "compat_check" \
+            "Installed 3x-ui version '${ver}' (${cls}) is outside supported versions (v2.x-v3.x)." \
+            "3xui_app" \
+            "Upgrade/pin to a supported v2.x/v3.x release or update 3xui-deploy."
+        $FORCE_COMPAT || return 1
+    fi
+    (( probe_rc == 0 )) || return 1
+    return 0
+}
+
 # ─── Panel Introspection & Settings ─────────────────────────────────────────
 # Note: inside mhsanaei/3x-ui Docker images, /usr/bin/x-ui is the x-ui.sh shell
-# wrapper (no 'setting' subcommand). Always invoke the Go binary (/app/x-ui).
+# wrapper (no 'setting' subcommand). Probe Go binary candidates dynamically.
 _xui_setting_cmd() {
     local args="" a
     for a in "$@"; do
         args+=" $(quote_sh "$a")"
     done
-    printf 'docker exec 3xui_app sh -c '\''b=/app/x-ui; [ -x "$b" ] || b=/usr/local/x-ui/x-ui; exec "$b" setting "$@"'\'' _%s' "$args"
+    printf 'docker exec 3xui_app sh -c '\''b=""; for c in /app/x-ui /usr/local/x-ui/x-ui /app/3x-ui; do if [ -x "$c" ] && [ "$(head -c 2 "$c" 2>/dev/null)" != "#!" ]; then b="$c"; break; fi; done; [ -n "$b" ] || b=/app/x-ui; exec "$b" setting "$@"'\'' _%s' "$args"
 }
 
 # Set panel username/password via stdin so the password never appears in local,
 # SSH, or docker exec process command-line arguments.
 _xui_set_credentials_stdin() {
     local user="$1" pass="$2" port="${3:-}" webpath="${4:-}"
-    local inner_sh='IFS= read -r _p; _u="$1"; _pt="$2"; _wp="$3"; b=/app/x-ui; [ -x "$b" ] || b=/usr/local/x-ui/x-ui; set -- setting "-username=${_u}" "-password=${_p}"; [ -n "$_pt" ] && set -- "$@" "-port=${_pt}"; [ -n "$_wp" ] && set -- "$@" "-webBasePath=${_wp}"; exec "$b" "$@"'
+    local inner_sh='IFS= read -r _p; _u="$1"; _pt="$2"; _wp="$3"; b=/app/x-ui; [ -x "$b" ] || b=/usr/local/x-ui/x-ui; [ -x "$b" ] || b=/app/3x-ui; set -- setting "-username=${_u}" "-password=${_p}"; [ -n "$_pt" ] && set -- "$@" "-port=${_pt}"; [ -n "$_wp" ] && set -- "$@" "-webBasePath=${_wp}"; exec "$b" "$@"'
     local cmd
     cmd="docker exec -i 3xui_app sh -c $(quote_sh "$inner_sh") _ $(quote_sh "$user") $(quote_sh "$port") $(quote_sh "$webpath")"
     if $REMOTE; then
@@ -1579,8 +2328,8 @@ _probe_panel_http() {
     code=$(printf '%s\n' "$resp" | awk -F: '/^__HTTP_CODE__:/ {print $2; exit}' | tr -d '\r ')
     body=$(printf '%s\n' "$resp" | sed '/^__HTTP_CODE__:/d')
 
-    if [[ "$code" == "200" ]] && printf '%s' "$body" | grep -qiE '(<html|id="app"|3x-ui|assets/)'; then
-        if ! printf '%s' "$body" | grep -qE '(Edge Relay Node|Service Status Portal)'; then
+    if [[ "$code" == "200" ]] && printf '%s' "$body" | grep -qiE '(<html|id="app"|3x-ui|assets/|vite)'; then
+        if ! printf '%s' "$body" | grep -qE '(Edge Relay Node|Service Status Portal|static-site-template:|Meridian Cloud Systems|Northstar Digital Studio|Atlas Engineering Docs)'; then
             return 0
         fi
     fi
@@ -1731,7 +2480,7 @@ _probe_sub_http() {
             ;;
     esac
 
-    if printf '%s' "$clean_resp" | grep -qE '(Edge Relay Node|Service Status Portal)'; then
+    if printf '%s' "$clean_resp" | grep -qE '(Edge Relay Node|Service Status Portal|static-site-template:|Meridian Cloud Systems|Northstar Digital Studio|Atlas Engineering Docs)'; then
         _SUB_PROBE_ERR="decoy"
         return 1
     fi
@@ -1964,11 +2713,43 @@ _sync_caddy_if_active() {
     if [[ "$SUB_MODE" == "dedicated" && -n "$SUB_DOMAIN" ]]; then
         run_q "grep -q $(quote_sh "tls /root/cert/$SUB_DOMAIN/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" && use_s_cert=true
     fi
-    generate_caddyfile "$PROXY_DOMAIN" "$PROXY_PORT" "$PROXY_EMAIL" "$p_port" "$p_path" \
+
+    local cf="$INSTALL_DIR/caddy/Caddyfile"
+    local cf_bak="$INSTALL_DIR/caddy/Caddyfile.bak"
+    local had_cf=false
+    if run_q "test -f $(quote_sh "$cf")"; then
+        had_cf=true
+        run "cp $(quote_sh "$cf") $(quote_sh "$cf_bak") && chmod 644 $(quote_sh "$cf_bak")" || true
+    fi
+
+    if ! generate_caddyfile "$PROXY_DOMAIN" "$PROXY_PORT" "$PROXY_EMAIL" "$p_port" "$p_path" \
         "$SUB_MODE" "$SUB_DOMAIN" "$SUB_PORT" "$SUB_PATH" "$SUB_JSON_PATH" \
-        "$use_p_cert" "$use_s_cert" || return 1
+        "$use_p_cert" "$use_s_cert"; then
+        $had_cf && run_q "mv -f $(quote_sh "$cf_bak") $(quote_sh "$cf")" || true
+        report_diagnostic "ERROR" "sync_caddy" \
+            "Failed to generate updated Caddyfile" \
+            "Caddy reverse proxy ($cf)" \
+            "Restored previous Caddyfile; check proxy.conf and probe.conf values."
+        return 1
+    fi
+
     if is_caddy_running; then
-        _caddy_reload && success "Synced & reloaded Caddy reverse proxy" || warn "Failed to reload Caddy"
+        if _caddy_reload; then
+            run_q "rm -f $(quote_sh "$cf_bak")" || true
+            success "Synced & reloaded Caddy reverse proxy"
+        else
+            if $had_cf; then
+                run_q "mv -f $(quote_sh "$cf_bak") $(quote_sh "$cf")" || true
+                _caddy_reload >/dev/null 2>&1 || true
+            fi
+            report_diagnostic "ERROR" "caddy_reload" \
+                "Caddy rejected the regenerated configuration and was rolled back" \
+                "3xui_caddy ($cf)" \
+                "Inspect Caddy logs and probe/proxy settings."
+            return 1
+        fi
+    else
+        run_q "rm -f $(quote_sh "$cf_bak")" || true
     fi
 }
 
@@ -2295,6 +3076,7 @@ configure_panel_security() {
     local disp_wdom="${PANEL_DOMAIN:-none}"
     local new_wdom
     read -rp "  Panel webDomain (domain or 'none' to clear) [${disp_wdom}]: " new_wdom
+    local domain_set=""
     if [[ "$new_wdom" == "none" || "$new_wdom" == "-" ]]; then
         xui_db_set "webDomain" "" || return 1
         success "Cleared webDomain"
@@ -2306,11 +3088,27 @@ configure_panel_security() {
         fi
         xui_db_set "webDomain" "$new_wdom" || return 1
         success "Panel webDomain set to ${new_wdom}"
+        domain_set="$new_wdom"
         changed=true
     fi
 
     if $changed; then
         confirm "Restart panel now to apply changes?" && restart_panel || true
+    fi
+
+    if [[ -n "$domain_set" ]]; then
+        load_proxy_conf
+        if $PROXY_ENABLED && [[ "$PROXY_DOMAIN" == "$domain_set" ]]; then
+            info "Panel domain '$domain_set' active; ensuring Web Management Panel is enabled..."
+            enable_webpanel auto || warn "Could not auto-enable Web Management Panel."
+        elif ! $PROXY_ENABLED; then
+            echo ""
+            info "A domain name ($domain_set) was configured for the main panel."
+            if confirm "Set up Caddy HTTPS proxy & automatically enable the Web Management Panel on https://${domain_set}/deploy/?"; then
+                PROXY_DOMAIN="$domain_set"
+                setup_reverse_proxy || true
+            fi
+        fi
     fi
 }
 
@@ -2551,36 +3349,136 @@ YAML
     fi
 }
 
+_rollback_failed_update() {
+    local target_tag="$1" prev_tag="$2" reason="$3"
+    local q_cfg q_bak
+    q_cfg=$(quote_sh "$INSTALL_DIR/compose.yaml")
+    q_bak=$(quote_sh "$INSTALL_DIR/compose.yaml.bak")
+
+    log_stage "update" "rollback" "Restoring previous version (${prev_tag:-backup}) after failed update to ${target_tag}..."
+    if run_q "test -f $q_bak" && run "cp $q_bak $q_cfg && chmod 600 $q_cfg"; then
+        compose up -d >/dev/null 2>&1 || true
+        invalidate_status
+        report_diagnostic "CRITICAL" "apply_version(${target_tag})" \
+            "$reason" \
+            "3xui_app / compose.yaml" \
+            "Automatically rolled back compose.yaml to '${prev_tag:-previous}'. Check logs with 'manage.sh logs deploy'."
+    else
+        report_diagnostic "CRITICAL" "apply_version(${target_tag})" \
+            "$reason (AND automatic rollback of compose.yaml.bak failed)" \
+            "3xui_app / compose.yaml" \
+            "Manually inspect $INSTALL_DIR/compose.yaml and restore from $BACKUP_DIR."
+    fi
+}
+
 apply_version() {
     local new_tag="$1"
     if ! validate_tag "$new_tag"; then
-        error "Invalid version tag: $new_tag"
+        report_diagnostic "ERROR" "apply_version" \
+            "Invalid version tag format: '${new_tag}'" \
+            "compose.yaml" \
+            "Provide a valid tag such as v2.6.0 or v3.0.0."
         return 1
     fi
 
-    echo ""
-    info "Applying version $new_tag..."
-
     is_deployed || { error "compose.yaml not found at $INSTALL_DIR"; return 1; }
+    detect_compose || { error "Docker Compose not found"; return 1; }
+
+    echo ""
+    log_stage "update" "classify" "Checking compatibility for target release ${new_tag}..."
+    local cur_ver cls
+    cur_ver=$(xui_detect_version || true)
+    cls=$(xui_classify_version "$new_tag" "$cur_ver")
+    info "Version check: current='${cur_ver:-unknown}' target='${new_tag}' classification='${cls}'"
+
+    case "$cls" in
+        unsupported_legacy|unsupported_major)
+            report_diagnostic "CRITICAL" "apply_version(${new_tag})" \
+                "Target 3x-ui version '${new_tag}' (${cls}) is outside tested compatibility range (v${XUI_COMPAT_MIN_VERSION}..v${XUI_COMPAT_MAX_TESTED_MAJOR}.x)." \
+                "3xui_app" \
+                "Update 3xui-deploy first or re-run with --force-compat if you want to bypass compatibility checks."
+            if ! $FORCE_COMPAT; then
+                return 1
+            fi
+            warn "Proceeding past unsupported version guard due to --force-compat."
+            ;;
+        major_upgrade)
+            warn "Major 3x-ui version jump detected (${cur_ver:-unknown} -> ${new_tag}). Database or CLI changes may occur."
+            if $INTERACTIVE && ! $AUTO_YES; then
+                confirm "Continue major upgrade to ${new_tag}?" || { info "Cancelled"; return 0; }
+            fi
+            ;;
+        unknown_tag)
+            warn "Non-semver tag '${new_tag}' selected; explicit version tags (e.g., v3.x.y) are safer for reproducibility."
+            if $INTERACTIVE && ! $AUTO_YES; then
+                confirm "Continue applying '${new_tag}'?" || { info "Cancelled"; return 0; }
+            fi
+            ;;
+    esac
+
+    local target_image="ghcr.io/mhsanaei/3x-ui:${new_tag}"
+    log_stage "update" "pull" "Pulling ${target_image} before modifying compose.yaml..."
+    if ! run "docker pull $(quote_sh "$target_image")"; then
+        report_diagnostic "ERROR" "apply_version(${new_tag})" \
+            "Failed to pull container image ${target_image}" \
+            "Docker registry / network" \
+            "Existing deployment was NOT modified. Verify network access and tag name, then retry."
+        return 1
+    fi
+
+    log_stage "update" "preflight" "Running read-only compatibility preflight on ${target_image}..."
+    if ! xui_preflight_image "$new_tag"; then
+        if ! $FORCE_COMPAT; then
+            warn "Aborted before modifying live stack."
+            return 1
+        fi
+        warn "Continuing despite preflight failure because --force-compat is set."
+    fi
 
     local q_cfg q_bak q_tmp
     q_cfg=$(quote_sh "$INSTALL_DIR/compose.yaml")
     q_bak=$(quote_sh "$INSTALL_DIR/compose.yaml.bak")
     q_tmp=$(quote_sh "$INSTALL_DIR/compose.yaml.tmp")
 
+    log_stage "update" "snapshot" "Creating pre-update configuration & data snapshot..."
     run "(umask 077 && cp $q_cfg $q_bak && chmod 600 $q_bak)" || { error "Failed to backup compose.yaml"; return 1; }
+    _perform_backup "pre_update" || warn "Pre-update data backup failed; compose.yaml.bak is preserved."
 
-    run "awk -v tag=$(quote_sh "$new_tag") 'index(\$0, \"image: ghcr.io/mhsanaei/3x-ui:\") > 0 { sub(/3x-ui:.*/, \"3x-ui:\" tag) } { print }' $q_cfg > $q_tmp && chmod 600 $q_tmp && mv $q_tmp $q_cfg" \
-        || { error "Failed to update version tag in compose.yaml"; return 1; }
+    log_stage "update" "apply" "Updating compose.yaml to ${new_tag} and recreating containers..."
+    if ! run "awk -v tag=$(quote_sh "$new_tag") 'index(\$0, \"image: ghcr.io/mhsanaei/3x-ui:\") > 0 { sub(/3x-ui:.*/, \"3x-ui:\" tag) } { print }' $q_cfg > $q_tmp && chmod 600 $q_tmp && mv $q_tmp $q_cfg"; then
+        run_q "cp $q_bak $q_cfg && chmod 600 $q_cfg" || true
+        error "Failed to update version tag in compose.yaml"
+        return 1
+    fi
 
-    info "Pulling image ($new_tag)..."
-    compose pull || { error "Image pull failed. Use 'Rollback version' to revert."; return 1; }
-
-    info "Recreating containers..."
-    compose up -d || { error "Container recreation failed. Use 'Rollback version' to revert."; return 1; }
+    if ! compose up -d; then
+        _rollback_failed_update "$new_tag" "$cur_ver" "Container recreation (compose up -d) failed"
+        return 1
+    fi
 
     invalidate_status
-    success "Panel successfully updated to version $new_tag"
+    log_stage "update" "verify" "Verifying container runtime, schema compatibility, and web endpoints..."
+    local verify_err=""
+    if ! is_running; then
+        verify_err="3xui_app container did not stay running after upgrade"
+    elif ! xui_probe_capabilities; then
+        verify_err="Post-update capability/schema compatibility probe failed"
+    elif ! verify_panel_loaded 12; then
+        verify_err="3X-UI Web UI did not respond cleanly after upgrade (status=${PANEL_LOAD_STATUS})"
+    fi
+
+    if [[ -z "$verify_err" ]] && { [[ "$SUB_MODE" != "none" || "$SUB_ENABLE_DB" == "true" ]]; }; then
+        if ! verify_subscription_endpoint 6; then
+            verify_err="Subscription endpoint verification failed after upgrade (status=${SUB_VERIFY_STATUS})"
+        fi
+    fi
+
+    if [[ -n "$verify_err" ]]; then
+        _rollback_failed_update "$new_tag" "$cur_ver" "$verify_err"
+        return 1
+    fi
+
+    success "Panel successfully updated and verified on version $new_tag"
     compose ps || true
 }
 
@@ -2774,9 +3672,11 @@ deploy() {
 
 update_panel_latest() {
     require_deployed || return 1
-    local latest_tag
-    latest_tag=$(get_latest_version)
-    apply_version "$latest_tag"
+    local target_tag="${1:-}"
+    if [[ -z "$target_tag" ]]; then
+        target_tag=$(get_latest_version)
+    fi
+    apply_version "$target_tag"
 }
 
 change_version_manually() {
@@ -2902,8 +3802,18 @@ status_panel() {
 }
 
 logs_panel() {
-    require_deployed || return 1
     local mode="${1:-}"
+    if [[ "$mode" == "deploy" ]]; then
+        local lf
+        lf=$(_resolve_log_file)
+        if run_q "test -f $(quote_sh "$lf")"; then
+            run "tail -n 200 $(quote_sh "$lf")"
+        else
+            info "No deployment log file found yet at $lf"
+        fi
+        return 0
+    fi
+    require_deployed || return 1
 
     if [[ -n "$mode" ]]; then
         case "$mode" in
@@ -2921,7 +3831,7 @@ logs_panel() {
         return
     fi
 
-    tui_select "Logs Viewer" "Select log length:" "Live follow" "Last 100 lines" "Last 500 lines" "Full logs" "Cancel"
+    tui_select "Logs Viewer" "Select log source/length:" "Live follow (containers)" "Last 100 lines" "Last 500 lines" "Full container logs" "3xui-deploy operation logs" "Cancel"
     local sel=$?
     clear_screen
 
@@ -2930,7 +3840,8 @@ logs_panel() {
         1) compose logs --tail=100 ;;
         2) compose logs --tail=500 ;;
         3) compose logs ;;
-        4|255) info "Cancelled" ;;
+        4) logs_panel deploy ;;
+        5|255) info "Cancelled" ;;
     esac
 }
 
@@ -3060,6 +3971,11 @@ fi
 
 [ -d $q_inst/cert ] && cp -a $q_inst/cert $q_stage/cert
 [ -d $q_inst/caddy ] && cp -a $q_inst/caddy $q_stage/caddy
+if [ -d $q_inst/webpanel ]; then
+    mkdir -p $q_stage/webpanel
+    [ -f $q_inst/webpanel/webpanel.conf ] && cp -a $q_inst/webpanel/webpanel.conf $q_stage/webpanel/
+    [ -f $q_inst/webpanel/auth.json ] && cp -a $q_inst/webpanel/auth.json $q_stage/webpanel/
+fi
 [ -f $q_inst/compose.yaml ] && cp -a $q_inst/compose.yaml $q_stage/compose.yaml
 [ -f $q_inst/.env ] && cp -a $q_inst/.env $q_stage/.env
 
@@ -3252,7 +4168,7 @@ if [ ! -d "\$src/db" ] && [ ! -f "\$src/compose.yaml" ]; then
     [ -n "\$sub" ] && src="\$sub"
 fi
 
-for chk in "\$src/compose.yaml" "\$src/.env" "\$src/caddy/proxy.conf" "\$src/caddy/Caddyfile" "\$src/db/x-ui.db" "\$src/postgres_dump.sql"; do
+for chk in "\$src/compose.yaml" "\$src/.env" "\$src/caddy/proxy.conf" "\$src/caddy/probe.conf" "\$src/caddy/Caddyfile" "\$src/webpanel/webpanel.conf" "\$src/webpanel/auth.json" "\$src/db/x-ui.db" "\$src/postgres_dump.sql"; do
     if [ -L "\$chk" ]; then
         echo "Refusing symlink inside backup: \$chk" >&2
         exit 1
@@ -3278,6 +4194,13 @@ if [ -d "\$src/caddy" ]; then
     [ -d $(quote_sh "$INSTALL_DIR/caddy/data") ] && chmod 700 $(quote_sh "$INSTALL_DIR/caddy/data")
     [ -d $(quote_sh "$INSTALL_DIR/caddy/config") ] && chmod 700 $(quote_sh "$INSTALL_DIR/caddy/config")
     [ -f $(quote_sh "$INSTALL_DIR/caddy/proxy.conf") ] && chmod 600 $(quote_sh "$INSTALL_DIR/caddy/proxy.conf")
+    [ -f $(quote_sh "$INSTALL_DIR/caddy/probe.conf") ] && chmod 600 $(quote_sh "$INSTALL_DIR/caddy/probe.conf")
+fi
+if [ -d "\$src/webpanel" ]; then
+    mkdir -p $(quote_sh "$INSTALL_DIR/webpanel")
+    [ -f "\$src/webpanel/webpanel.conf" ] && cp -a "\$src/webpanel/webpanel.conf" $(quote_sh "$INSTALL_DIR/webpanel/webpanel.conf") && chmod 600 $(quote_sh "$INSTALL_DIR/webpanel/webpanel.conf")
+    [ -f "\$src/webpanel/auth.json" ] && cp -a "\$src/webpanel/auth.json" $(quote_sh "$INSTALL_DIR/webpanel/auth.json") && chmod 600 $(quote_sh "$INSTALL_DIR/webpanel/auth.json")
+    chmod 700 $(quote_sh "$INSTALL_DIR/webpanel")
 fi
 if [ -f "\$src/compose.yaml" ]; then
     cp -a "\$src/compose.yaml" $(quote_sh "$INSTALL_DIR/compose.yaml")
@@ -3893,7 +4816,7 @@ _parse_stream_settings() {
 _inbound_fw_proto() {
     local proto="${1-}" net="${2-tcp}"
     case "$proto" in
-        wireguard|hysteria|hysteria2|tuic)
+        wireguard|amneziawg|hysteria|hysteria2|tuic|masque)
             printf 'udp' ;;
         shadowsocks|dokodemo-door|mixed|socks)
             printf 'both' ;;
@@ -3932,17 +4855,22 @@ _format_inbound_rows() {
 
 get_xui_inbounds() {
     local raw_rows=""
+    local stream_col="stream_settings"
     if _is_postgres_backend; then
         is_pg_running || return 0
         get_pg_env
         local sql="SELECT id, enable, protocol, COALESCE(NULLIF(listen,''), '0.0.0.0'), port, regexp_replace(COALESCE(remark,''), E'[\\r\\n\\t]+', ' ', 'g'), regexp_replace(COALESCE(stream_settings,''), E'[\\r\\n\\t]+', ' ', 'g') FROM inbounds ORDER BY id;"
         raw_rows=$(run_out "docker exec 3xui_postgres psql -U $(quote_sh "$PG_USER") -d $(quote_sh "$PG_DB") -F \$'\t' -tA -c $(quote_sh "$sql")" || true)
     else
-        local sql="SELECT id, enable, protocol, COALESCE(NULLIF(listen,''), '0.0.0.0'), port, replace(replace(replace(COALESCE(remark,''), char(10), ' '), char(13), ''), char(9), ' '), replace(replace(replace(COALESCE(stream_settings,''), char(10), ' '), char(13), ''), char(9), ' ') FROM inbounds ORDER BY id;"
-        if is_running && ensure_sqlite_in_container; then
-            raw_rows=$(run_out "docker exec 3xui_app sqlite3 -cmd '.timeout 5000' -separator \$'\t' /etc/x-ui/x-ui.db $(quote_sh "$sql")" || true)
-        elif run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
-            raw_rows=$(run_out "sqlite3 -cmd '.timeout 5000' -separator \$'\t' $(quote_sh "$INSTALL_DIR/db/x-ui.db") $(quote_sh "$sql")" || true)
+        local sql="SELECT id, enable, protocol, COALESCE(NULLIF(listen,''), '0.0.0.0'), port, replace(replace(replace(COALESCE(remark,''), char(10), ' '), char(13), ''), char(9), ' '), replace(replace(replace(COALESCE(${stream_col},''), char(10), ' '), char(13), ''), char(9), ' ') FROM inbounds ORDER BY id;"
+        raw_rows=$(_xui_sqlite_query "$sql" $'\t')
+        if [[ -z "$raw_rows" ]]; then
+            local cols
+            cols=$(_xui_sqlite_query "PRAGMA table_info(inbounds);" "|" || true)
+            if [[ -n "$cols" ]] && printf '%s\n' "$cols" | cut -d'|' -f2 | grep -qx 'streamSettings'; then
+                sql="SELECT id, enable, protocol, COALESCE(NULLIF(listen,''), '0.0.0.0'), port, replace(replace(replace(COALESCE(remark,''), char(10), ' '), char(13), ''), char(9), ' '), replace(replace(replace(COALESCE(streamSettings,''), char(10), ' '), char(13), ''), char(9), ' ') FROM inbounds ORDER BY id;"
+                raw_rows=$(_xui_sqlite_query "$sql" $'\t')
+            fi
         fi
     fi
     _format_inbound_rows "$raw_rows"
@@ -3950,12 +4878,14 @@ get_xui_inbounds() {
 
 _collect_caddy_inbound_blocks() {
     local panel_path="${1:-/}" sub_path="${2:-/sub/}" sub_json_path="${3:-/json/}"
+    local wp_base=""
+    $WEBPANEL_ENABLED && wp_base="${WEBPANEL_PATH%/}"
     local p_base="${panel_path%/}" s_base="${sub_path%/}" j_base="${sub_json_path%/}"
     local inbounds="${INBOUNDS_OVERRIDE:-}"
     [[ -z "$inbounds" ]] && inbounds=$(get_xui_inbounds || true)
     [[ -z "$inbounds" ]] && return 0
 
-    local seen_paths="|${p_base}|${s_base}|${j_base}|"
+    local seen_paths="|${p_base}|${s_base}|${j_base}|${wp_base}|"
     local id en proto listen port remark net sec path fw_proto
     while IFS='|' read -r id en proto listen port remark net sec path fw_proto; do
         [[ "$id" =~ ^[0-9]+$ ]] || continue
@@ -4080,60 +5010,736 @@ remove_caddy_compose() {
     fi
 }
 
+_html_escape() {
+    local s="${1-}"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    s="${s//\"/&quot;}"
+    printf '%s' "$s"
+}
+
 generate_decoy_site() {
     local force="${1:-false}"
     local site_dir="$INSTALL_DIR/caddy/site"
     local index_file="$site_dir/index.html"
 
-    run "mkdir -p $(quote_sh "$site_dir") && chmod 755 $(quote_sh "$site_dir")" || return 1
+    run "mkdir -p $(quote_sh "$site_dir") $(quote_sh "$site_dir/assets") && chmod 755 $(quote_sh "$site_dir") $(quote_sh "$site_dir/assets")" || return 1
     if [[ "$force" != "true" ]] && run_q "test -f $(quote_sh "$index_file")"; then
         return 0
     fi
 
-    local html
-    html=$(cat <<'HTML'
+    if run_q "test -f $(quote_sh "$INSTALL_DIR/caddy/probe.conf")"; then
+        load_probe_conf
+    fi
+
+    local theme="${DECOY_THEME:-cloud}"
+    local brand tagline email accent accent_dark hero_eyebrow hero_title hero_desc
+    local card1_t card1_d card2_t card2_d card3_t card3_d
+
+    case "$theme" in
+        studio)
+            brand="${DECOY_SITE_NAME:-Northstar Digital Studio}"
+            tagline="${DECOY_SITE_TAGLINE:-Product Architecture, Design Systems & Web Engineering}"
+            email="${DECOY_CONTACT_EMAIL:-hello@northstarstudio.example}"
+            accent="#0f766e"; accent_dark="#115e59"
+            hero_eyebrow="Digital Product Engineering"
+            hero_title="Resilient interfaces and scalable design systems for modern teams."
+            hero_desc="We partner with product organizations to design, benchmark, and ship accessible web platforms built on measurable performance standards."
+            card1_t="Design Systems"; card1_d="Tokenized UI libraries, WCAG AA accessibility audits, and cohesive cross-product component architecture."
+            card2_t="Frontend Engineering"; card2_d="Zero-bloat static and server-rendered web applications engineered for sub-second Core Web Vitals."
+            card3_t="Platform Reliability"; card3_d="Automated visual regression pipelines, semantic release workflows, and edge caching governance."
+            ;;
+        docs)
+            brand="${DECOY_SITE_NAME:-Atlas Engineering Docs}"
+            tagline="${DECOY_SITE_TAGLINE:-Platform Architecture Reference, API Standards & Runbooks}"
+            email="${DECOY_CONTACT_EMAIL:-docs@atlaseng.example}"
+            accent="#1d4ed8"; accent_dark="#1e40af"
+            hero_eyebrow="Engineering Knowledge Base"
+            hero_title="Technical standards, service runbooks, and architecture documentation."
+            hero_desc="Centralized reference specifications covering service boundaries, observability schemas, change control, and operational readiness."
+            card1_t="API Governance"; card1_d="Versioned OpenAPI contracts, idempotency semantics, and structured error envelopes across services."
+            card2_t="Observability"; card2_d="Unified telemetry taxonomy for structured logs, latency histograms, and SLO burn-rate alerts."
+            card3_t="Release Operations"; card3_d="Blue-green deployment checklists, schema migration rules, and automated rollback verification."
+            ;;
+        *)
+            brand="${DECOY_SITE_NAME:-Meridian Cloud Systems}"
+            tagline="${DECOY_SITE_TAGLINE:-Managed Edge Infrastructure & Reliability Engineering}"
+            email="${DECOY_CONTACT_EMAIL:-hello@meridiancloud.example}"
+            accent="#0f4c81"; accent_dark="#0b3a63"
+            hero_eyebrow="Distributed Infrastructure"
+            hero_title="Predictable edge compute and reliability engineering at global scale."
+            hero_desc="We build fault-tolerant telemetry pipelines, regional failover automation, and low-latency delivery infrastructure for engineering teams."
+            card1_t="Regional Edge Compute"; card1_d="Deterministic request routing across regional availability zones with automated health-based traffic draining."
+            card2_t="Zero-Downtime Releases"; card2_d="Pre-flight schema verification, staged canary rollouts, and instant configuration rollback safeguards."
+            card3_t="Compliance & Auditing"; card3_d="Tamper-evident operational logs, strict TLS posture, and automated security baseline validation."
+            ;;
+    esac
+
+    local e_brand e_tagline e_email
+    e_brand=$(_html_escape "$brand")
+    e_tagline=$(_html_escape "$tagline")
+    e_email=$(_html_escape "$email")
+
+    local tmp_site
+    tmp_site=$(mktemp -d "${TMPDIR:-/tmp}/3xui-site.XXXXXX") || return 1
+    mkdir -p "$tmp_site/assets"
+
+    local nav_block footer_block
+    nav_block=$(cat <<EOF
+  <header class="site-header">
+    <div class="container nav-inner">
+      <a class="brand" href="index.html">
+        <span class="brand-badge" aria-hidden="true">M</span>
+        <span>${e_brand}</span>
+      </a>
+      <button id="nav-toggle" class="nav-toggle" type="button" aria-expanded="false" aria-label="Toggle navigation">Menu</button>
+      <nav id="site-nav" class="site-nav" aria-label="Main Navigation">
+        <a href="index.html">Home</a>
+        <a href="services.html">Services</a>
+        <a href="docs.html">Documentation</a>
+        <a href="about.html">About</a>
+        <a href="contact.html" class="nav-cta">Contact</a>
+      </nav>
+    </div>
+  </header>
+EOF
+)
+    footer_block=$(cat <<EOF
+  <footer class="site-footer">
+    <div class="container footer-grid">
+      <div>
+        <strong>${e_brand}</strong>
+        <p class="muted">${e_tagline}</p>
+      </div>
+      <div class="footer-links">
+        <a href="services.html">Services</a>
+        <a href="docs.html">Documentation</a>
+        <a href="about.html">About</a>
+        <a href="contact.html">Contact</a>
+        <button id="open-legal-modal" class="link-btn" type="button">Privacy &amp; Terms</button>
+      </div>
+    </div>
+    <div class="container footer-bottom">
+      <span>&copy; 2026 ${e_brand}. All rights reserved.</span>
+      <span class="muted">Contact: ${e_email}</span>
+    </div>
+  </footer>
+  <div id="legal-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="legal-title">
+    <div class="modal-box">
+      <h3 id="legal-title">Privacy &amp; Acceptable Use</h3>
+      <p class="muted">${e_brand} collects zero third-party advertising trackers on this public informational site. Contact submissions are processed locally in your browser unless explicitly integrated.</p>
+      <button id="close-legal-modal" class="btn btn-primary" type="button">Close</button>
+    </div>
+  </div>
+  <script src="assets/app.js"></script>
+EOF
+)
+
+    cat > "$tmp_site/favicon.svg" <<EOF
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="${accent}"/>
+  <path d="M18 44V20h7l7 12 7-12h7v24h-6V30l-8 13-8-13v14h-6z" fill="#ffffff"/>
+</svg>
+EOF
+
+    cat > "$tmp_site/robots.txt" <<'EOF'
+User-agent: *
+Allow: /
+Sitemap: /sitemap.xml
+EOF
+
+    cat > "$tmp_site/sitemap.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>/</loc></url>
+  <url><loc>/services.html</loc></url>
+  <url><loc>/docs.html</loc></url>
+  <url><loc>/about.html</loc></url>
+  <url><loc>/contact.html</loc></url>
+</urlset>
+EOF
+
+    cat > "$tmp_site/assets/style.css" <<EOF
+:root {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-alt: #f1f5f9;
+  --border: #e2e8f0;
+  --text: #0f172a;
+  --muted: #475569;
+  --accent: ${accent};
+  --accent-dark: ${accent_dark};
+  --ok: #059669;
+  --radius: 10px;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.container { width: 100%; max-width: 1120px; margin: 0 auto; padding: 0 1.25rem; }
+
+.site-header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.nav-inner {
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--text);
+}
+.brand:hover { text-decoration: none; }
+.brand-badge {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #ffffff;
+  display: grid;
+  place-items: center;
+  font-size: 0.9rem;
+}
+.site-nav { display: flex; align-items: center; gap: 1.25rem; }
+.site-nav a { color: var(--muted); font-weight: 500; font-size: 0.95rem; }
+.site-nav a:hover, .site-nav a.active { color: var(--text); text-decoration: none; }
+.site-nav .nav-cta {
+  padding: 0.42rem 0.85rem;
+  background: var(--accent);
+  color: #ffffff;
+  border-radius: 7px;
+}
+.site-nav .nav-cta:hover { background: var(--accent-dark); color: #ffffff; }
+.nav-toggle {
+  display: none;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.hero {
+  padding: 4rem 0 3rem;
+  background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
+  border-bottom: 1px solid var(--border);
+}
+.eyebrow {
+  display: inline-block;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  margin-bottom: 0.6rem;
+}
+.hero h1 { margin: 0 0 1rem; font-size: clamp(1.85rem, 3.6vw, 2.75rem); line-height: 1.18; max-width: 760px; }
+.hero p { margin: 0 0 1.5rem; font-size: 1.06rem; color: var(--muted); max-width: 660px; }
+.actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+
+.btn {
+  display: inline-block;
+  padding: 0.62rem 1.15rem;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 0.94rem;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  background: var(--surface);
+  color: var(--text);
+}
+.btn-primary { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+.btn-primary:hover { background: var(--accent-dark); text-decoration: none; }
+.btn-ghost:hover { border-color: var(--accent); text-decoration: none; }
+
+.section { padding: 3rem 0; }
+.section-alt { background: var(--surface); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.section-title { margin: 0 0 0.4rem; font-size: 1.55rem; }
+.section-lead { margin: 0 0 1.75rem; color: var(--muted); max-width: 680px; }
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 1rem;
+  margin-top: 2.25rem;
+}
+.metric {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.15rem;
+}
+.metric strong { display: block; font-size: 1.45rem; color: var(--text); }
+.metric span { font-size: 0.86rem; color: var(--muted); }
+
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1.15rem;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.35rem;
+}
+.card h3 { margin: 0 0 0.5rem; font-size: 1.1rem; }
+.card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+
+.filter-tabs { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+.tab-btn {
+  padding: 0.42rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  font-weight: 500;
+}
+.tab-btn.active { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+
+.search-input {
+  width: 100%;
+  max-width: 440px;
+  padding: 0.62rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.96rem;
+  margin-bottom: 1.5rem;
+}
+
+.faq-list { display: flex; flex-direction: column; gap: 0.75rem; max-width: 780px; }
+.faq-item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.faq-q {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 1rem 1.15rem;
+  font-weight: 600;
+  font-size: 0.98rem;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+}
+.faq-a { padding: 0 1.15rem 1rem; color: var(--muted); font-size: 0.94rem; }
+
+.form-card {
+  max-width: 620px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.field { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.9rem; font-weight: 500; }
+.field input, .field select, .field textarea {
+  padding: 0.58rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-family: inherit;
+  font-size: 0.95rem;
+}
+.status-banner {
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  background: rgba(5, 150, 105, 0.1);
+  border: 1px solid rgba(5, 150, 105, 0.35);
+  color: var(--ok);
+  font-weight: 500;
+}
+
+.site-footer {
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding: 2.25rem 0 1.5rem;
+  margin-top: 2rem;
+}
+.footer-grid { display: flex; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+.footer-links { display: flex; gap: 1.1rem; flex-wrap: wrap; align-items: center; }
+.footer-links a, .link-btn { color: var(--muted); font-size: 0.9rem; background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit; }
+.footer-bottom {
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  font-size: 0.84rem;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.6);
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  z-index: 40;
+}
+.modal-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-width: 460px;
+  padding: 1.5rem;
+}
+
+@media (max-width: 760px) {
+  .nav-toggle { display: inline-block; }
+  .site-nav {
+    display: none;
+    position: absolute;
+    top: 64px;
+    left: 0;
+    right: 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 1rem 1.25rem;
+  }
+  .site-nav.open { display: flex; }
+}
+EOF
+
+    cat > "$tmp_site/assets/app.js" <<'EOF'
+(function () {
+  "use strict";
+
+  var navBtn = document.getElementById("nav-toggle");
+  var navMenu = document.getElementById("site-nav");
+  if (navBtn && navMenu) {
+    navBtn.addEventListener("click", function () {
+      var expanded = navMenu.classList.toggle("open");
+      navBtn.setAttribute("aria-expanded", expanded ? "true" : "false");
+    });
+  }
+
+  var openModal = document.getElementById("open-legal-modal");
+  var closeModal = document.getElementById("close-legal-modal");
+  var modal = document.getElementById("legal-modal");
+  if (openModal && closeModal && modal) {
+    openModal.addEventListener("click", function () { modal.classList.remove("hidden"); });
+    closeModal.addEventListener("click", function () { modal.classList.add("hidden"); });
+  }
+
+  document.querySelectorAll(".faq-q").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var answer = btn.nextElementSibling;
+      if (answer) {
+        var hidden = answer.classList.toggle("hidden");
+        btn.setAttribute("aria-expanded", hidden ? "false" : "true");
+      }
+    });
+  });
+
+  document.querySelectorAll(".tab-btn").forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      var filter = tab.getAttribute("data-filter");
+      document.querySelectorAll(".tab-btn").forEach(function (t) { t.classList.remove("active"); });
+      tab.classList.add("active");
+      document.querySelectorAll("[data-category]").forEach(function (card) {
+        var cat = card.getAttribute("data-category");
+        card.classList.toggle("hidden", filter !== "all" && cat !== filter);
+      });
+    });
+  });
+
+  var docSearch = document.getElementById("doc-search");
+  if (docSearch) {
+    docSearch.addEventListener("input", function () {
+      var q = docSearch.value.trim().toLowerCase();
+      document.querySelectorAll("[data-doc-item]").forEach(function (item) {
+        var text = (item.textContent || "").toLowerCase();
+        item.classList.toggle("hidden", q !== "" && text.indexOf(q) === -1);
+      });
+    });
+  }
+
+  var contactForm = document.getElementById("contact-form");
+  if (contactForm) {
+    contactForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var nameEl = document.getElementById("c-name");
+      var emailEl = document.getElementById("c-email");
+      var msgEl = document.getElementById("c-message");
+      var outEl = document.getElementById("contact-status");
+      if (!nameEl.value.trim() || !emailEl.value.trim() || msgEl.value.trim().length < 10) {
+        outEl.textContent = "Please complete all fields (message must be at least 10 characters).";
+        outEl.classList.remove("hidden");
+        return;
+      }
+      outEl.textContent = "Thank you, " + nameEl.value.trim() + ". Your inquiry reference #" + Math.floor(10000 + Math.random() * 89999) + " has been recorded.";
+      outEl.classList.remove("hidden");
+      contactForm.reset();
+    });
+  }
+})();
+EOF
+
+    cat > "$tmp_site/index.html" <<EOF
+<!DOCTYPE html>
+<!-- static-site-template:v2 -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${e_brand} — ${e_tagline}</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+${nav_block}
+  <main>
+    <section class="hero">
+      <div class="container">
+        <span class="eyebrow">${hero_eyebrow}</span>
+        <h1>${hero_title}</h1>
+        <p>${hero_desc}</p>
+        <div class="actions">
+          <a class="btn btn-primary" href="services.html">Explore Services</a>
+          <a class="btn btn-ghost" href="docs.html">Read Documentation</a>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric"><strong>99.98%</strong><span>Measured quarterly availability</span></div>
+          <div class="metric"><strong>&lt; 28 ms</strong><span>Median regional edge response</span></div>
+          <div class="metric"><strong>24 / 7</strong><span>Automated telemetry &amp; failover</span></div>
+          <div class="metric"><strong>ISO-27001</strong><span>Aligned operational controls</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <h2 class="section-title">Core Capabilities</h2>
+        <p class="section-lead">Structured engineering practices built for predictability, maintainability, and clear audit trails.</p>
+        <div class="cards-grid">
+          <article class="card"><h3>${card1_t}</h3><p>${card1_d}</p></article>
+          <article class="card"><h3>${card2_t}</h3><p>${card2_d}</p></article>
+          <article class="card"><h3>${card3_t}</h3><p>${card3_d}</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt">
+      <div class="container">
+        <h2 class="section-title">Frequently Asked Questions</h2>
+        <p class="section-lead">Common operational questions from engineering and security teams.</p>
+        <div class="faq-list">
+          <div class="faq-item">
+            <button class="faq-q" type="button" aria-expanded="false">How are maintenance windows communicated? <span>+</span></button>
+            <div class="faq-a hidden">Planned upgrades run during low-traffic regional windows with pre-flight verification and automatic rollback checks.</div>
+          </div>
+          <div class="faq-item">
+            <button class="faq-q" type="button" aria-expanded="false">What SLA targets apply to managed infrastructure? <span>+</span></button>
+            <div class="faq-a hidden">Production tiers include 99.95% uptime commitments backed by multi-region health monitoring and automated failover.</div>
+          </div>
+          <div class="faq-item">
+            <button class="faq-q" type="button" aria-expanded="false">How can teams request an architecture review? <span>+</span></button>
+            <div class="faq-a hidden">Reach out via our <a href="contact.html">contact page</a> or review our published standards in the <a href="docs.html">documentation hub</a>.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+${footer_block}
+</body>
+</html>
+EOF
+
+    cat > "$tmp_site/services.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Service Status Portal</title>
-  <style>
-    :root { color-scheme: dark; }
-    body {
-      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background: #0f172a; color: #e2e8f0; display: grid; place-items: center; min-height: 100vh;
-    }
-    .card {
-      max-width: 460px; padding: 2rem; border-radius: 12px;
-      background: #1e293b; border: 1px solid #334155; box-shadow: 0 12px 30px rgba(0,0,0,.35);
-    }
-    h1 { margin: 0 0 .5rem; font-size: 1.25rem; font-weight: 600; }
-    p { margin: 0 0 1.25rem; color: #94a3b8; font-size: .95rem; line-height: 1.5; }
-    .badge {
-      display: inline-flex; align-items: center; gap: .5rem;
-      font-size: .85rem; color: #34d399; background: rgba(16,185,129,.12);
-      padding: .35rem .75rem; border-radius: 999px;
-    }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; }
-  </style>
+  <title>Services — ${e_brand}</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
-  <main class="card">
-    <h1>Service Status Portal</h1>
-    <p>All core platform systems are operating normally. Scheduled maintenance windows are announced in advance.</p>
-    <span class="badge"><span class="dot"></span>Operational</span>
+${nav_block}
+  <main class="section">
+    <div class="container">
+      <span class="eyebrow">Solutions Catalog</span>
+      <h1 class="section-title">Managed Services &amp; Architecture Practice</h1>
+      <p class="section-lead">Filter by practice area to review deliverables and operational scope.</p>
+      <div class="filter-tabs" role="tablist">
+        <button class="tab-btn active" type="button" data-filter="all">All</button>
+        <button class="tab-btn" type="button" data-filter="infra">Infrastructure</button>
+        <button class="tab-btn" type="button" data-filter="reliability">Reliability</button>
+        <button class="tab-btn" type="button" data-filter="security">Security</button>
+      </div>
+      <div class="cards-grid">
+        <article class="card" data-category="infra"><h3>${card1_t}</h3><p>${card1_d}</p></article>
+        <article class="card" data-category="reliability"><h3>${card2_t}</h3><p>${card2_d}</p></article>
+        <article class="card" data-category="security"><h3>${card3_t}</h3><p>${card3_d}</p></article>
+        <article class="card" data-category="infra"><h3>TLS &amp; Edge Routing</h3><p>Automated certificate lifecycle governance, HTTP/2 &amp; HTTP/3 termination, and strict transport policy headers.</p></article>
+        <article class="card" data-category="reliability"><h3>Disaster Recovery Drills</h3><p>Scheduled point-in-time archive verification and automated cross-host restore testing.</p></article>
+        <article class="card" data-category="security"><h3>Baseline Auditing</h3><p>Continuous verification of least-privilege permissions, credential hygiene, and host firewall rules.</p></article>
+      </div>
+    </div>
   </main>
+${footer_block}
 </body>
 </html>
-HTML
-)
+EOF
+
+    cat > "$tmp_site/docs.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Documentation — ${e_brand}</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+${nav_block}
+  <main class="section">
+    <div class="container">
+      <span class="eyebrow">Reference Hub</span>
+      <h1 class="section-title">Technical Documentation &amp; Guides</h1>
+      <p class="section-lead">Search platform standards, reliability playbooks, and integration checklists.</p>
+      <input id="doc-search" class="search-input" type="search" placeholder="Filter documentation topics (e.g., TLS, backup, SLA)...">
+      <div class="cards-grid">
+        <article class="card" data-doc-item><h3>Edge TLS &amp; HSTS Standard</h3><p>Configuration baseline requiring TLS 1.2+, strict transport headers, and automated certificate renewal verification.</p></article>
+        <article class="card" data-doc-item><h3>Backup &amp; Recovery Policy</h3><p>Online consistent database snapshots paired with pre-restore safety archives and checksum validation.</p></article>
+        <article class="card" data-doc-item><h3>Change Management &amp; Rollback</h3><p>Pre-flight artifact validation, staged release rollout, and automated health-checked rollback gates.</p></article>
+        <article class="card" data-doc-item><h3>Incident Response SLA</h3><p>Severity classification matrix (INFO, WARN, ERROR, CRITICAL) with root-cause diagnostics and resolution playbooks.</p></article>
+      </div>
+    </div>
+  </main>
+${footer_block}
+</body>
+</html>
+EOF
+
+    cat > "$tmp_site/about.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>About — ${e_brand}</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+${nav_block}
+  <main class="section">
+    <div class="container">
+      <span class="eyebrow">Organization</span>
+      <h1 class="section-title">About ${e_brand}</h1>
+      <p class="section-lead">${e_tagline}</p>
+      <div class="cards-grid">
+        <article class="card"><h3>Engineering Philosophy</h3><p>Every production system deserves clear failure boundaries, reproducible builds, and transparent diagnostics without brittle shortcuts.</p></article>
+        <article class="card"><h3>Regional Presence</h3><p>Operational support spanning European, North American, and Asia-Pacific availability zones with consistent observability.</p></article>
+        <article class="card"><h3>Security Commitment</h3><p>Least-privilege defaults, minimal runtime attack surfaces, and regular independent configuration verification.</p></article>
+      </div>
+    </div>
+  </main>
+${footer_block}
+</body>
+</html>
+EOF
+
+    cat > "$tmp_site/contact.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Contact — ${e_brand}</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+${nav_block}
+  <main class="section">
+    <div class="container">
+      <span class="eyebrow">Get In Touch</span>
+      <h1 class="section-title">Contact ${e_brand}</h1>
+      <p class="section-lead">Questions about infrastructure engineering, SLAs, or documentation? Send a note below or email ${e_email}.</p>
+      <form id="contact-form" class="form-card" novalidate>
+        <div id="contact-status" class="status-banner hidden" role="status"></div>
+        <label class="field"><span>Full Name</span><input id="c-name" type="text" required placeholder="Alex Rivera"></label>
+        <label class="field"><span>Work Email</span><input id="c-email" type="email" required placeholder="alex@company.example"></label>
+        <label class="field"><span>Topic</span><select id="c-topic"><option>Infrastructure Review</option><option>Reliability Consulting</option><option>Documentation Feedback</option></select></label>
+        <label class="field"><span>Message</span><textarea id="c-message" rows="4" required placeholder="Tell us about your workload and timeline..."></textarea></label>
+        <button class="btn btn-primary" type="submit">Send Inquiry</button>
+      </form>
+    </div>
+  </main>
+${footer_block}
+</body>
+</html>
+EOF
+
+    cat > "$tmp_site/404.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Page Not Found — ${e_brand}</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+${nav_block}
+  <main class="section">
+    <div class="container">
+      <span class="eyebrow">404 Not Found</span>
+      <h1 class="section-title">The requested page could not be found.</h1>
+      <p class="section-lead">Check the URL or return to the homepage to browse services and documentation.</p>
+      <a class="btn btn-primary" href="index.html">Back to Home</a>
+    </div>
+  </main>
+${footer_block}
+</body>
+</html>
+EOF
+
     if $REMOTE; then
-        printf '%s\n' "$html" | ssh_cmd "cat > $(quote_sh "$index_file") && chmod 644 $(quote_sh "$index_file")"
+        tar -cf - -C "$tmp_site" . | ssh_cmd "mkdir -p $(quote_sh "$site_dir") && chmod 755 $(quote_sh "$site_dir") && tar --no-same-owner -xf - -C $(quote_sh "$site_dir") && find $(quote_sh "$site_dir") -type d -exec chmod 755 {} + && find $(quote_sh "$site_dir") -type f -exec chmod 644 {} +"
     else
-        printf '%s\n' "$html" > "$index_file"
-        chmod 644 "$index_file"
+        mkdir -p "$site_dir/assets"
+        cp -a "$tmp_site/." "$site_dir/"
+        find "$site_dir" -type d -exec chmod 755 {} + 2>/dev/null || true
+        find "$site_dir" -type f -exec chmod 644 {} + 2>/dev/null || true
     fi
+    rm -rf "$tmp_site"
 }
 
 _caddy_tls_block() {
@@ -4193,6 +5799,251 @@ _caddy_sub_routes() {
 EOF
 }
 
+_regex_escape_caddy() {
+    local s="${1-}"
+    printf '%s' "$s" | sed -E 's/[][(){}.+*?^$|\\]/\\&/g; s/[[:space:]]+/\\s+/g'
+}
+
+_caddy_probe_redirect_blocks() {
+    local panel_path="${1:-/}" webpanel_path="${2:-/deploy/}" sub_path="${3:-/sub/}" sub_json_path="${4:-/json/}"
+    local inbound_paths_csv="${5:-}"
+
+    $PROBE_REDIRECT_ENABLED || return 0
+
+    local active_state="${PROBE_ACTIVE_STATE:-primary}"
+    local effective_mode="redirect"
+    local dest="${PROBE_REDIRECT_TARGET:-https://www.cloudflare.com}"
+    local status="${PROBE_REDIRECT_STATUS:-302}"
+
+    case "$active_state" in
+        disabled|fallback_decoy)
+            return 0
+            ;;
+        fallback_404)
+            effective_mode="not_found"
+            ;;
+        fallback_secondary)
+            if validate_redirect_url "${PROBE_FALLBACK_URL:-}"; then
+                dest="$PROBE_FALLBACK_URL"
+            else
+                return 0
+            fi
+            ;;
+        *)
+            validate_redirect_url "$dest" || return 0
+            ;;
+    esac
+
+    local allow_ips="127.0.0.1 ::1"
+    if [[ -n "${PROBE_ALLOW_CIDRS:-}" ]]; then
+        local a_item a_trimmed
+        local IFS=','
+        for a_item in $PROBE_ALLOW_CIDRS; do
+            a_trimmed=$(printf '%s' "$a_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [[ -n "$a_trimmed" ]] && validate_cidr_entry "$a_trimmed" && allow_ips+=" ${a_trimmed}"
+        done
+    fi
+
+    local action_block=""
+    if [[ "$effective_mode" == "not_found" ]]; then
+        action_block=$(cat <<'ACT'
+        root * /srv/site
+        header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+        rewrite * /404.html
+        file_server {
+            status 404
+        }
+ACT
+)
+    else
+        action_block="        redir ${dest} ${status}"
+    fi
+
+    # 1. Blocked CIDRs
+    if [[ -n "${PROBE_BLOCK_CIDRS:-}" ]]; then
+        local block_ips="" b_item b_trimmed
+        local IFS=','
+        for b_item in $PROBE_BLOCK_CIDRS; do
+            b_trimmed=$(printf '%s' "$b_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [[ -n "$b_trimmed" ]] && validate_cidr_entry "$b_trimmed" && block_ips+="${block_ips:+ }${b_trimmed}"
+        done
+        if [[ -n "$block_ips" ]]; then
+            cat <<EOF
+
+    @probe_cidr {
+        remote_ip ${block_ips}
+        not remote_ip ${allow_ips}
+    }
+    handle @probe_cidr {
+${action_block}
+    }
+EOF
+        fi
+    fi
+
+    # 2. Unusual HTTP methods
+    if [[ "${PROBE_DETECT_BAD_METHODS:-true}" == "true" ]]; then
+        cat <<EOF
+
+    @probe_method {
+        not remote_ip ${allow_ips}
+        not method GET HEAD OPTIONS
+    }
+    handle @probe_method {
+${action_block}
+    }
+EOF
+    fi
+
+    # 3. Missing or empty User-Agent (Caddy v2 requires `not header User-Agent *`)
+    if [[ "${PROBE_DETECT_EMPTY_UA:-true}" == "true" ]]; then
+        cat <<EOF
+
+    @probe_missing_ua {
+        not remote_ip ${allow_ips}
+        not header User-Agent *
+    }
+    handle @probe_missing_ua {
+${action_block}
+    }
+
+    @probe_empty_ua {
+        not remote_ip ${allow_ips}
+        header User-Agent ""
+    }
+    handle @probe_empty_ua {
+${action_block}
+    }
+EOF
+    fi
+
+    # 4. Suspicious User-Agent patterns (scanners / CLI / crawlers / custom)
+    local ua_parts=()
+    [[ "${PROBE_DETECT_SCANNERS:-true}" == "true" ]] && ua_parts+=("nikto|sqlmap|nmap|masscan|zgrab|gobuster|dirbuster|nuclei|ffuf|wpscan|acunetix|nessus|openvas|censys|shodan|httpx|feroxbuster|wfuzz|hydra|jaeles")
+    [[ "${PROBE_DETECT_CLI:-true}" == "true" ]] && ua_parts+=("curl/|wget/|python-requests|python-urllib|aiohttp|go-http-client|libwww-perl|httpie|okhttp|axios/|java/")
+    [[ "${PROBE_DETECT_CRAWLERS:-false}" == "true" ]] && ua_parts+=("ahrefsbot|semrushbot|mj12bot|dotbot|petalbot|bytespider|gptbot|ccbot|claudebot|yandexbot|bingbot|googlebot|baiduspider")
+    if [[ -n "${PROBE_CUSTOM_UA:-}" ]]; then
+        local c_item c_trimmed c_esc
+        local IFS=','
+        for c_item in $PROBE_CUSTOM_UA; do
+            c_trimmed=$(printf '%s' "$c_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [[ -n "$c_trimmed" ]] || continue
+            [[ "$c_trimmed" =~ [\{\}\;\<\>\"\'\\\`] ]] && continue
+            c_esc=$(_regex_escape_caddy "$c_trimmed")
+            [[ -n "$c_esc" ]] && ua_parts+=("$c_esc")
+        done
+    fi
+    if (( ${#ua_parts[@]} > 0 )); then
+        local ua_joined="" part
+        for part in "${ua_parts[@]}"; do
+            ua_joined+="${ua_joined:+|}${part}"
+        done
+        cat <<EOF
+
+    @probe_ua {
+        not remote_ip ${allow_ips}
+        header_regexp User-Agent (?i)(${ua_joined})
+    }
+    handle @probe_ua {
+${action_block}
+    }
+EOF
+    fi
+
+    # 5. Suspicious exploit/scanner paths (filtered against ALL protected service routes)
+    local candidate_paths=()
+    if [[ "${PROBE_DETECT_PATHS:-true}" == "true" ]]; then
+        candidate_paths+=(
+            "/.env" "/.env.*" "/.git" "/.git/*" "/.svn/*"
+            "/wp-admin" "/wp-admin/*" "/wp-login.php" "/xmlrpc.php"
+            "/phpmyadmin" "/phpmyadmin/*" "/admin.php" "/config.php"
+            "/cgi-bin/*" "/actuator" "/actuator/*" "/server-status"
+            "/vendor/phpunit/*" "/boaform/*" "/HNAP1" "/shell" "/sdk"
+        )
+    fi
+    if [[ -n "${PROBE_CUSTOM_PATHS:-}" ]]; then
+        local cp_item cp_trimmed
+        local IFS=','
+        for cp_item in $PROBE_CUSTOM_PATHS; do
+            cp_trimmed=$(printf '%s' "$cp_item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [[ -n "$cp_trimmed" ]] || continue
+            [[ "$cp_trimmed" != /* ]] && cp_trimmed="/$cp_trimmed"
+            [[ "$cp_trimmed" == "/" || "$cp_trimmed" == "/*" || "$cp_trimmed" == *".."* || "$cp_trimmed" == *"//"* ]] && continue
+            [[ "$cp_trimmed" =~ [[:space:]\{\}\;\<\>\"\'\\\`] ]] && continue
+            candidate_paths+=("$cp_trimmed")
+        done
+    fi
+
+    if (( ${#candidate_paths[@]} > 0 )); then
+        local protected_list=() p_cand
+        [[ -n "$panel_path" && "$panel_path" != "/" ]] && protected_list+=("$panel_path")
+        [[ -n "$webpanel_path" && "$webpanel_path" != "/" ]] && protected_list+=("$webpanel_path")
+        [[ -n "$sub_path" && "$sub_path" != "/" ]] && protected_list+=("$sub_path")
+        [[ -n "$sub_json_path" && "$sub_json_path" != "/" ]] && protected_list+=("$sub_json_path")
+        if [[ -n "$inbound_paths_csv" ]]; then
+            local ip_tok
+            local IFS=','
+            for ip_tok in $inbound_paths_csv; do
+                [[ -n "$ip_tok" && "$ip_tok" != "/" ]] && protected_list+=("$ip_tok")
+            done
+        fi
+
+        local safe_paths="" cand cand_base prot_p overlaps
+        for cand in "${candidate_paths[@]}"; do
+            cand_base="${cand%\*}"
+            overlaps=false
+            for prot_p in "${protected_list[@]:-}"; do
+                [[ -n "$prot_p" ]] || continue
+                if _paths_overlap "$cand_base" "$prot_p"; then
+                    overlaps=true
+                    break
+                fi
+            done
+            $overlaps || safe_paths+="${safe_paths:+ }${cand}"
+        done
+
+        if [[ -n "$safe_paths" ]]; then
+            cat <<EOF
+
+    @probe_path {
+        not remote_ip ${allow_ips}
+        path ${safe_paths}
+    }
+    handle @probe_path {
+${action_block}
+    }
+EOF
+        fi
+    fi
+}
+
+_caddy_decoy_handlers() {
+    cat <<'DECOY'
+
+    @decoy_exists {
+        file {
+            root /srv/site
+            try_files {path} {path}.html {path}/index.html
+        }
+    }
+    handle @decoy_exists {
+        root * /srv/site
+        header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+        rewrite * {http.matchers.file.relative}
+        file_server
+    }
+
+    handle {
+        root * /srv/site
+        header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+        rewrite * /404.html
+        file_server {
+            status 404
+        }
+    }
+DECOY
+}
+
 _caddy_reload() {
     is_caddy_running || { error "Container 3xui_caddy is not running"; return 1; }
     run "docker exec 3xui_caddy caddy validate --config /etc/caddy/Caddyfile >/dev/null" || return 1
@@ -4220,8 +6071,27 @@ generate_caddyfile() {
     local use_existing_panel_cert="${11:-false}"
     local use_existing_sub_cert="${12:-false}"
 
+    if run_q "test -f $(quote_sh "$INSTALL_DIR/caddy/probe.conf")"; then
+        load_probe_conf
+    elif run_q "test -f $(quote_sh "$INSTALL_DIR/caddy/probe-state.json")"; then
+        local st_raw st_val
+        st_raw=$(run_out "cat $(quote_sh "$INSTALL_DIR/caddy/probe-state.json")" || true)
+        st_val=$(printf '%s' "$st_raw" | sed -nE 's/.*"active_state"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1)
+        case "$st_val" in
+            primary|fallback_secondary|fallback_decoy|fallback_404|disabled) PROBE_ACTIVE_STATE="$st_val" ;;
+        esac
+    fi
+    if run_q "test -f $(quote_sh "$INSTALL_DIR/webpanel/webpanel.conf")"; then
+        load_webpanel_conf
+    fi
+
     local base_no_slash="${panel_path%/}"
     [[ -z "$base_no_slash" ]] && base_no_slash="/"
+
+    local wp_path_norm wp_no_slash
+    wp_path_norm=$(_normalize_webpath "${WEBPANEL_PATH:-/deploy/}")
+    wp_no_slash="${wp_path_norm%/}"
+    [[ -z "$wp_no_slash" ]] && wp_no_slash="/deploy"
 
     local sub_no_slash="${sub_path%/}"
     local sub_json_no_slash="${sub_json_path%/}"
@@ -4246,10 +6116,65 @@ generate_caddyfile() {
     local panel_tls=""
     panel_tls=$(_caddy_tls_block "$panel_domain" "$https_port" "$use_existing_panel_cert")
 
+    local webpanel_redir="" webpanel_block="" effective_wp_path=""
+    if $WEBPANEL_ENABLED && [[ "$base_no_slash" != "/" ]] && ! _paths_overlap "$wp_path_norm" "$panel_path"; then
+        local wp_sub_conflict=false
+        if [[ "$sub_mode" == "same" ]] && { _paths_overlap "$wp_path_norm" "$sub_path" || _paths_overlap "$wp_path_norm" "$sub_json_path"; }; then
+            wp_sub_conflict=true
+        fi
+        if ! $wp_sub_conflict; then
+            effective_wp_path="$wp_path_norm"
+            webpanel_redir=$'\n'"    redir ${wp_no_slash} ${wp_no_slash}/ 308"
+            webpanel_block=$(cat <<EOF
+
+    @webpanel {
+        path ${wp_no_slash}/*
+    }
+    handle @webpanel {
+        uri strip_prefix ${wp_no_slash}
+        request_body {
+            max_size 16MB
+        }
+        reverse_proxy ${WEBPANEL_BIND:-127.0.0.1}:${WEBPANEL_PORT:-2059} {
+            header_up Host {http.request.hostport}
+            header_up X-Forwarded-Host {http.request.host}
+            header_up X-Forwarded-Port {http.request.port}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Prefix ${wp_no_slash}
+        }
+    }
+EOF
+)
+        else
+            warn "WebPanel path '$wp_path_norm' overlaps subscription path; skipping @webpanel route."
+        fi
+    fi
+
     local same_sub_block=""
     if [[ "$sub_mode" == "same" ]]; then
         same_sub_block=$(_caddy_sub_routes "$sub_no_slash" "$sub_json_no_slash" "$sub_port")
     fi
+
+    local caddy_inbound_blocks="" inbound_paths_csv=""
+    caddy_inbound_blocks=$(_collect_caddy_inbound_blocks "$panel_path" "$sub_path" "$sub_json_path" || true)
+    local inbounds_raw="${INBOUNDS_OVERRIDE:-}"
+    [[ -z "$inbounds_raw" ]] && inbounds_raw=$(get_xui_inbounds || true)
+    if [[ -n "$inbounds_raw" ]]; then
+        local i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw
+        while IFS='|' read -r i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw; do
+            _is_inbound_enabled "$i_en" || continue
+            _is_loopback_addr "${i_listen:-}" || continue
+            [[ -n "$i_path" && "$i_path" != "/" ]] && inbound_paths_csv+="${inbound_paths_csv:+,}${i_path}"
+        done <<< "$inbounds_raw"
+    fi
+
+    local panel_probe_blocks=""
+    panel_probe_blocks=$(_caddy_probe_redirect_blocks "$panel_path" "$effective_wp_path" "$([[ "$sub_mode" == "same" ]] && printf '%s' "$sub_path")" "$([[ "$sub_mode" == "same" ]] && printf '%s' "$sub_json_path")" "$inbound_paths_csv" || true)
+
+    local decoy_handlers=""
+    decoy_handlers=$(_caddy_decoy_handlers)
 
     local dedicated_sub_block=""
     if [[ "$sub_mode" == "dedicated" && -n "$sub_domain" ]]; then
@@ -4259,6 +6184,8 @@ generate_caddyfile() {
         sub_tls=$(_caddy_tls_block "$sub_domain" "$https_port" "$use_existing_sub_cert")
         local sub_routes=""
         sub_routes=$(_caddy_sub_routes "$sub_no_slash" "$sub_json_no_slash" "$sub_port")
+        local sub_probe_blocks=""
+        sub_probe_blocks=$(_caddy_probe_redirect_blocks "$panel_path" "$effective_wp_path" "$sub_path" "$sub_json_path" "$inbound_paths_csv" || true)
         dedicated_sub_block=$(cat <<EOF
 
 ${sub_addr} {
@@ -4274,22 +6201,11 @@ ${sub_tls}
         Referrer-Policy "strict-origin-when-cross-origin"
         Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=()"
         X-Robots-Tag "noindex, nofollow, noarchive"
-    }${sub_routes}
-
-    handle {
-        root * /srv/site
-        @decoy_root path / /index.html
-        rewrite @decoy_root /index.html
-        header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
-        file_server
-    }
+    }${sub_routes}${sub_probe_blocks}${decoy_handlers}
 }
 EOF
 )
     fi
-
-    local caddy_inbound_blocks=""
-    caddy_inbound_blocks=$(_collect_caddy_inbound_blocks "$panel_path" "$sub_path" "$sub_json_path" || true)
 
     local caddyfile_body
     caddyfile_body=$(cat <<EOF
@@ -4310,7 +6226,7 @@ ${panel_tls}
         if [[ "$base_no_slash" != "/" ]]; then
             printf '\n\n    redir %s %s/ 308' "$base_no_slash" "$base_no_slash"
         fi
-    )
+    )${webpanel_redir}
 
     @panel {
         path $( [[ "$base_no_slash" == "/" ]] && printf '*' || printf '%s/*' "$base_no_slash" )
@@ -4327,15 +6243,7 @@ ${panel_tls}
             header_up X-Forwarded-For {remote_host}
             header_up X-Forwarded-Proto {scheme}
         }
-    }${same_sub_block}${caddy_inbound_blocks}
-
-    handle {
-        root * /srv/site
-        @decoy_root path / /index.html
-        rewrite @decoy_root /index.html
-        header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
-        file_server
-    }
+    }${webpanel_block}${same_sub_block}${caddy_inbound_blocks}${panel_probe_blocks}${decoy_handlers}
 }${dedicated_sub_block}
 EOF
 )
@@ -4575,12 +6483,20 @@ setup_reverse_proxy() {
     SUB_PATH="$sub_path"
     SUB_JSON_PATH="$sub_json_path"
 
+    load_webpanel_conf
+    WEBPANEL_ENABLED=true
+    WEBPANEL_DOMAIN="$panel_domain"
+    WEBPANEL_BIND="127.0.0.1"
+    WEBPANEL_PORT=$(_find_free_webpanel_port "$PANEL_PORT" "$sub_port" "$https_port")
+    WEBPANEL_PATH=$(_choose_exclusive_webpanel_path "$panel_path" "$sub_path" "$sub_json_path")
+
     info "Generating decoy site, Caddyfile, and updating compose.yaml..."
     generate_decoy_site false || return 1
     generate_caddyfile "$panel_domain" "$https_port" "$acme_email" "$PANEL_PORT" "$panel_path" \
         "$sub_mode" "$sub_domain" "$sub_port" "$sub_path" "$sub_json_path" \
         "$use_existing_panel_cert" "$use_existing_sub_cert" || return 1
     save_proxy_conf || return 1
+    save_webpanel_conf || warn "Could not save webpanel.conf"
     inject_caddy_compose || return 1
 
     info "Pulling and starting Caddy container..."
@@ -4611,6 +6527,15 @@ setup_reverse_proxy() {
     info "Restarting 3X-UI to apply loopback & subscription settings..."
     compose restart 3xui >/dev/null || true
 
+    local wp_init_pass=""
+    info "Enabling standalone Web Management Panel on https://${panel_domain}${port_sfx}${WEBPANEL_PATH}..."
+    if enable_webpanel auto; then
+        wp_init_pass="${_LAST_WEBPANEL_INIT_PASS:-}"
+        _LAST_WEBPANEL_INIT_PASS=""
+    else
+        warn "Web Management Panel setup encountered a warning; run 'manage.sh webpanel enable' later."
+    fi
+
     invalidate_status
     verify_panel_loaded 12 || true
     if [[ "$sub_mode" != "none" ]]; then
@@ -4618,14 +6543,216 @@ setup_reverse_proxy() {
     fi
     echo ""
     success "Caddy reverse proxy is active!"
-    echo -e "  Panel URL : ${BOLD}${ext_panel_url}${NC}"
-    echo -e "  Decoy URL : ${BOLD}https://${panel_domain}${port_sfx}/${NC}"
-    [[ -n "$ext_sub_url" ]] && echo -e "  Sub URL   : ${BOLD}${ext_sub_url}${NC}"
+    echo -e "  Panel URL    : ${BOLD}${ext_panel_url}${NC}"
+    echo -e "  WebPanel URL : ${BOLD}https://${panel_domain}${port_sfx}${WEBPANEL_PATH}${NC}"
+    if [[ -n "$wp_init_pass" ]]; then
+        echo -e "  WebPanel Auth: ${BOLD}${WEBPANEL_USER}${NC} / ${BOLD}${YELLOW}${wp_init_pass}${NC}  (save this now!)"
+        wp_init_pass=""
+    fi
+    echo -e "  Decoy URL    : ${BOLD}https://${panel_domain}${port_sfx}/${NC}"
+    [[ -n "$ext_sub_url" ]] && echo -e "  Sub URL      : ${BOLD}${ext_sub_url}${NC}"
     echo -e "  ${DIM}Ensure DNS points to this server and firewall allows 80/tcp + ${https_port}/tcp+udp.${NC}"
+}
+
+_print_protected_paths() {
+    get_panel_info >/dev/null 2>&1 || true
+    load_webpanel_conf >/dev/null 2>&1 || true
+    local p
+    for p in "$PANEL_PATH" "$WEBPANEL_PATH" "$SUB_PATH" "$SUB_JSON_PATH"; do
+        [[ -n "$p" && "$p" != "/" ]] && printf '%s\n' "$p"
+    done
+    local inbounds_raw="${INBOUNDS_OVERRIDE:-}"
+    [[ -z "$inbounds_raw" ]] && inbounds_raw=$(get_xui_inbounds || true)
+    if [[ -n "$inbounds_raw" ]]; then
+        local i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw
+        while IFS='|' read -r i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw; do
+            _is_inbound_enabled "$i_en" || continue
+            _is_loopback_addr "${i_listen:-}" || continue
+            [[ -n "$i_path" && "$i_path" != "/" ]] && printf '%s\n' "$i_path"
+        done <<< "$inbounds_raw"
+    fi
+}
+
+_probe_url_health() {
+    local url="${1-}"
+    validate_redirect_url "$url" || return 1
+    local code
+    code=$(run_out "curl -ksSL -o /dev/null -w '%{http_code}' --proto '=http,https' --max-time 4 -I $(quote_sh "$url") 2>/dev/null" || echo "000")
+    if [[ "$code" == "403" || "$code" == "405" || "$code" == "501" || "$code" == "000" ]]; then
+        code=$(run_out "curl -ksSL -o /dev/null -w '%{http_code}' --proto '=http,https' --max-time 4 $(quote_sh "$url") 2>/dev/null" || echo "000")
+    fi
+    [[ "$code" =~ ^[1-4][0-9]{2}$ ]]
+}
+
+check_redirect_target_health() {
+    local explicit_url="${1:-}"
+    load_probe_conf
+    if [[ -n "$explicit_url" ]]; then
+        explicit_url=$(_normalize_redirect_url "$explicit_url")
+        if ! validate_redirect_url "$explicit_url"; then
+            error "Invalid redirect URL: $explicit_url"
+            return 1
+        fi
+        if _probe_url_health "$explicit_url"; then
+            success "Redirect target is reachable: $explicit_url"
+            return 0
+        fi
+        warn "Redirect target is currently unreachable: $explicit_url"
+        return 1
+    fi
+
+    if ! $PROBE_REDIRECT_ENABLED; then
+        info "Probe redirection is disabled."
+        return 0
+    fi
+
+    local prev_state="$PROBE_ACTIVE_STATE"
+    local next_state="primary" effective_target="$PROBE_REDIRECT_TARGET" reason="Primary redirect destination is reachable."
+    local primary_ok=true secondary_ok=false
+
+    if ! _probe_url_health "$PROBE_REDIRECT_TARGET"; then
+        primary_ok=false
+        case "$PROBE_FALLBACK_MODE" in
+            secondary_url)
+                if validate_redirect_url "$PROBE_FALLBACK_URL" && _probe_url_health "$PROBE_FALLBACK_URL"; then
+                    secondary_ok=true
+                    next_state="fallback_secondary"
+                    effective_target="$PROBE_FALLBACK_URL"
+                    reason="Primary unreachable; switched to secondary fallback URL."
+                else
+                    next_state="fallback_decoy"
+                    effective_target=""
+                    reason="Primary and secondary targets unreachable; safely serving decoy site."
+                fi
+                ;;
+            not_found)
+                next_state="fallback_404"
+                effective_target=""
+                reason="Primary unreachable; fallback serving 404 page for probes."
+                ;;
+            *)
+                next_state="fallback_decoy"
+                effective_target=""
+                reason="Primary unreachable; safely serving decoy website."
+                ;;
+        esac
+    fi
+
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S")
+    local state_json
+    state_json=$(cat <<EOF
+{
+  "active_state": "${next_state}",
+  "effective_target": "${effective_target}",
+  "reason": "${reason}",
+  "last_checked": "${now_iso}",
+  "primary_ok": ${primary_ok},
+  "secondary_ok": ${secondary_ok}
+}
+EOF
+)
+    run "mkdir -p $(quote_sh "$INSTALL_DIR/caddy") && chmod 755 $(quote_sh "$INSTALL_DIR/caddy")" || true
+    if $REMOTE; then
+        printf '%s\n' "$state_json" | ssh_cmd "umask 077 && cat > $(quote_sh "$INSTALL_DIR/caddy/probe-state.json") && chmod 600 $(quote_sh "$INSTALL_DIR/caddy/probe-state.json")"
+    else
+        ( umask 077; printf '%s\n' "$state_json" > "$INSTALL_DIR/caddy/probe-state.json" )
+        chmod 600 "$INSTALL_DIR/caddy/probe-state.json"
+    fi
+
+    PROBE_ACTIVE_STATE="$next_state"
+    if [[ "$prev_state" != "$next_state" ]]; then
+        warn "Probe redirect state changed: ${prev_state} -> ${next_state} (${reason})"
+        get_panel_info >/dev/null 2>&1 || true
+        _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || true
+    else
+        info "Probe redirect active state: ${next_state} (${reason})"
+    fi
+}
+
+configure_probe_redirect() {
+    require_deployed || return 1
+    load_probe_conf
+
+    echo ""
+    echo -e "  ${BOLD}${MAGENTA}Probe & Scanner Redirection Setup${NC}"
+    echo -e "  ${DIM}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${H}${NC}"
+    echo "  Redirects detected scanners, CLI bots, and active probes on non-panel routes"
+    echo "  while keeping legitimate browsers and 3X-UI/WebPanel/subscription routes untouched."
+    echo ""
+    echo -e "  Current state : $($PROBE_REDIRECT_ENABLED && echo "${GREEN}enabled${NC}" || echo "${DIM}disabled${NC}") (${PROBE_ACTIVE_STATE})"
+    echo -e "  Target URL    : ${PROBE_REDIRECT_TARGET}"
+    echo -e "  Fallback Mode : ${PROBE_FALLBACK_MODE}"
+    echo ""
+
+    if ! confirm "Enable probe & scanner redirection?"; then
+        PROBE_REDIRECT_ENABLED=false
+        save_probe_conf || return 1
+        get_panel_info >/dev/null 2>&1 || true
+        _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || true
+        success "Probe redirection disabled (serving decoy site for all non-panel traffic)."
+        return 0
+    fi
+
+    local raw_target norm_target
+    read -rp "  Redirect destination (e.g. www.cloudflare.com, www.speedtest.net) [${PROBE_REDIRECT_TARGET}]: " raw_target
+    norm_target=$(_normalize_redirect_url "${raw_target:-$PROBE_REDIRECT_TARGET}")
+    if ! validate_redirect_url "$norm_target"; then
+        error "Invalid or unsafe redirect destination: $norm_target"
+        return 1
+    fi
+
+    if ! _probe_url_health "$norm_target"; then
+        warn "Destination '${norm_target}' did not respond during health check."
+        confirm "Use '${norm_target}' anyway (safe fallback will activate if unreachable)?" || return 0
+    else
+        success "Destination reachable: ${norm_target}"
+    fi
+
+    local r_status fb_mode fb_url=""
+    read -rp "  HTTP redirect status (301/302/307) [${PROBE_REDIRECT_STATUS}]: " r_status
+    r_status="${r_status:-$PROBE_REDIRECT_STATUS}"
+    [[ "$r_status" =~ ^(301|302|307)$ ]] || { error "Invalid status (choose 301, 302, or 307)"; return 1; }
+
+    tui_select "Safe Fallback Behavior" "If '${norm_target}' becomes unreachable, how should Caddy respond?" \
+        "Serve legitimate decoy website (Recommended)" \
+        "Redirect to secondary fallback URL" \
+        "Serve decoy 404 Not Found page"
+    case $? in
+        1)
+            fb_mode="secondary_url"
+            read -rp "  Secondary fallback URL [${PROBE_FALLBACK_URL:-https://www.speedtest.net}]: " fb_url
+            fb_url=$(_normalize_redirect_url "${fb_url:-${PROBE_FALLBACK_URL:-https://www.speedtest.net}}")
+            validate_redirect_url "$fb_url" || { error "Invalid secondary fallback URL"; return 1; }
+            ;;
+        2) fb_mode="not_found" ;;
+        *) fb_mode="decoy" ;;
+    esac
+
+    confirm "Detect vulnerability scanners (nikto, sqlmap, nuclei, nmap, etc.)?" && PROBE_DETECT_SCANNERS=true || PROBE_DETECT_SCANNERS=false
+    confirm "Detect CLI/script tools (curl, wget, python-requests, go-http)?" && PROBE_DETECT_CLI=true || PROBE_DETECT_CLI=false
+    confirm "Detect missing or empty User-Agent headers?" && PROBE_DETECT_EMPTY_UA=true || PROBE_DETECT_EMPTY_UA=false
+    confirm "Detect unusual HTTP methods (non-GET/HEAD/OPTIONS)?" && PROBE_DETECT_BAD_METHODS=true || PROBE_DETECT_BAD_METHODS=false
+    confirm "Detect common exploit probe paths (/.env, /.git, /wp-admin, etc.)?" && PROBE_DETECT_PATHS=true || PROBE_DETECT_PATHS=false
+    confirm "Also redirect aggressive SEO/AI crawlers (ahrefs, semrush, gptbot)?" && PROBE_DETECT_CRAWLERS=true || PROBE_DETECT_CRAWLERS=false
+
+    PROBE_REDIRECT_ENABLED=true
+    PROBE_REDIRECT_TARGET="$norm_target"
+    PROBE_REDIRECT_STATUS="$r_status"
+    PROBE_FALLBACK_MODE="$fb_mode"
+    PROBE_FALLBACK_URL="$fb_url"
+
+    save_probe_conf || return 1
+    check_redirect_target_health || true
+    get_panel_info >/dev/null 2>&1 || true
+    _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || return 1
+    success "Probe redirection configured and active (${PROBE_REDIRECT_TARGET})."
 }
 
 status_reverse_proxy() {
     load_proxy_conf
+    load_probe_conf
+    load_webpanel_conf
     echo ""
     if ! $PROXY_ENABLED || [[ -z "$PROXY_DOMAIN" ]]; then
         echo -e "  Reverse Proxy : ${DIM}Not configured${NC}\n"
@@ -4640,7 +6767,13 @@ status_reverse_proxy() {
 
     echo -e "  Caddy Status  : $caddy_state"
     echo -e "  Panel Domain  : ${BOLD}https://${PROXY_DOMAIN}${port_sfx}${PANEL_PATH}${NC} (webDomain=${PANEL_DOMAIN:-(unset)})"
-    echo -e "  Decoy Root    : https://${PROXY_DOMAIN}${port_sfx}/"
+    if $WEBPANEL_ENABLED; then
+        local wp_state="${RED}Stopped${NC}"
+        is_webpanel_running && wp_state="${GREEN}Running${NC}"
+        echo -e "  WebPanel URL  : ${BOLD}https://${PROXY_DOMAIN}${port_sfx}${WEBPANEL_PATH}${NC} ($wp_state)"
+    fi
+    echo -e "  Decoy Root    : https://${PROXY_DOMAIN}${port_sfx}/ (theme=${DECOY_THEME})"
+    echo -e "  Probe Redir   : $($PROBE_REDIRECT_ENABLED && echo "${GREEN}enabled${NC} -> ${PROBE_REDIRECT_TARGET} (state=${PROBE_ACTIVE_STATE}, fallback=${PROBE_FALLBACK_MODE})" || echo "${DIM}disabled${NC}")"
     echo -e "  Backend Bind  : ${PANEL_LISTEN:-0.0.0.0}:${PANEL_PORT}"
     echo -e "  Sub Proxy     : ${SUB_MODE}  (subEnable=${SUB_ENABLE_DB:-unset}, jsonEnable=${SUB_JSON_ENABLE_DB:-unset})"
     if [[ "$SUB_MODE" != "none" || "$SUB_ENABLE_DB" == "true" ]]; then
@@ -4682,18 +6815,42 @@ reload_reverse_proxy() {
 
 customize_decoy_site() {
     require_deployed || return 1
+    load_probe_conf
     local index_file="$INSTALL_DIR/caddy/site/index.html"
 
-    tui_select "Camouflage Decoy Site" "File: $index_file" \
+    tui_select "Camouflage Decoy Site" "Theme: ${DECOY_THEME} (${DECOY_SITE_NAME})" \
+        "Select built-in multi-page theme (Cloud / Studio / Docs)" \
         "Edit index.html interactively (nano / vi)" \
         "Upload custom local HTML file" \
-        "Reset to default built-in status page" \
+        "Reset to default multi-page static website" \
         "Back"
     local sel=$?
     clear_screen
 
     case "$sel" in
         0)
+            tui_select "Decoy Website Theme" "Choose a realistic website template:" \
+                "Meridian Cloud Systems (Infrastructure & Edge)" \
+                "Northstar Digital Studio (Product & Design)" \
+                "Atlas Engineering Docs (Technical Portal)" \
+                "Cancel"
+            local tsel=$?
+            clear_screen
+            case "$tsel" in
+                0) DECOY_THEME="cloud"; DECOY_SITE_NAME="Meridian Cloud Systems"; DECOY_SITE_TAGLINE="Managed Edge Infrastructure & Reliability Engineering"; DECOY_CONTACT_EMAIL="hello@meridiancloud.example" ;;
+                1) DECOY_THEME="studio"; DECOY_SITE_NAME="Northstar Digital Studio"; DECOY_SITE_TAGLINE="Product Architecture, Design Systems & Web Engineering"; DECOY_CONTACT_EMAIL="hello@northstarstudio.example" ;;
+                2) DECOY_THEME="docs"; DECOY_SITE_NAME="Atlas Engineering Docs"; DECOY_SITE_TAGLINE="Platform Architecture Reference, API Standards & Runbooks"; DECOY_CONTACT_EMAIL="docs@atlaseng.example" ;;
+                *) return 0 ;;
+            esac
+            local custom_name custom_tag
+            read -rp "  Site name [${DECOY_SITE_NAME}]: " custom_name
+            [[ -n "$custom_name" ]] && DECOY_SITE_NAME="$custom_name"
+            read -rp "  Tagline [${DECOY_SITE_TAGLINE}]: " custom_tag
+            [[ -n "$custom_tag" ]] && DECOY_SITE_TAGLINE="$custom_tag"
+            save_probe_conf || return 1
+            generate_decoy_site true && success "Applied multi-page decoy site theme '${DECOY_THEME}'"
+            ;;
+        1)
             generate_decoy_site false || return 1
             if run_q "command -v nano || command -v vi"; then
                 run_it "ed=\$(command -v nano || command -v vi); \"\$ed\" $(quote_sh "$index_file")"
@@ -4702,7 +6859,7 @@ customize_decoy_site() {
                 error "Neither nano nor vi is installed on the target host"
             fi
             ;;
-        1)
+        2)
             echo ""
             local src_html
             read -rp "  Path to local HTML file: " src_html
@@ -4716,10 +6873,10 @@ customize_decoy_site() {
             fi
             success "Uploaded custom decoy site"
             ;;
-        2)
-            generate_decoy_site true && success "Decoy page reset to default"
+        3)
+            generate_decoy_site true && success "Decoy site reset to default multi-page website"
             ;;
-        3|255) return 0 ;;
+        4|255) return 0 ;;
     esac
 }
 
@@ -4727,7 +6884,9 @@ disable_reverse_proxy() {
     require_deployed || return 1
     get_panel_info || true
 
-    confirm "Stop Caddy reverse proxy and revert 3X-UI to direct access (0.0.0.0)?" || { info "Cancelled"; return 0; }
+    confirm "Stop Caddy reverse proxy, disable the Web Management Panel, and revert 3X-UI to direct access?" || { info "Cancelled"; return 0; }
+
+    disable_webpanel >/dev/null 2>&1 || true
 
     info "Reverting 3X-UI listen IP & subscription URI overrides..."
     if is_running || is_pg_running || run_q "command -v sqlite3 && test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
@@ -4752,7 +6911,7 @@ disable_reverse_proxy() {
     compose up -d --remove-orphans || true
     is_running && compose restart 3xui >/dev/null || true
     invalidate_status
-    success "Reverse proxy disabled; 3X-UI restored to direct access."
+    success "Reverse proxy & Web Management Panel disabled; 3X-UI restored to direct access."
 }
 
 manage_reverse_proxy() {
@@ -4760,6 +6919,7 @@ manage_reverse_proxy() {
 
     while true; do
         load_proxy_conf
+        load_probe_conf
         local proxy_state="${DIM}not configured${NC}"
         if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]]; then
             if is_caddy_running; then
@@ -4769,13 +6929,18 @@ manage_reverse_proxy() {
             fi
         fi
 
-        local header_text="  Proxy Status : ${proxy_state}\n  Sub Mode     : ${SUB_MODE}\n  Config Dir   : $INSTALL_DIR/caddy/"
+        local redir_state="${DIM}disabled${NC}"
+        $PROBE_REDIRECT_ENABLED && redir_state="${GREEN}on${NC} -> ${PROBE_REDIRECT_TARGET} (${PROBE_ACTIVE_STATE})"
+
+        local header_text="  Proxy Status : ${proxy_state}\n  Sub Mode     : ${SUB_MODE}\n  Decoy Theme  : ${DECOY_THEME} (${DECOY_SITE_NAME})\n  Probe Redir  : ${redir_state}\n  Config Dir   : $INSTALL_DIR/caddy/"
 
         local opts=(
             "Setup / Reconfigure Caddy reverse proxy"
             "Reverse proxy status & URLs"
             "Verify panel, subscription & DNS routing"
-            "Customize decoy site (index.html)"
+            "Configure probe & bot redirection"
+            "Check redirect target health"
+            "Customize decoy site (themes / HTML)"
             "View Caddy logs (last 100 lines)"
             "Reload Caddy configuration"
             "Disable reverse proxy & revert to direct access"
@@ -4789,11 +6954,338 @@ manage_reverse_proxy() {
             0) setup_reverse_proxy ;;
             1) status_reverse_proxy ;;
             2) verify_reverse_proxy || true ;;
-            3) customize_decoy_site ;;
-            4) run "docker logs --tail=100 3xui_caddy 2>/dev/null || echo '  (3xui_caddy not running)'" || true ;;
-            5) reload_reverse_proxy ;;
-            6) disable_reverse_proxy ;;
-            7|255) _SKIP_PAUSE=true; return ;;
+            3) configure_probe_redirect ;;
+            4) check_redirect_target_health || true ;;
+            5) customize_decoy_site ;;
+            6) run "docker logs --tail=100 3xui_caddy 2>/dev/null || echo '  (3xui_caddy not running)'" || true ;;
+            7) reload_reverse_proxy ;;
+            8) disable_reverse_proxy ;;
+            9|255) _SKIP_PAUSE=true; return ;;
+        esac
+        echo ""
+        read -rp "  Press Enter..."
+    done
+}
+
+# ─── Standalone Web Management Panel (3xui-deploy-web) ──────────────────────
+_find_free_webpanel_port() {
+    local p_port="${1:-2053}" s_port="${2:-2096}" px_port="${3:-443}"
+    local cand
+    for cand in 2059 2060 2061 2062 2063 2064 2065 2066 2067 2068 2069 2070; do
+        [[ "$cand" == "$p_port" || "$cand" == "$s_port" || "$cand" == "$px_port" ]] && continue
+        if ! run_q "ss -tuln 2>/dev/null | grep -qE ':${cand}[[:space:]]'"; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done
+    printf '2059'
+}
+
+_choose_exclusive_webpanel_path() {
+    local panel_path="${1:-/}" sub_path="${2:-/sub/}" sub_json_path="${3:-/json/}"
+    local candidates=("/deploy/" "/deploy-mgr/" "/3xui-deploy/" "/ops-console/")
+    local cand
+    for cand in "${candidates[@]}"; do
+        _paths_overlap "$cand" "$panel_path" && continue
+        _paths_overlap "$cand" "$sub_path" && continue
+        _paths_overlap "$cand" "$sub_json_path" && continue
+        printf '%s' "$cand"
+        return 0
+    done
+    printf '/deploy-mgr/'
+}
+
+_ensure_python3() {
+    if run_q "command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,9) else 1)'"; then
+        return 0
+    fi
+    info "Installing Python 3 for standalone Web Management Panel..."
+    if run_q "command -v apt-get"; then
+        run "apt-get update -qq && apt-get install -y -qq python3" || return 1
+    elif run_q "command -v dnf"; then
+        run "dnf install -y python3" || return 1
+    elif run_q "command -v apk"; then
+        run "apk add --no-cache python3" || return 1
+    else
+        error "Python 3.9+ is required for the Web Management Panel."
+        return 1
+    fi
+}
+
+_install_webpanel_files() {
+    local dst="$INSTALL_DIR/webpanel"
+    run "mkdir -p $(quote_sh "$dst/static") && chmod 700 $(quote_sh "$dst") && chmod 755 $(quote_sh "$dst/static")" || return 1
+
+    local script_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
+    fi
+
+    if [[ -n "$script_dir" && -f "$script_dir/webpanel/server.py" && -f "$script_dir/webpanel/static/index.html" ]]; then
+        if $REMOTE; then
+            tar -cf - -C "$script_dir/webpanel" . | ssh_cmd "tar --no-same-owner -xf - -C $(quote_sh "$dst")" || return 1
+        else
+            cp -a "$script_dir/webpanel/." "$dst/" || return 1
+        fi
+    else
+        local files=(
+            "webpanel/__init__.py"
+            "webpanel/auth.py"
+            "webpanel/probe.py"
+            "webpanel/ops.py"
+            "webpanel/server.py"
+            "webpanel/static/index.html"
+            "webpanel/static/app.css"
+            "webpanel/static/app.js"
+        )
+        local rel url target
+        for rel in "${files[@]}"; do
+            url="${REPO_RAW_BASE}/${rel}"
+            target="${INSTALL_DIR}/${rel}"
+            run "curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 $(quote_sh "$url") -o $(quote_sh "$target")" || {
+                error "Failed to download ${rel} for Web Management Panel"
+                return 1
+            }
+        done
+    fi
+
+    # Install a synchronized executable manage.sh inside $INSTALL_DIR/webpanel/manage.sh for ops.py
+    if [[ -n "$script_dir" && -f "$script_dir/manage.sh" ]]; then
+        if $REMOTE; then
+            ssh_copy "$script_dir/manage.sh" "$dst/manage.sh" && run "chmod 755 $(quote_sh "$dst/manage.sh")" || return 1
+        else
+            cp "$script_dir/manage.sh" "$dst/manage.sh" && chmod 755 "$dst/manage.sh" || return 1
+        fi
+    else
+        run "curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 $(quote_sh "$REPO_RAW_URL") -o $(quote_sh "$dst/manage.sh") && bash -n $(quote_sh "$dst/manage.sh") && chmod 755 $(quote_sh "$dst/manage.sh")" || return 1
+    fi
+
+    run "chmod 700 $(quote_sh "$dst") && chmod 755 $(quote_sh "$dst/static") && chmod 644 $(quote_sh "$dst")/*.py $(quote_sh "$dst/static")/*" || true
+    run "python3 -m py_compile $(quote_sh "$dst/__init__.py") $(quote_sh "$dst/auth.py") $(quote_sh "$dst/probe.py") $(quote_sh "$dst/ops.py") $(quote_sh "$dst/server.py")" || {
+        report_diagnostic "ERROR" "install_webpanel" \
+            "WebPanel Python syntax verification failed" \
+            "Web Management Panel ($dst)" \
+            "Ensure Python 3.9+ is installed and re-run 'manage.sh webpanel enable'."
+        return 1
+    }
+}
+
+_setup_webpanel_service() {
+    local svc_path="/etc/systemd/system/3xui-deploy-web.service"
+    local unit_body
+    unit_body=$(cat <<EOF
+[Unit]
+Description=3xui-deploy Standalone Web Management Panel
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_DIR}
+Environment=PYTHONPATH=${INSTALL_DIR}
+Environment=XUI_INSTALL_DIR=${INSTALL_DIR}
+Environment=XUI_BACKUP_DIR=${BACKUP_DIR}
+ExecStart=/usr/bin/env python3 -m webpanel.server --install-dir ${INSTALL_DIR} --backup-dir ${BACKUP_DIR}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+    if run_q "command -v systemctl && [ -d /run/systemd/system ]"; then
+        if $REMOTE; then
+            printf '%s\n' "$unit_body" | ssh_cmd "cat > $(quote_sh "$svc_path") && chmod 644 $(quote_sh "$svc_path")" || return 1
+        else
+            printf '%s\n' "$unit_body" > "$svc_path"
+            chmod 644 "$svc_path"
+        fi
+        run "systemctl daemon-reload && systemctl enable 3xui-deploy-web >/dev/null 2>&1 && systemctl restart 3xui-deploy-web" || return 1
+        return 0
+    fi
+
+    # Fallback daemon launch when systemd is absent (e.g., containers)
+    local pid_file="$INSTALL_DIR/webpanel/server.pid"
+    local log_out="$INSTALL_DIR/logs/webpanel-server.log"
+    run "mkdir -p $(quote_sh "$INSTALL_DIR/logs") && chmod 700 $(quote_sh "$INSTALL_DIR/logs")" || true
+    run "if [ -f $(quote_sh "$pid_file") ]; then kill \$(cat $(quote_sh "$pid_file")) 2>/dev/null || true; fi"
+    run "cd $(quote_sh "$INSTALL_DIR") && nohup env PYTHONPATH=$(quote_sh "$INSTALL_DIR") python3 -m webpanel.server --install-dir $(quote_sh "$INSTALL_DIR") --backup-dir $(quote_sh "$BACKUP_DIR") >$(quote_sh "$log_out") 2>&1 < /dev/null & echo \$! > $(quote_sh "$pid_file") && chmod 600 $(quote_sh "$pid_file")"
+}
+
+is_webpanel_running() {
+    if run_q "systemctl is-active --quiet 3xui-deploy-web 2>/dev/null"; then
+        return 0
+    fi
+    local pid_file="$INSTALL_DIR/webpanel/server.pid"
+    run_q "test -f $(quote_sh "$pid_file") && kill -0 \$(cat $(quote_sh "$pid_file")) 2>/dev/null"
+}
+
+enable_webpanel() {
+    local mode="${1:-interactive}"
+    require_deployed || return 1
+    load_proxy_conf
+    load_webpanel_conf
+
+    if ! $PROXY_ENABLED || [[ -z "$PROXY_DOMAIN" ]]; then
+        error "A configured panel domain + Caddy reverse proxy is required before enabling the Web Management Panel."
+        info "Run 'manage.sh proxy setup' first — the Web Management Panel is automatically enabled once a domain is configured."
+        return 1
+    fi
+
+    get_panel_info >/dev/null 2>&1 || true
+    if [[ "$PANEL_PATH" == "/" ]]; then
+        error "3X-UI Web Base Path cannot be '/' when serving the Web Management Panel on ${PROXY_DOMAIN}."
+        return 1
+    fi
+
+    _ensure_python3 || return 1
+    _install_webpanel_files || return 1
+
+    WEBPANEL_ENABLED=true
+    WEBPANEL_DOMAIN="$PROXY_DOMAIN"
+    WEBPANEL_BIND="127.0.0.1"
+    validate_port "$WEBPANEL_PORT" || WEBPANEL_PORT=$(_find_free_webpanel_port "$PANEL_PORT" "$SUB_PORT" "$PROXY_PORT")
+    WEBPANEL_PATH=$(_choose_exclusive_webpanel_path "$PANEL_PATH" "$SUB_PATH" "$SUB_JSON_PATH")
+    save_webpanel_conf || return 1
+
+    _LAST_WEBPANEL_INIT_PASS=""
+    if ! run_q "test -s $(quote_sh "$INSTALL_DIR/webpanel/auth.json")"; then
+        local init_pw
+        init_pw=$(generate_random_string 20)
+        local auth_cmd="PYTHONPATH=$(quote_sh "$INSTALL_DIR") python3 -m webpanel.auth init-admin $(quote_sh "$INSTALL_DIR/webpanel/auth.json") $(quote_sh "$WEBPANEL_USER")"
+        if $REMOTE; then
+            printf '%s\n' "$init_pw" | ssh_cmd "$auth_cmd" >/dev/null || { init_pw=""; error "Failed to initialize WebPanel admin credentials"; return 1; }
+        else
+            printf '%s\n' "$init_pw" | bash -c "$auth_cmd" >/dev/null || { init_pw=""; error "Failed to initialize WebPanel admin credentials"; return 1; }
+        fi
+        _LAST_WEBPANEL_INIT_PASS="$init_pw"
+        init_pw=""
+    fi
+
+    _setup_webpanel_service || { error "Failed to start Web Management Panel service"; return 1; }
+    _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || warn "Failed to sync Caddy route for Web Management Panel"
+
+    local port_sfx=""
+    [[ "$PROXY_PORT" != "443" ]] && port_sfx=":${PROXY_PORT}"
+    local wp_url="https://${PROXY_DOMAIN}${port_sfx}${WEBPANEL_PATH}"
+
+    if [[ "$mode" != "auto" ]]; then
+        success "Standalone Web Management Panel is active!"
+        echo -e "  URL      : ${BOLD}${wp_url}${NC}"
+        echo -e "  Username : ${BOLD}${WEBPANEL_USER}${NC}"
+        if [[ -n "$_LAST_WEBPANEL_INIT_PASS" ]]; then
+            echo -e "  Password : ${BOLD}${YELLOW}${_LAST_WEBPANEL_INIT_PASS}${NC}  (save this now!)"
+            _LAST_WEBPANEL_INIT_PASS=""
+        fi
+    fi
+    return 0
+}
+
+disable_webpanel() {
+    load_webpanel_conf
+    if run_q "command -v systemctl && systemctl list-unit-files 2>/dev/null | grep -q 3xui-deploy-web"; then
+        run "systemctl disable --now 3xui-deploy-web >/dev/null 2>&1 || true"
+    fi
+    local pid_file="$INSTALL_DIR/webpanel/server.pid"
+    run_q "if [ -f $(quote_sh "$pid_file") ]; then kill \$(cat $(quote_sh "$pid_file")) 2>/dev/null || true; rm -f $(quote_sh "$pid_file"); fi" || true
+
+    WEBPANEL_ENABLED=false
+    if run_q "test -d $(quote_sh "$INSTALL_DIR/webpanel")"; then
+        save_webpanel_conf || true
+    fi
+    load_proxy_conf
+    if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]]; then
+        get_panel_info >/dev/null 2>&1 || true
+        _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || true
+    fi
+    success "Web Management Panel disabled"
+}
+
+status_webpanel() {
+    load_proxy_conf
+    load_webpanel_conf
+    echo ""
+    local port_sfx=""
+    [[ "$PROXY_PORT" != "443" ]] && port_sfx=":${PROXY_PORT}"
+    echo -e "  Enabled    : $($WEBPANEL_ENABLED && echo "${GREEN}Yes${NC}" || echo "${DIM}No${NC}")"
+    echo -e "  Service    : $(is_webpanel_running && echo "${GREEN}Running${NC}" || echo "${RED}Stopped${NC}")"
+    echo -e "  Bind       : ${WEBPANEL_BIND:-127.0.0.1}:${WEBPANEL_PORT}"
+    echo -e "  Path       : ${WEBPANEL_PATH}"
+    echo -e "  Domain     : ${WEBPANEL_DOMAIN:-${PROXY_DOMAIN:-(none)}}"
+    if $WEBPANEL_ENABLED && [[ -n "${PROXY_DOMAIN}" ]]; then
+        echo -e "  URL        : ${BOLD}https://${PROXY_DOMAIN}${port_sfx}${WEBPANEL_PATH}${NC}"
+    fi
+    echo ""
+}
+
+reset_webpanel_password() {
+    require_deployed || return 1
+    load_webpanel_conf
+    run_q "test -f $(quote_sh "$INSTALL_DIR/webpanel/auth.py")" || { error "WebPanel is not installed; run enable first."; return 1; }
+
+    local new_user new_pw new_pw2 auto_pw=false
+    read -rp "  WebPanel username [${WEBPANEL_USER}]: " new_user
+    new_user="${new_user:-$WEBPANEL_USER}"
+    [[ "$new_user" =~ ^[a-zA-Z0-9._-]{1,64}$ ]] || { error "Invalid username"; return 1; }
+
+    read -rs -p "  New WebPanel password [Enter to auto-generate 20-char]: " new_pw
+    echo ""
+    if [[ -z "$new_pw" ]]; then
+        new_pw=$(generate_random_string 20)
+        auto_pw=true
+    else
+        validate_strong_password "$new_pw" || { error "Password does not meet security requirements"; return 1; }
+        read -rs -p "  Confirm password: " new_pw2
+        echo ""
+        [[ "$new_pw" == "$new_pw2" ]] || { new_pw=""; new_pw2=""; error "Passwords do not match"; return 1; }
+        new_pw2=""
+    fi
+
+    local auth_cmd="PYTHONPATH=$(quote_sh "$INSTALL_DIR") python3 -m webpanel.auth set-password $(quote_sh "$INSTALL_DIR/webpanel/auth.json") $(quote_sh "$new_user")"
+    if $REMOTE; then
+        printf '%s\n' "$new_pw" | ssh_cmd "$auth_cmd" || { new_pw=""; error "Failed to update WebPanel credentials"; return 1; }
+    else
+        printf '%s\n' "$new_pw" | bash -c "$auth_cmd" || { new_pw=""; error "Failed to update WebPanel credentials"; return 1; }
+    fi
+
+    WEBPANEL_USER="$new_user"
+    save_webpanel_conf || true
+    success "WebPanel credentials updated for '${new_user}'"
+    $auto_pw && echo -e "  Generated password: ${BOLD}${YELLOW}${new_pw}${NC}  (save this now!)"
+    new_pw=""
+}
+
+manage_webpanel() {
+    require_deployed || return 1
+    while true; do
+        load_proxy_conf
+        load_webpanel_conf
+        local wp_state="${DIM}disabled${NC}"
+        if $WEBPANEL_ENABLED; then
+            is_webpanel_running && wp_state="${GREEN}active${NC} (${WEBPANEL_PATH})" || wp_state="${YELLOW}enabled, stopped${NC}"
+        fi
+        local header_text="  Status : ${wp_state}\n  Domain : ${WEBPANEL_DOMAIN:-${PROXY_DOMAIN:-(none)}}\n  Bind   : ${WEBPANEL_BIND}:${WEBPANEL_PORT}"
+        local opts=(
+            "Enable / Restart Web Management Panel"
+            "Show Web Management Panel status & URL"
+            "Reset Web Management Panel password"
+            "View WebPanel audit log"
+            "Disable Web Management Panel"
+            "Back"
+        )
+        tui_select "Standalone Web Management Panel" "$header_text" "${opts[@]}"
+        local sub=$?
+        clear_screen
+        case "$sub" in
+            0) enable_webpanel ;;
+            1) status_webpanel ;;
+            2) reset_webpanel_password ;;
+            3) run "tail -n 100 $(quote_sh "$INSTALL_DIR/logs/webpanel-audit.log") 2>/dev/null || echo '  (no audit entries yet)'" || true ;;
+            4) disable_webpanel ;;
+            5|255) _SKIP_PAUSE=true; return ;;
         esac
         echo ""
         read -rp "  Press Enter..."
@@ -5453,9 +7945,12 @@ manage_geo_assets() {
     require_deployed || return 1
     require_running  || return 1
 
+    local bin_dir
+    bin_dir=$(_xui_detect_bin_dir)
+
     local scope="${1:-}"
     if [[ -z "$scope" ]]; then
-        tui_select "Update GeoIP / GeoSite Assets" "Downloads latest routing .dat files into 3xui_app:/app/bin/:" \
+        tui_select "Update GeoIP / GeoSite Assets" "Downloads latest routing .dat files into 3xui_app:${bin_dir}/:" \
             "Standard GeoIP & GeoSite (Loyalsoldier)" \
             "Standard + Iran rules (geoip_IR / geosite_IR)" \
             "Standard + Russia rules (geoip_RU / geosite_RU)" \
@@ -5492,27 +7987,45 @@ manage_geo_assets() {
     local tmp_dir
     tmp_dir=$(run_out "mktemp -d /tmp/3xui-geo.XXXXXX")
     [[ -n "$tmp_dir" ]] || { error "Failed to create temp directory"; return 1; }
-    run_q "chmod 700 $(quote_sh "$tmp_dir")" || true
+    run_q "chmod 700 $(quote_sh "$tmp_dir") && mkdir -p $(quote_sh "$tmp_dir/bak")" || true
 
-    local pair fname url ok=0
+    local pair fname url ok=0 copied_files=()
     for pair in "${pairs[@]}"; do
         fname="${pair%%|*}"
         url="${pair#*|}"
         info "Downloading $fname..."
-        if run "curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 $(quote_sh "$url") -o $(quote_sh "$tmp_dir/$fname") && [ \$(wc -c < $(quote_sh "$tmp_dir/$fname")) -gt 10240 ] && docker cp $(quote_sh "$tmp_dir/$fname") $(quote_sh "3xui_app:/app/bin/$fname")"; then
+        run_q "docker cp $(quote_sh "3xui_app:${bin_dir}/${fname}") $(quote_sh "${tmp_dir}/bak/${fname}")" || true
+        if run "curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 $(quote_sh "$url") -o $(quote_sh "$tmp_dir/$fname") && [ \$(wc -c < $(quote_sh "$tmp_dir/$fname")) -gt 10240 ] && docker cp $(quote_sh "$tmp_dir/$fname") $(quote_sh "3xui_app:${bin_dir}/${fname}")"; then
             ok=$(( ok + 1 ))
+            copied_files+=("$fname")
         else
             warn "Failed to update $fname"
         fi
     done
 
-    run_q "rm -rf $(quote_sh "$tmp_dir")" || true
-
     if (( ok > 0 )); then
         info "Restarting container so Xray reloads geo databases..."
         compose restart >/dev/null || docker restart 3xui_app >/dev/null || true
-        success "Updated $ok/${#pairs[@]} geo-asset file(s)"
+        sleep 2
+        if is_running && run_q "docker exec 3xui_app sh -c 'pgrep -f xray >/dev/null 2>&1 || pidof xray-linux-amd64 >/dev/null 2>&1'"; then
+            run_q "rm -rf $(quote_sh "$tmp_dir")" || true
+            success "Updated $ok/${#pairs[@]} geo-asset file(s) in ${bin_dir}"
+            return 0
+        fi
+        warn "Xray process did not recover after geo update — rolling back previous .dat files..."
+        local rf
+        for rf in "${copied_files[@]}"; do
+            run_q "test -f $(quote_sh "${tmp_dir}/bak/${rf}") && docker cp $(quote_sh "${tmp_dir}/bak/${rf}") $(quote_sh "3xui_app:${bin_dir}/${rf}")" || true
+        done
+        compose restart >/dev/null || docker restart 3xui_app >/dev/null || true
+        run_q "rm -rf $(quote_sh "$tmp_dir")" || true
+        report_diagnostic "ERROR" "manage_geo_assets" \
+            "Xray failed to stay running after updating geo databases" \
+            "3xui_app:${bin_dir}/" \
+            "Rolled back previous .dat files; inspect Xray logs."
+        return 1
     else
+        run_q "rm -rf $(quote_sh "$tmp_dir")" || true
         error "No geo-asset files were updated"
         return 1
     fi
@@ -5751,6 +8264,52 @@ security_audit() {
         _aud_warn "Neither ufw nor firewalld appears active"
     fi
 
+    # 8. Forward Compatibility, Probe Redirection & WebPanel Isolation
+    local det_v det_cls
+    det_v=$(xui_detect_version 2>/dev/null || true)
+    det_cls=$(xui_classify_version "${det_v:-unknown}" 2>/dev/null || echo "unknown_tag")
+    case "$det_cls" in
+        supported|major_upgrade) _aud_pass "3X-UI version '${det_v}' within supported compatibility matrix" ;;
+        unknown_tag)             _aud_warn "3X-UI image tag '${det_v:-unknown}' is unpinned; pin explicit release tags for reproducibility" ;;
+        *)                       _aud_fail "3X-UI version '${det_v:-unknown}' (${det_cls}) is unsupported" ;;
+    esac
+
+    load_probe_conf
+    if $PROBE_REDIRECT_ENABLED; then
+        if validate_redirect_url "$PROBE_REDIRECT_TARGET"; then
+            _aud_pass "Probe redirection enabled (${PROBE_REDIRECT_TARGET}, fallback=${PROBE_FALLBACK_MODE})"
+        else
+            _aud_fail "Probe redirection enabled with invalid target URL: ${PROBE_REDIRECT_TARGET}"
+        fi
+    fi
+
+    load_webpanel_conf
+    if $WEBPANEL_ENABLED; then
+        if is_webpanel_running; then
+            _aud_pass "Standalone Web Management Panel service is running (${WEBPANEL_PATH})"
+        else
+            _aud_fail "Web Management Panel is enabled in webpanel.conf but service is stopped"
+        fi
+        if [[ "${WEBPANEL_BIND:-127.0.0.1}" == "127.0.0.1" || "${WEBPANEL_BIND:-}" == "::1" ]]; then
+            _aud_pass "WebPanel bound exclusively to loopback (${WEBPANEL_BIND}:${WEBPANEL_PORT})"
+        else
+            _aud_fail "WebPanel bind host (${WEBPANEL_BIND}) is NOT loopback"
+        fi
+        local wp_cm wp_am
+        wp_cm=$(_remote_file_mode "$INSTALL_DIR/webpanel/webpanel.conf")
+        wp_am=$(_remote_file_mode "$INSTALL_DIR/webpanel/auth.json")
+        if [[ "$wp_cm" == "600" && "$wp_am" == "600" ]]; then
+            _aud_pass "WebPanel config & auth.json permissions restricted (0600)"
+        else
+            _aud_warn "WebPanel config/auth modes (${wp_cm:-?}/${wp_am:-?}) should be 600"
+        fi
+        if _paths_overlap "$WEBPANEL_PATH" "$PANEL_PATH"; then
+            _aud_fail "WebPanel path ($WEBPANEL_PATH) overlaps 3X-UI panel path ($PANEL_PATH)"
+        else
+            _aud_pass "WebPanel path ($WEBPANEL_PATH) isolated from 3X-UI panel path ($PANEL_PATH)"
+        fi
+    fi
+
     echo ""
     echo -e "  Summary: ${GREEN}${pass} passed${NC}, ${YELLOW}${warn_c} warning(s)${NC}, ${RED}${fail} failed${NC}"
     echo ""
@@ -5816,15 +8375,20 @@ Options:
   -l, --local             Force local execution mode
   -d, --dir <path>        Override install directory (default: /opt/3x-ui)
   -y, --yes               Auto-confirm destructive or interactive confirmation prompts
+  -v, --verbose           Enable debug logging to stderr and log file
+      --force-compat      Override unsupported 3x-ui version/preflight blocks
   -h, --help              Show this help message
 
 Commands (omit to launch interactive TUI):
   deploy                  Install Docker if needed and deploy 3X-UI
   status                  Show deployment and panel status
   start | stop | restart  Control container lifecycle
-  update                  Update 3X-UI to latest GitHub release tag
+  update [tag]            Update 3X-UI (latest or specific tag) with preflight & auto-rollback
   rollback                Rollback to compose.yaml.bak
-  logs [follow|all|N]     View container logs (default: last 100 lines)
+  compat [check|matrix|test <tag>]
+                          Check 3x-ui compatibility, DB schema & preflight image contract
+  logs [follow|all|N|deploy]
+                          View container logs or 3xui-deploy operation logs
   backup                  Create timestamped backup archive
   restore [archive]       Restore from backup archive
   health                  Show system & panel diagnostics
@@ -5832,8 +8396,10 @@ Commands (omit to launch interactive TUI):
   geo-update [std|ir|ru|all]  Update Xray GeoIP & GeoSite databases
   settings                Open Panel Settings & Security menu
   certs                   Open Certificate Management menu
-  proxy [setup|status|verify|reload|disable]
-                          Manage Caddy reverse proxy (HTTPS + decoy + subs)
+  proxy [setup|status|verify|reload|probe|check-redirect|disable]
+                          Manage Caddy reverse proxy, decoy website & probe redirection
+  webpanel [enable|disable|status|reset-password]
+                          Manage standalone Web Management Panel (/deploy/)
   inbounds [list|verify|sync-proxy|sync-fw]
                           Inspect inbounds, verify sockets & sync Caddy/firewall
   audit                   Run security & configuration audit
@@ -6008,6 +8574,8 @@ main_loop() {
         "--- PANEL & SECURITY ---"
         "Panel settings & security"
         "Reverse proxy (Caddy)"
+        "Standalone Web Management Panel"
+        "Compatibility & preflight checks"
         "Inbounds & protocol routing"
         "Manage certificates"
         "Security audit"
@@ -6052,6 +8620,8 @@ main_loop() {
             "Lazydocker UI")             launch_lazydocker ;;
             "Panel settings & security")   manage_panel_settings ;;
             "Reverse proxy (Caddy)")       manage_reverse_proxy ;;
+            "Standalone Web Management Panel") manage_webpanel ;;
+            "Compatibility & preflight checks") xui_check_compatibility check || true ;;
             "Inbounds & protocol routing") manage_inbounds ;;
             "Manage certificates")         manage_certs ;;
             "Security audit")              security_audit || true ;;
@@ -6082,7 +8652,7 @@ main() {
     setup_terminal
     load_config
 
-    local cli_cmd="" cli_arg=""
+    local cli_cmd="" cli_arg="" cli_arg2=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -r|--remote)
@@ -6105,6 +8675,14 @@ main() {
                 AUTO_YES=true
                 shift
                 ;;
+            -v|--verbose)
+                XUI_DEBUG=1
+                shift
+                ;;
+            --force-compat)
+                FORCE_COMPAT=true
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -6119,6 +8697,8 @@ main() {
                     cli_cmd="$1"
                 elif [[ -z "$cli_arg" ]]; then
                     cli_arg="$1"
+                elif [[ -z "$cli_arg2" ]]; then
+                    cli_arg2="$1"
                 else
                     error "Unexpected argument: $1"
                     exit 1
@@ -6139,7 +8719,7 @@ main() {
             self-update)  self_update; exit $? ;;
         esac
 
-        if [[ "$cli_cmd" == "deploy" || "$cli_cmd" == "settings" || "$cli_cmd" == "certs" || "$cli_cmd" == "proxy" || "$cli_cmd" == "inbounds" ]]; then
+        if [[ "$cli_cmd" == "deploy" || "$cli_cmd" == "settings" || "$cli_cmd" == "certs" || "$cli_cmd" == "proxy" || "$cli_cmd" == "webpanel" || "$cli_cmd" == "inbounds" ]]; then
             [[ ! -t 0 && -r /dev/tty ]] && exec < /dev/tty
         fi
 
@@ -6156,8 +8736,15 @@ main() {
             start)        start_panel ;;
             stop)         stop_panel ;;
             restart)      restart_panel ;;
-            update)       update_panel_latest ;;
+            update)       update_panel_latest "$cli_arg" ;;
             rollback)     rollback_version ;;
+            compat)
+                case "${cli_arg:-check}" in
+                    check|matrix) xui_check_compatibility "${cli_arg:-check}" ;;
+                    test)         xui_check_compatibility test "$cli_arg2" ;;
+                    *)            error "Unknown compat action: $cli_arg (use: check|matrix|test <tag>)"; exit 1 ;;
+                esac
+                ;;
             logs)         logs_panel "${cli_arg:-100}" ;;
             backup)       backup_panel ;;
             restore)      restore_panel "$cli_arg" ;;
@@ -6168,13 +8755,29 @@ main() {
             certs)        INTERACTIVE=true; manage_certs ;;
             proxy)
                 case "${cli_arg:-}" in
-                    "")      INTERACTIVE=true; manage_reverse_proxy ;;
-                    setup)   INTERACTIVE=true; setup_reverse_proxy ;;
-                    status)  status_reverse_proxy ;;
-                    verify)  verify_reverse_proxy ;;
-                    reload)  reload_reverse_proxy ;;
-                    disable) disable_reverse_proxy ;;
-                    *)       error "Unknown proxy action: $cli_arg (use: setup|status|verify|reload|disable)"; exit 1 ;;
+                    "")              INTERACTIVE=true; manage_reverse_proxy ;;
+                    setup)           INTERACTIVE=true; setup_reverse_proxy ;;
+                    status)          status_reverse_proxy ;;
+                    verify)          verify_reverse_proxy ;;
+                    reload)          reload_reverse_proxy ;;
+                    probe)           INTERACTIVE=true; configure_probe_redirect ;;
+                    check-redirect)  check_redirect_target_health "$cli_arg2" ;;
+                    sync-caddy)      get_panel_info >/dev/null 2>&1 || true; _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" ;;
+                    decoy-apply)     load_probe_conf; generate_decoy_site true ;;
+                    protected-paths) _print_protected_paths ;;
+                    disable)         disable_reverse_proxy ;;
+                    *)               error "Unknown proxy action: $cli_arg (use: setup|status|verify|reload|probe|check-redirect|disable)"; exit 1 ;;
+                esac
+                ;;
+            webpanel)
+                case "${cli_arg:-}" in
+                    "")             INTERACTIVE=true; manage_webpanel ;;
+                    enable)         enable_webpanel "${cli_arg2:-cli}" ;;
+                    disable)        disable_webpanel ;;
+                    status)         status_webpanel ;;
+                    reset-password) INTERACTIVE=true; reset_webpanel_password ;;
+                    logs)           run "tail -n 100 $(quote_sh "$INSTALL_DIR/logs/webpanel-audit.log") 2>/dev/null || echo '(no audit log yet)'" ;;
+                    *)              error "Unknown webpanel action: $cli_arg (use: enable|disable|status|reset-password|logs)"; exit 1 ;;
                 esac
                 ;;
             inbounds)

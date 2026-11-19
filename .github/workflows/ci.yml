@@ -15,8 +15,8 @@ jobs:
 
       - name: Verify LF line endings
         run: |
-          if grep -q $'\r' manage.sh tests/test_manage.sh; then
-            echo "ERROR: shell scripts contain CRLF line endings"
+          if grep -q $'\r' manage.sh tests/test_manage.sh tests/test_compat.sh webpanel/*.py tests/test_webpanel.py; then
+            echo "ERROR: source files contain CRLF line endings"
             exit 1
           fi
 
@@ -24,15 +24,23 @@ jobs:
         run: |
           bash -n manage.sh
           bash -n tests/test_manage.sh
+          bash -n tests/test_compat.sh
 
       - name: Run ShellCheck (advisory)
         run: |
           if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck -S warning manage.sh tests/test_manage.sh || true
+            shellcheck -S warning manage.sh tests/test_manage.sh tests/test_compat.sh || true
           fi
 
-      - name: Run unit tests
-        run: bash tests/test_manage.sh
+      - name: Run bash unit & compatibility tests
+        run: |
+          bash tests/test_manage.sh
+          bash tests/test_compat.sh
+
+      - name: Check Python syntax and run webpanel tests
+        run: |
+          python3 -m py_compile webpanel/__init__.py webpanel/auth.py webpanel/probe.py webpanel/ops.py webpanel/server.py tests/test_webpanel.py
+          python3 -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Smoke test CLI help
         run: |

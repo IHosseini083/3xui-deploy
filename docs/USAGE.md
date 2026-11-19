@@ -31,11 +31,13 @@ Use **Target & SSH manager → Install SSH public key & clear saved password** t
 
 ---
 
-## Deployment, Upgrades & Rollbacks
+## Deployment, Forward Compatibility, Upgrades & Rollbacks
 
 1. **Deploy / Install**: Installs Docker + Compose plugin if missing, lets you choose **SQLite** or **PostgreSQL**, fetches the latest release tag from `mhsanaei/3x-ui`, generates `/opt/3x-ui/compose.yaml` (and `.env` for PostgreSQL), starts containers, and runs the optional **Post-Deploy Hardening** wizard.
-2. **Update to latest version / Change version manually**: Backs up `compose.yaml` to `compose.yaml.bak`, updates the image tag cleanly via `awk`, pulls the image, and runs `compose up -d`.
-3. **Rollback version**: Displays current vs. backup image tags and restores `compose.yaml.bak`.
+2. **Forward Compatibility (`compat`)**: Run `3xui-deploy compat check`, `compat matrix`, or `compat test <tag>` to inspect the detected 3X-UI release (`v2.x`–`v3.x`), Go binary path, DB schema (`settings` & `inbounds`), and CLI flags. Unsupported versions (`< v2.0.0` or `>= v4.0.0`) are blocked unless `--force-compat` is explicitly passed.
+3. **Safe Updates & Auto-Rollback (`update [tag]`)**: Pulls and preflight-checks the candidate image *before* modifying `compose.yaml`, saves `compose.yaml.bak` + a `pre_update` archive, updates containers, verifies DB schema and live panel/subscription endpoints, and automatically rolls back to `compose.yaml.bak` if startup or verification fails.
+4. **Structured Logging (`logs deploy`)**: Staged operational logs (`INFO`, `OK`, `WARN`, `ERROR`, `CRITICAL`) with automatic secret redaction are written to `$INSTALL_DIR/logs/3xui-deploy.log` (or `~/.3xui-deploy.log`).
+5. **Rollback version**: Displays current vs. backup image tags and restores `compose.yaml.bak`.
 
 Environment overrides:
 - `XUI_INSTALL_DIR` (or `-d, --dir`): default `/opt/3x-ui`
@@ -58,18 +60,29 @@ Under **Panel settings & security** (`manage.sh settings`), `x-ui setting` queri
 
 ---
 
-## Reverse Proxy (Caddy), Camouflage & Subscription Domain
+## Reverse Proxy (Caddy), Multi-Page Decoy Website & Probe Redirection
 
 Under **Reverse proxy (Caddy)** (`manage.sh proxy`), `manage.sh` runs `caddy:2-alpine` (`3xui_caddy`) inside `/opt/3x-ui/compose.yaml` with `network_mode: host`:
 
 - **Loopback Isolation & Host Synchronization**: Automatically locks 3X-UI's panel (`webListen`) and subscription server (`subListen`) to `127.0.0.1`, sets `webDomain` and `subDomain` in 3X-UI's database to prevent `DomainValidatorMiddleware` `403` mismatches or `X-Real-IP` fallback issues, clears direct panel/sub TLS so Caddy terminates HTTPS cleanly, and sends `Host`, `X-Forwarded-Host`, `X-Forwarded-Port`, `X-Real-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto` upstream.
-- **Camouflage Decoy Site (`/`)**: Requires a non-root `webBasePath` (offers to auto-generate one if currently `/`) and serves a neutral status page (`/opt/3x-ui/caddy/site/index.html`) on `/` with strict `Content-Security-Policy` headers so only `/<webBasePath>*` routes reach 3X-UI. Use **Customize decoy site** to edit, upload a custom HTML page, or reset it.
+- **Legitimate Multi-Page Decoy Site (`/`)**: Requires a non-root `webBasePath` (offers to auto-generate one if currently `/`) and serves a multi-page static website (`index.html`, `services.html`, `docs.html`, `about.html`, `contact.html`, `404.html`, local CSS/JS, `robots.txt`, `sitemap.xml`) under `/opt/3x-ui/caddy/site/` with three selectable themes (`cloud`, `studio`, `docs`) and strict CSP headers. Use **Customize decoy site** to pick a theme, edit HTML, upload custom HTML, or reset.
+- **Configurable Probe & Bot Redirection (`proxy probe` / WebPanel)**: Optionally redirect detected vulnerability scanners, CLI tools, missing/empty User-Agents, unusual HTTP methods, blocked CIDRs, or exploit probe paths (`/.env`, `/.git`, `/wp-admin`, etc.) to a custom external URL (e.g., `https://www.cloudflare.com`, `https://www.speedtest.net`). Legitimate browser traffic and protected routes (`PANEL_PATH`, `/deploy/`, `/sub/`, `/json/`, loopback inbounds) are never redirected. Automatic health checks fall back safely to the decoy website, a secondary URL, or a decoy `404` page if the redirect destination becomes unreachable.
 - **Custom HTTPS Port (Xray Reality Coexistence)**: Defaults to `443`, or lets you choose a custom port (e.g. `8443`) while disabling Caddy's `TLS-ALPN-01` challenge (`disable_tlsalpn_challenge`) so port `443` stays free for Xray VLESS/Reality (uses HTTP-01 on port `80`, or existing certs under `/opt/3x-ui/cert/<domain>/`).
 - **Subscription Proxy Modes**:
   1. **Dedicated subscription domain** (e.g., `sub.example.com`): Creates an isolated vhost proxying `/sub/*` and `/json/*` to `127.0.0.1:<subPort>`, serving the decoy site on `/`, enabling `subJsonEnable` and `subEncrypt`, and setting `subDomain`, `subURI`, and `subJsonURI` in 3X-UI's database.
   2. **Same domain as panel** (e.g., `panel.example.com/sub/` & `/json/`): Proxies subscriptions alongside the panel under the same domain.
   3. **Disabled**: Proxies only the panel (clearing any stale loopback `subListen` or proxy `subURI` overrides).
-- **Auto-Sync, DNS & Endpoint Verification (`proxy verify`)**: Changing panel port, `webBasePath`, or subscription settings automatically regenerates `Caddyfile` and reloads Caddy via its isolated Unix admin socket (`unix//config/admin.sock`). `proxy setup`, `proxy verify`, `status`, and `health` verify live panel UI loading, subscription backend + Caddy routing (`Cache-Control: no-store` header verification), and A/AAAA DNS resolution.
+- **Auto-Sync, DNS & Endpoint Verification (`proxy verify`)**: Changing panel port, `webBasePath`, probe rules, or subscription settings automatically regenerates `Caddyfile` (with automatic rollback on validation error) and reloads Caddy via its isolated Unix admin socket (`unix//config/admin.sock`).
+
+---
+
+## Standalone Web Management Panel (`/deploy/`)
+
+When you configure a panel domain via `proxy setup` (or set `webDomain` in Panel Settings and enable proxy), `3xui-deploy` automatically installs and starts the standalone **Web Management Panel** (`3xui-deploy-web.service`):
+
+- **Exclusive Domain & Dedicated Path**: Bound strictly to `127.0.0.1` (`2059`) and reverse-proxied exclusively under the main panel domain (`https://panel.example.com/deploy/`), automatically selecting a non-overlapping path if `/deploy/` collides with existing panel/subscription routes. Never mounted on dedicated subscription domains (`sub.example.com`).
+- **Capabilities**: View system metrics & container status, start/stop/restart stack, run 3X-UI compatibility & preflight checks, execute rollback-safe updates, configure decoy themes and probe redirection rules (including live target health tester and request simulator), inspect Xray inbounds, run `audit`, create/prune backups, update GeoIP/GeoSite datasets, and filter `3xui-deploy` / audit / container logs.
+- **CLI Commands**: `webpanel enable`, `webpanel status`, `webpanel reset-password`, `webpanel logs`, `webpanel disable`.
 
 ---
 
