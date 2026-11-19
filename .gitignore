@@ -30,3 +30,7 @@ compose.yaml.tmp
 Thumbs.db
 .vscode/
 .idea/
+
+
+# TODO
+TODO.md
