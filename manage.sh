@@ -14,6 +14,19 @@
 #
 set -uo pipefail
 
+if [[ -z "${HOME:-}" ]]; then
+    HOME=$(getent passwd "$(id -u 2>/dev/null || echo 0)" 2>/dev/null | cut -d: -f6 || true)
+    if [[ -z "$HOME" && "$(id -u 2>/dev/null || echo 1)" == "0" && -d /root ]]; then
+        HOME="/root"
+    fi
+    [[ -n "$HOME" ]] || HOME="${TMPDIR:-/tmp}"
+    export HOME
+fi
+if [[ -z "${PATH:-}" ]]; then
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    export PATH
+fi
+
 # ─── Globals & Defaults ─────────────────────────────────────────────────────
 REPO_URL="https://github.com/IHosseini083/3xui-deploy"
 REPO_RAW_URL="https://raw.githubusercontent.com/IHosseini083/3xui-deploy/main/manage.sh"
@@ -22,7 +35,7 @@ BIN_INSTALL_PATH="/usr/local/bin/3xui-deploy"
 
 INSTALL_DIR="${XUI_INSTALL_DIR:-/opt/3x-ui}"
 BACKUP_DIR="${XUI_BACKUP_DIR:-/opt/3x-ui-backups}"
-CONFIG_FILE="${HOME}/.3xui-manager.conf"
+CONFIG_FILE="${HOME:-/tmp}/.3xui-manager.conf"
 COMPOSE_CMD=""
 
 XUI_LOG_FILE="${XUI_LOG_FILE:-}"
@@ -7082,6 +7095,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONPATH=${INSTALL_DIR}
 Environment=XUI_INSTALL_DIR=${INSTALL_DIR}
 Environment=XUI_BACKUP_DIR=${BACKUP_DIR}
@@ -8498,6 +8513,14 @@ self_update() {
         fi
     fi
 
+    if [[ -f "$INSTALL_DIR/webpanel/manage.sh" && "$(realpath "$INSTALL_DIR/webpanel/manage.sh" 2>/dev/null || echo "$INSTALL_DIR/webpanel/manage.sh")" != "$(realpath "${0:-}" 2>/dev/null || echo "")" ]]; then
+        if [[ $EUID -eq 0 || -w "$INSTALL_DIR/webpanel/manage.sh" ]]; then
+            install -m 0755 "$tmp_script" "$INSTALL_DIR/webpanel/manage.sh" || true
+        elif command -v sudo &>/dev/null; then
+            sudo install -m 0755 "$tmp_script" "$INSTALL_DIR/webpanel/manage.sh" || true
+        fi
+    fi
+
     rm -f "$tmp_script"
     if $updated; then
         success "Updated manager script successfully! Re-run to use the new version."
@@ -8719,8 +8742,17 @@ main() {
             self-update)  self_update; exit $? ;;
         esac
 
-        if [[ "$cli_cmd" == "deploy" || "$cli_cmd" == "settings" || "$cli_cmd" == "certs" || "$cli_cmd" == "proxy" || "$cli_cmd" == "webpanel" || "$cli_cmd" == "inbounds" ]]; then
-            [[ ! -t 0 && -r /dev/tty ]] && exec < /dev/tty
+        local _needs_tty=false
+        if ! $AUTO_YES; then
+            case "$cli_cmd:${cli_arg:-}" in
+                deploy:*|settings:*|certs:*) _needs_tty=true ;;
+                proxy:|proxy:setup|proxy:probe) _needs_tty=true ;;
+                webpanel:|webpanel:reset-password) _needs_tty=true ;;
+                inbounds:) _needs_tty=true ;;
+            esac
+        fi
+        if $_needs_tty && [[ ! -t 0 ]] && ( : < /dev/tty ) 2>/dev/null; then
+            exec < /dev/tty
         fi
 
         INTERACTIVE=false
@@ -8797,7 +8829,9 @@ main() {
     fi
 
     # Support interactive TUI when launched via `curl ... | bash`
-    [[ ! -t 0 && -r /dev/tty ]] && exec < /dev/tty
+    if [[ ! -t 0 ]] && ( : < /dev/tty ) 2>/dev/null; then
+        exec < /dev/tty
+    fi
 
     # Interactive TUI path.
     if $REMOTE; then

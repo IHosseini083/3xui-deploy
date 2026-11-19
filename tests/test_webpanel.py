@@ -326,6 +326,24 @@ class ServerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(st, 401)
 
+    def test_ops_run_manage_sets_home_and_path_under_minimal_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manage_path = os.path.join(tmp, "manage.sh")
+            with open(manage_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("#!/usr/bin/env bash\nexit 0\n")
+            deploy_ops = ops.DeployOps(tmp, os.path.join(tmp, "backups"), manage_path)
+            fake_proc = mock.Mock(returncode=0, stdout="ok\n")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch(
+                "subprocess.run", return_value=fake_proc
+            ) as run_mock:
+                rc, out = deploy_ops._run_manage(["proxy", "sync-caddy"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out, "ok\n")
+            passed_env = run_mock.call_args.kwargs["env"]
+            self.assertTrue(passed_env.get("HOME"))
+            self.assertIn("/usr/local/sbin", passed_env.get("PATH", ""))
+            self.assertEqual(passed_env.get("NO_COLOR"), "1")
+
 
 if __name__ == "__main__":
     unittest.main()

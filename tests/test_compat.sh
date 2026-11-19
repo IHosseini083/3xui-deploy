@@ -207,10 +207,27 @@ YAML
     assert_contains "$(< "$INSTALL_DIR/compose.yaml")" "3x-ui:v2.5.0" "compose.yaml automatically rolled back to v2.5.0"
 }
 
+# ─── 5. Minimal / Systemd-Like Environment Execution ────────────────────────
+test_minimal_systemd_environment() {
+    local clean_dir="$TEST_TMP/clean-env-dir"
+    mkdir -p "$clean_dir/caddy" "$clean_dir/logs"
+    assert_ok "manage.sh --help works with HOME unset (systemd env)" \
+        env -i PATH="$PATH" XUI_LOG_FILE="$TEST_TMP/min-env.log" bash "$REPO_ROOT/manage.sh" --help </dev/null >/dev/null
+    assert_ok "manage.sh initializes HOME & protected-paths under minimal env" \
+        env -i PATH="$PATH" XUI_INSTALL_DIR="$clean_dir" XUI_LOG_FILE="$TEST_TMP/min-env.log" XUI_SOURCE_ONLY=1 \
+        bash -c 'source "$1" && [[ -n "${HOME:-}" ]] && _print_protected_paths >/dev/null' _ "$REPO_ROOT/manage.sh" </dev/null
+    local min_out=""
+    min_out=$(env -i PATH="$PATH" XUI_INSTALL_DIR="$clean_dir" XUI_LOG_FILE="$TEST_TMP/min-env.log" \
+        bash "$REPO_ROOT/manage.sh" --local --yes --dir "$clean_dir" proxy sync-caddy </dev/null 2>&1 || true)
+    assert_not_contains "$min_out" "unbound variable" "proxy sync-caddy has no unbound variable under minimal env"
+    assert_not_contains "$min_out" "/dev/tty" "proxy sync-caddy does not touch /dev/tty under --yes with no tty"
+}
+
 test_version_classification
 test_logging_and_diagnostics
 test_capability_probing_and_schema_drift
 test_update_safety_and_rollback
+test_minimal_systemd_environment
 
 printf 'Compat tests complete: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 (( FAIL_COUNT == 0 ))

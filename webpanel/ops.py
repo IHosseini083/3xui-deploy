@@ -107,6 +107,17 @@ class DeployOps:
             *args,
         ]
         env = dict(os.environ)
+        if not env.get("HOME"):
+            home_dir = os.path.expanduser("~")
+            if not home_dir or home_dir == "~":
+                home_dir = "/root" if os.path.isdir("/root") else tempfile.gettempdir()
+            env["HOME"] = home_dir
+        std_bins = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+        path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+        for sb in std_bins:
+            if sb not in path_parts:
+                path_parts.append(sb)
+        env["PATH"] = os.pathsep.join(path_parts)
         env["NO_COLOR"] = "1"
         env["XUI_INSTALL_DIR"] = self.install_dir
         env["XUI_BACKUP_DIR"] = self.backup_dir
