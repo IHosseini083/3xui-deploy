@@ -22,7 +22,7 @@ When started without flags, `manage.sh` scores environment hints (`DISPLAY`, `un
 
 ### SSH Multiplexing & Key Migration
 
-Connection details are saved in `~/.3xui-manager.conf` (`chmod 600`), and persistent ControlMaster sockets live in `${XDG_RUNTIME_DIR:-$HOME/.ssh}/3xui_mux/mux-%C` (`chmod 700`) with a 1-hour persist window.
+Connection details are saved in `~/.3xui-manager.conf` (`chmod 600`), and persistent ControlMaster sockets live in `${XDG_RUNTIME_DIR:-$HOME/.ssh}/3xui_mux/mux-%C` (`chmod 700`) with a 15-minute persist window.
 
 Use **Target & SSH manager → Install SSH public key & clear saved password** to:
 1. Locate `~/.ssh/id_ed25519.pub` (or `id_ecdsa.pub` / `id_rsa.pub`), or generate a new Ed25519 key pair.
@@ -47,10 +47,13 @@ Environment overrides:
 
 Under **Panel settings & security** (`manage.sh settings`), `x-ui setting` queries and updates the running container (`3xui_app`):
 
-- **Show full panel settings**: Prints `x-ui setting -show=true`, `-getCert=true`, and the computed `http(s)://ip:port/path/` URL.
+- **Show full panel & subscription settings**: Prints `x-ui setting -show=true`, `-getListen=true`, `-getCert=true`, `webDomain`, `sessionMaxAge`, 2FA status, subscription DB configuration, and the effective URL.
 - **Change panel port**: Updates `-port` (validated `1–65535`).
+- **Change panel listen IP (`webListen`)**: Binds the panel to `0.0.0.0` / blank (all interfaces), `127.0.0.1`, `::1`, or a specific host interface IP (with loopback validation warning if Caddy proxy is active).
 - **Change / randomize Web Base Path**: Updates `-webBasePath` or generates a random `/12chars/` path.
-- **Reset admin username & password**: Prompts for username/password (or auto-generates a 16-character alphanumeric password).
+- **Configure subscription domain & network**: Works in both Caddy reverse-proxy mode (`127.0.0.1` loopback + `subDomain` + `subURI` + `subJsonEnable` + `subJsonURI` + Caddy sync) and direct mode (`subListen`, `subDomain`, `subPort`, optional TLS cert), followed by live endpoint & DNS verification.
+- **Harden auth, session & web domain**: Sets `sessionMaxAge` (`5–10080` minutes, recommended `60`) and `webDomain` (enforcing strict `Host` validation).
+- **Reset admin username & password**: Enforces password strength rules (min 12 chars, no control chars or weak defaults, >= 16 chars or >= 2 classes) or auto-generates a 20-character password, passed securely over stdin (`_xui_set_credentials_stdin`).
 - **Reset / Disable 2FA**: Calls `x-ui setting -resetTwoFactor=true` if locked out of TOTP.
 
 ---
@@ -59,14 +62,20 @@ Under **Panel settings & security** (`manage.sh settings`), `x-ui setting` queri
 
 Under **Reverse proxy (Caddy)** (`manage.sh proxy`), `manage.sh` runs `caddy:2-alpine` (`3xui_caddy`) inside `/opt/3x-ui/compose.yaml` with `network_mode: host`:
 
-- **Loopback Isolation**: Automatically locks 3X-UI's panel (`webListen`) and subscription server (`subListen`) to `127.0.0.1`, clearing direct panel/sub TLS so Caddy terminates HTTPS cleanly.
-- **Camouflage Decoy Site (`/`)**: Requires a non-root `webBasePath` (offers to auto-generate one if currently `/`) and serves `/opt/3x-ui/caddy/site/index.html` on `/` so only `/<webBasePath>*` routes reach 3X-UI. Use **Customize decoy site** to edit, upload a custom HTML page, or reset it.
+- **Loopback Isolation & Host Synchronization**: Automatically locks 3X-UI's panel (`webListen`) and subscription server (`subListen`) to `127.0.0.1`, sets `webDomain` and `subDomain` in 3X-UI's database to prevent `DomainValidatorMiddleware` `403` mismatches or `X-Real-IP` fallback issues, clears direct panel/sub TLS so Caddy terminates HTTPS cleanly, and sends `Host`, `X-Forwarded-Host`, `X-Forwarded-Port`, `X-Real-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto` upstream.
+- **Camouflage Decoy Site (`/`)**: Requires a non-root `webBasePath` (offers to auto-generate one if currently `/`) and serves a neutral status page (`/opt/3x-ui/caddy/site/index.html`) on `/` with strict `Content-Security-Policy` headers so only `/<webBasePath>*` routes reach 3X-UI. Use **Customize decoy site** to edit, upload a custom HTML page, or reset it.
 - **Custom HTTPS Port (Xray Reality Coexistence)**: Defaults to `443`, or lets you choose a custom port (e.g. `8443`) while disabling Caddy's `TLS-ALPN-01` challenge (`disable_tlsalpn_challenge`) so port `443` stays free for Xray VLESS/Reality (uses HTTP-01 on port `80`, or existing certs under `/opt/3x-ui/cert/<domain>/`).
 - **Subscription Proxy Modes**:
-  1. **Dedicated subscription domain** (e.g., `sub.example.com`): Creates an isolated vhost proxying `/sub/*` and `/json/*` to `127.0.0.1:<subPort>`, serving the decoy site on `/`, and setting `subURI` / `subJsonURI` in 3X-UI's database.
+  1. **Dedicated subscription domain** (e.g., `sub.example.com`): Creates an isolated vhost proxying `/sub/*` and `/json/*` to `127.0.0.1:<subPort>`, serving the decoy site on `/`, enabling `subJsonEnable` and `subEncrypt`, and setting `subDomain`, `subURI`, and `subJsonURI` in 3X-UI's database.
   2. **Same domain as panel** (e.g., `panel.example.com/sub/` & `/json/`): Proxies subscriptions alongside the panel under the same domain.
-  3. **Disabled**: Proxies only the panel.
-- **Auto-Sync & Web UI Load Verification**: Changing panel port or `webBasePath` later in **Panel settings & security** automatically regenerates `Caddyfile` and reloads Caddy. `deploy`, `start`, `restart`, `status`, `health`, and `proxy setup` also probe the panel login page (and Caddy HTTPS route when enabled) to confirm HTTP `200` and 3X-UI UI HTML markers rather than serving the decoy page.
+  3. **Disabled**: Proxies only the panel (clearing any stale loopback `subListen` or proxy `subURI` overrides).
+- **Auto-Sync, DNS & Endpoint Verification (`proxy verify`)**: Changing panel port, `webBasePath`, or subscription settings automatically regenerates `Caddyfile` and reloads Caddy via its isolated Unix admin socket (`unix//config/admin.sock`). `proxy setup`, `proxy verify`, `status`, and `health` verify live panel UI loading, subscription backend + Caddy routing (`Cache-Control: no-store` header verification), and A/AAAA DNS resolution.
+
+---
+
+## Security Audit (`audit`)
+
+Run `manage.sh audit` (or select **Security audit** in the TUI) to inspect default credentials, 2FA, `sessionMaxAge`, `webBasePath`, loopback/TLS isolation, subscription domain consistency, Caddy Unix admin socket & container hardening (`cap_drop`, `no-new-privileges`), secret file permissions, `XRAY_VMESS_AEAD_FORCED`, Fail2ban, firewall state, and local SSH config hygiene.
 
 ---
 
