@@ -4,7 +4,7 @@
 - Cookie: `3xui_deploy_sid` (`HttpOnly; Secure; SameSite=Strict; Path=<WEBPANEL_PATH>`)
 - Header on mutations: `X-CSRF-Token: <session.csrf_token>` + matching `Origin`
 - Endpoints:
-  - `GET /api/auth/status` — returns `{authenticated, username?, csrf_token?, domain, base_path}`
+  - `GET /api/auth/status` — returns `{authenticated, username?, csrf_token?, domain, base_path, version}`
   - `POST /api/auth/login` — `{username, password}` (IP rate-limited: 5 failures / 15m -> `429`)
   - `POST /api/auth/logout` — clears cookie & invalidates session
   - `POST /api/auth/change-password` — verifies current password, enforces strong password policy, rotates current session, revokes others
@@ -20,13 +20,14 @@
   - `GET /api/jobs/<id>/stream` — Server-Sent Events (`text/event-stream`) emitting `state`, `update`, `done` events and `: keepalive` heartbeats
 
 ## Operational Endpoints (`webpanel/ops.py`)
-- `GET /api/overview` — host metrics (CPU, RAM/Swap, disk, network, OS), `3xui_*` containers + live stats, health summary, version, URLs, TLS certs, probe state
+- `GET /api/overview` — host metrics (CPU, RAM/Swap, disk, network, OS), `3xui_*` containers + live stats, health summary, `version` (`deploy`, `webpanel`, `in_sync`), URLs, TLS certs, probe state
+- `GET /api/version[?check=1]` — returns installed `current_version`, `webpanel_version`, `in_sync`, and (with `?check=1`) remote `latest_version`, `latest_ref`, `channel`, `update_available`, `release_url`
 - `GET /api/health` — runs `manage.sh health`
 - `GET /api/xray` — runs `manage.sh xray-status`
 - `GET /api/compat` — runs `manage.sh compat check`
 - `POST /api/compat/test` — `{tag, async?}` -> runs `manage.sh compat test <tag>`
 - `POST /api/deploy` — `{db_type, pg_user?, async?}` -> runs `manage.sh deploy <sqlite|postgres> [user]`
-- `POST /api/self-update` — `{async?}` -> runs `manage.sh self-update`
+- `POST /api/self-update` — `{target?, force?, async?}` -> runs `manage.sh self-update [--force] [target]` and schedules `3xui-deploy-web` restart if WebPanel files changed
 - `POST /api/lifecycle` — `{action, async?}` in `{start, stop, restart, reload_caddy, verify_proxy, sync_inbounds_caddy, verify_inbounds, sync_firewall, self_update}`
 - `POST /api/update` — `{tag?, force_compat?, async?}` -> runs `manage.sh [--force-compat] update [tag]`
 - `POST /api/rollback` — `{async?}` -> runs `manage.sh rollback`

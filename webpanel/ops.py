@@ -16,10 +16,12 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from . import __version__ as WEBPANEL_VERSION
 from . import auth, probe
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+DEPLOY_REF_RE = re.compile(r"^(?:main|v[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?)$")
 SAFE_BACKUP_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\.tar\.gz$")
 WEBPATH_RE = re.compile(r"^/[a-zA-Z0-9/_-]{0,127}$")
 PG_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$")
@@ -90,6 +92,23 @@ def parse_kv_lines(text: str) -> dict[str, str]:
         if re.fullmatch(r"[A-Z0-9_]+", k):
             out[k] = v.strip()
     return out
+
+
+def read_script_version(manage_script: str) -> str:
+    """Extract DEPLOY_VERSION from manage.sh header lines."""
+    if not manage_script or not os.path.isfile(manage_script):
+        return ""
+    try:
+        with open(manage_script, "r", encoding="utf-8", errors="replace") as fh:
+            for idx, line in enumerate(fh):
+                if idx > 80:
+                    break
+                m = re.match(r'^DEPLOY_VERSION="([^"]+)"', line.strip())
+                if m:
+                    return m.group(1).strip()
+    except OSError:
+        pass
+    return ""
 
 
 def validate_port_value(raw: Any) -> tuple[bool, int]:
@@ -636,6 +655,9 @@ class DeployOps:
                 meta = dict(res.get("meta") or {})
                 if res.get("new_webpanel_url"):
                     meta["new_webpanel_url"] = res["new_webpanel_url"]
+                for mk in ("updated_from", "updated_to", "updated_ref", "restart_required"):
+                    if mk in res and res[mk] not in (None, ""):
+                        meta[mk] = res[mk]
                 self._update_job(
                     job_id,
                     status="succeeded" if ok else "failed",
@@ -646,6 +668,8 @@ class DeployOps:
                     meta_update=meta,
                     finished=True,
                 )
+                if ok and meta.get("restart_required"):
+                    self._schedule_webpanel_restart()
             except Exception as exc:  # noqa: BLE001
                 _emit(f"[ERROR] {exc}")
                 self._update_job(
@@ -1217,10 +1241,16 @@ class DeployOps:
         else:
             health_status = "healthy"
 
+        script_ver = read_script_version(self.manage_script)
         return {
             "install_dir": self.install_dir,
             "deployed": deployed,
             "xui_tag": self._read_compose_tag(),
+            "version": {
+                "deploy": script_ver or WEBPANEL_VERSION,
+                "webpanel": WEBPANEL_VERSION,
+                "in_sync": (not script_ver) or (script_ver == WEBPANEL_VERSION),
+            },
             "containers": containers,
             "metrics": metrics,
             "summary": {
@@ -1408,6 +1438,122 @@ class DeployOps:
         t0 = time.monotonic()
         res = _exec()
         self.record_sync_job("xui_rollback", "Rollback 3X-UI version", actor, res, t0)
+        return res
+
+    def get_version_info(self, check_remote: bool = False) -> dict[str, Any]:
+        script_ver = read_script_version(self.manage_script)
+        current_ver = script_ver or WEBPANEL_VERSION
+        res: dict[str, Any] = {
+            "ok": True,
+            "current_version": current_ver,
+            "webpanel_version": WEBPANEL_VERSION,
+            "in_sync": (not script_ver) or (script_ver == WEBPANEL_VERSION),
+        }
+        if not check_remote:
+            return res
+
+        rc, out = self._run_manage(["self-update", "--check"], timeout=25)
+        kv = parse_kv_lines(out)
+        if kv.get("DEPLOY_CURRENT_VERSION"):
+            res["current_version"] = kv["DEPLOY_CURRENT_VERSION"]
+        avail_raw = kv.get("DEPLOY_UPDATE_AVAILABLE", "unknown").lower()
+        avail: bool | None = True if avail_raw == "true" else (False if avail_raw == "false" else None)
+        res.update(
+            {
+                "ok": rc == 0,
+                "returncode": rc,
+                "latest_version": kv.get("DEPLOY_LATEST_VERSION", "unknown"),
+                "latest_ref": kv.get("DEPLOY_LATEST_REF", "main"),
+                "channel": kv.get("DEPLOY_CHANNEL", "main"),
+                "update_available": avail,
+                "release_url": kv.get("DEPLOY_RELEASE_URL", ""),
+                "output": out,
+            }
+        )
+        return res
+
+    def _schedule_webpanel_restart(self, delay: float = 1.8) -> None:
+        if os.environ.get("XUI_TESTING") == "1" or not shutil.which("systemctl"):
+            return
+
+        def _do_restart() -> None:
+            try:
+                chk = subprocess.run(
+                    ["systemctl", "is-active", "--quiet", "3xui-deploy-web"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    shell=False,
+                )
+                if chk.returncode == 0:
+                    subprocess.run(
+                        ["systemctl", "restart", "3xui-deploy-web"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                        shell=False,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        timer = threading.Timer(delay, _do_restart)
+        timer.daemon = True
+        timer.start()
+
+    def run_self_update(
+        self,
+        target: str = "",
+        force: bool = False,
+        *,
+        async_mode: bool = False,
+        actor: str = "admin",
+    ) -> dict[str, Any]:
+        clean_target = (target or "").strip()
+        if clean_target and not DEPLOY_REF_RE.fullmatch(clean_target):
+            return {
+                "ok": False,
+                "returncode": 2,
+                "error": "Invalid target version/ref (use vX.Y.Z or main).",
+            }
+
+        args = ["self-update"]
+        if force:
+            args.append("--force")
+        if clean_target:
+            args.append(clean_target)
+        label = clean_target or "latest release"
+
+        def _exec(emit: Callable[[str], None] | None = None) -> dict[str, Any]:
+            with self._op_lock:
+                if emit:
+                    rc, out = self._run_manage_streaming(args, on_line=emit, timeout=180)
+                else:
+                    rc, out = self._run_manage(args, timeout=180)
+            kv = parse_kv_lines(out)
+            res: dict[str, Any] = {
+                "ok": rc == 0,
+                "returncode": rc,
+                "output": out,
+            }
+            if kv.get("UPDATED_FROM"):
+                res["updated_from"] = kv["UPDATED_FROM"]
+            if kv.get("UPDATED_TO"):
+                res["updated_to"] = kv["UPDATED_TO"]
+            if kv.get("UPDATED_REF"):
+                res["updated_ref"] = kv["UPDATED_REF"]
+            if kv.get("WEBPANEL_RESTART_REQUIRED", "").lower() == "true":
+                res["restart_required"] = True
+            return res
+
+        if async_mode:
+            return {"accepted": True, "job": self.start_job("self_update", f"Update 3xui-deploy ({label})", actor, _exec)}
+        t0 = time.monotonic()
+        res = _exec()
+        self.record_sync_job("self_update", f"Update 3xui-deploy ({label})", actor, res, t0)
+        if res.get("ok") and res.get("restart_required"):
+            self._schedule_webpanel_restart()
         return res
 
     def issue_certificate(

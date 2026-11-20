@@ -28,9 +28,11 @@ if [[ -z "${PATH:-}" ]]; then
 fi
 
 # ─── Globals & Defaults ─────────────────────────────────────────────────────
-REPO_URL="https://github.com/IHosseini083/3xui-deploy"
-REPO_RAW_URL="https://raw.githubusercontent.com/IHosseini083/3xui-deploy/main/manage.sh"
-REPO_RAW_BASE="https://raw.githubusercontent.com/IHosseini083/3xui-deploy/main"
+DEPLOY_VERSION="2.0.0"
+REPO_SLUG="IHosseini083/3xui-deploy"
+REPO_URL="https://github.com/${REPO_SLUG}"
+REPO_RAW_BASE="https://raw.githubusercontent.com/${REPO_SLUG}/main"
+REPO_RAW_URL="${REPO_RAW_BASE}/manage.sh"
 BIN_INSTALL_PATH="/usr/local/bin/3xui-deploy"
 
 INSTALL_DIR="${XUI_INSTALL_DIR:-/opt/3x-ui}"
@@ -654,10 +656,10 @@ print_banner() {
   ██████╔╝██╔╝ ██╗       ╚██████╔╝██║
   ╚═════╝ ╚═╝  ╚═╝        ╚═════╝ ╚═╝
 EOF
-        echo -e "${NC}${DIM}  Xray panel · Docker deployment manager${NC}"
+        echo -e "${NC}${DIM}  Xray panel · Docker deployment manager · v${DEPLOY_VERSION}${NC}"
     else
         echo -e "${CYAN}${BOLD}  3X-UI MANAGER${NC}"
-        echo -e "${DIM}  Xray panel · Docker deployment manager${NC}"
+        echo -e "${DIM}  Xray panel · Docker deployment manager · v${DEPLOY_VERSION}${NC}"
     fi
 
     echo ""
@@ -8056,6 +8058,9 @@ status_webpanel() {
     echo -e "  Bind       : ${WEBPANEL_BIND:-127.0.0.1}:${WEBPANEL_PORT}"
     echo -e "  Path       : ${WEBPANEL_PATH}"
     echo -e "  Domain     : ${WEBPANEL_DOMAIN:-${PROXY_DOMAIN:-(none)}}"
+    local wp_ver
+    wp_ver=$(_deploy_read_installed_webpanel_version || true)
+    [[ -n "$wp_ver" ]] && echo -e "  Version    : v${wp_ver}"
     if $WEBPANEL_ENABLED && [[ -n "${PROXY_DOMAIN}" ]]; then
         echo -e "  URL        : ${BOLD}https://${PROXY_DOMAIN}${port_sfx}${WEBPANEL_PATH}${NC}"
     fi
@@ -9369,7 +9374,7 @@ usage() {
     local prog="manage.sh"
     [[ -n "${0:-}" && "$0" != "bash" && "$0" != "-bash" && "$0" != /dev/fd/* && "$0" != /proc/* ]] && prog=$(basename "$0")
     cat <<EOF
-3X-UI Manager (${REPO_URL})
+3X-UI Manager v${DEPLOY_VERSION} (${REPO_URL})
 
 Usage:
   ${prog} [OPTIONS] [COMMAND] [ARGS]
@@ -9381,6 +9386,7 @@ Options:
   -y, --yes               Auto-confirm destructive or interactive confirmation prompts
   -v, --verbose           Enable debug logging to stderr and log file
       --force-compat      Override unsupported 3x-ui version/preflight blocks
+  -V, --version           Print 3xui-deploy version and exit
   -h, --help              Show this help message
 
 Commands (omit to launch interactive TUI):
@@ -9416,26 +9422,333 @@ Commands (omit to launch interactive TUI):
   inbounds [list|verify|sync-proxy|sync-fw]
                           Inspect inbounds, verify sockets & sync Caddy/firewall
   audit                   Run security & configuration audit
+  version [--check]       Show installed 3xui-deploy / WebPanel version (or check for updates)
   self-install            Install this manager globally as ${BIN_INSTALL_PATH}
-  self-update             Update this manager script from GitHub main branch
+  self-update [tag|main|--check|--force]
+                          Update 3xui-deploy (& WebPanel if installed) from latest release or ref
   help                    Show this help message
 EOF
 }
 
-_download_script_to() {
-    local dst="$1"
+_deploy_validate_ref() {
+    local ref="${1:-}"
+    [[ "$ref" == "main" ]] && return 0
+    [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+}
+
+_repo_raw_base_for_ref() {
+    local ref="${1:-main}"
+    printf 'https://raw.githubusercontent.com/%s/%s' "$REPO_SLUG" "$ref"
+}
+
+_deploy_http_get() {
+    local url="$1" dst="${2:-}"
     if command -v curl &>/dev/null; then
-        curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 "$REPO_RAW_URL" -o "$dst" || return 1
+        if [[ -n "$dst" ]]; then
+            curl -fsSL --proto '=https' --tlsv1.2 --max-time 25 "$url" -o "$dst"
+        else
+            curl -fsSL --proto '=https' --tlsv1.2 --max-time 25 "$url"
+        fi
     elif command -v wget &>/dev/null; then
-        wget -qO "$dst" --https-only --secure-protocol=TLSv1_2 --timeout=30 "$REPO_RAW_URL" || return 1
+        if [[ -n "$dst" ]]; then
+            wget -qO "$dst" --https-only --secure-protocol=TLSv1_2 --timeout=25 "$url"
+        else
+            wget -qO- --https-only --secure-protocol=TLSv1_2 --timeout=25 "$url"
+        fi
     else
         error "curl or wget is required to download from GitHub"
         return 1
     fi
+}
+
+_deploy_read_installed_webpanel_version() {
+    local init_py="$INSTALL_DIR/webpanel/__init__.py"
+    local raw=""
+    if $REMOTE; then
+        raw=$(run_out "sed -n 's/^__version__[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p' $(quote_sh "$init_py") | head -n 1" || true)
+    elif [[ -f "$init_py" ]]; then
+        raw=$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$init_py" 2>/dev/null | head -n 1 || true)
+    fi
+    printf '%s' "${raw//[$'\r\n ']/}"
+}
+
+_deploy_extract_script_version() {
+    local script_file="$1"
+    [[ -f "$script_file" ]] || return 1
+    sed -n 's/^DEPLOY_VERSION="\([^"]*\)".*/\1/p' "$script_file" 2>/dev/null | head -n 1
+}
+
+_deploy_latest_release_ref() {
+    local tag=""
+    local releases_url="${REPO_URL}/releases/latest"
+    local api_url="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
+
+    if command -v curl &>/dev/null; then
+        local effective_url=""
+        effective_url=$(curl -fsSLI --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' --max-time 10 "$releases_url" 2>/dev/null || true)
+        if [[ "$effective_url" == */releases/tag/* ]]; then
+            tag="${effective_url##*/}"
+        fi
+        if [[ -z "$tag" ]]; then
+            tag=$(curl -fsSL --proto '=https' --tlsv1.2 --max-time 10 "$api_url" 2>/dev/null \
+                | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1 || true)
+        fi
+    elif command -v wget &>/dev/null; then
+        tag=$(wget -qO- --https-only --secure-protocol=TLSv1_2 --timeout=10 "$api_url" 2>/dev/null \
+            | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1 || true)
+    fi
+
+    tag="${tag//[$'\r\n ']/}"
+    if [[ -n "$tag" && "$tag" != "main" ]] && _deploy_validate_ref "$tag"; then
+        printf '%s|%s|release' "$tag" "${tag#v}"
+        return 0
+    fi
+
+    local main_ver=""
+    main_ver=$(_deploy_http_get "$(_repo_raw_base_for_ref main)/VERSION" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ "$main_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+        printf 'main|%s|main' "$main_ver"
+    else
+        printf 'main||main'
+    fi
+}
+
+_sha256_file() {
+    local path="$1"
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$path" | awk '{print tolower($1)}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$path" | awk '{print tolower($1)}'
+    else
+        return 1
+    fi
+}
+
+_download_release_checksums() {
+    local ref="${1:-}" dst="${2:-}"
+    [[ "$ref" == v* && -n "$dst" ]] || return 1
+    local url="${REPO_URL}/releases/download/${ref}/SHA256SUMS.txt"
+    _deploy_http_get "$url" "$dst" 2>/dev/null && [[ -s "$dst" ]]
+}
+
+_verify_checksum_if_present() {
+    local sums_file="${1:-}" rel_path="${2:-}" local_file="${3:-}"
+    [[ -n "$sums_file" && -s "$sums_file" ]] || return 0
+    local expected actual
+    expected=$(awk -v target="$rel_path" '
+        {
+            p = $2
+            sub(/^\.\//, "", p)
+            if (p == target && $1 ~ /^[0-9a-fA-F]{64}$/) {
+                print tolower($1)
+                exit
+            }
+        }
+    ' "$sums_file" 2>/dev/null || true)
+    if [[ -z "$expected" ]]; then
+        error "Checksum entry missing for '${rel_path}' in SHA256SUMS.txt"
+        return 1
+    fi
+    actual=$(_sha256_file "$local_file") || {
+        error "sha256sum or shasum is required to verify release checksums"
+        return 1
+    }
+    if [[ "$actual" != "$expected" ]]; then
+        error "SHA-256 verification failed for ${rel_path} (expected ${expected}, got ${actual})"
+        return 1
+    fi
+    return 0
+}
+
+_deploy_version_info() {
+    local check_remote=false
+    [[ "${1:-}" == "--check" ]] && check_remote=true
+
+    local wp_ver=""
+    wp_ver=$(_deploy_read_installed_webpanel_version || true)
+    printf 'DEPLOY_CURRENT_VERSION=%s\n' "$DEPLOY_VERSION"
+    printf 'DEPLOY_WEBPANEL_VERSION=%s\n' "${wp_ver:-none}"
+
+    if ! $check_remote; then
+        if [[ -n "$wp_ver" ]]; then
+            echo "  3xui-deploy v${DEPLOY_VERSION} (WebPanel v${wp_ver})"
+        else
+            echo "  3xui-deploy v${DEPLOY_VERSION}"
+        fi
+        return 0
+    fi
+
+    local resolved="" latest_ref="main" latest_ver="" channel="main"
+    resolved=$(_deploy_latest_release_ref || true)
+    IFS='|' read -r latest_ref latest_ver channel <<< "$resolved"
+    latest_ref="${latest_ref:-main}"
+    channel="${channel:-main}"
+
+    local avail="unknown" cmp=""
+    if [[ -n "$latest_ver" ]]; then
+        cmp=$(_semver_compare "$latest_ver" "$DEPLOY_VERSION" 2>/dev/null || true)
+        if [[ "$cmp" == "1" ]]; then
+            avail="true"
+        elif [[ "$cmp" == "0" || "$cmp" == "-1" ]]; then
+            avail="false"
+        fi
+    fi
+
+    local rel_url="$REPO_URL"
+    [[ "$channel" == "release" && "$latest_ref" == v* ]] && rel_url="${REPO_URL}/releases/tag/${latest_ref}"
+
+    printf 'DEPLOY_LATEST_VERSION=%s\n' "${latest_ver:-unknown}"
+    printf 'DEPLOY_LATEST_REF=%s\n' "$latest_ref"
+    printf 'DEPLOY_CHANNEL=%s\n' "$channel"
+    printf 'DEPLOY_UPDATE_AVAILABLE=%s\n' "$avail"
+    printf 'DEPLOY_RELEASE_URL=%s\n' "$rel_url"
+
+    if [[ "$avail" == "true" ]]; then
+        info "Update available: v${DEPLOY_VERSION} -> v${latest_ver} (${channel}: ${latest_ref})"
+    elif [[ "$avail" == "false" ]]; then
+        success "Up to date on v${DEPLOY_VERSION} (${channel}: ${latest_ref})"
+    else
+        warn "Could not resolve remote version from ${REPO_URL}"
+    fi
+}
+
+deploy_version_cmd() {
+    case "${1:-}" in
+        "" )
+            _deploy_version_info
+            ;;
+        --check)
+            _deploy_version_info --check
+            ;;
+        *)
+            error "Unknown version option: $1 (use: version [--check])"
+            return 1
+            ;;
+    esac
+}
+
+_download_script_to() {
+    local dst="$1" ref="${2:-main}" sums_file="${3:-}"
+    local url
+    url="$(_repo_raw_base_for_ref "$ref")/manage.sh"
+    _deploy_http_get "$url" "$dst" || return 1
     [[ -s "$dst" ]] || return 1
     head -n 1 "$dst" | grep -q '^#!/usr/bin/env bash' || return 1
     grep -q '# 3X-UI Manager' "$dst" || return 1
+    _verify_checksum_if_present "$sums_file" "manage.sh" "$dst" || return 1
     bash -n "$dst" 2>/dev/null
+}
+
+_sync_webpanel_from_ref() {
+    local ref="${1:-main}" sums_file="${2:-}" manage_src="${3:-}"
+    local dst="$INSTALL_DIR/webpanel"
+    run_q "test -f $(quote_sh "$dst/server.py")" || return 0
+
+    local stage
+    stage=$(mktemp -d /tmp/3xui-wp-update.XXXXXX) || { error "Failed to create WebPanel staging directory"; return 1; }
+
+    local files=(
+        "webpanel/__init__.py"
+        "webpanel/auth.py"
+        "webpanel/probe.py"
+        "webpanel/ops.py"
+        "webpanel/server.py"
+        "webpanel/static/index.html"
+        "webpanel/static/app.css"
+        "webpanel/static/app.js"
+    )
+    local base rel url local_target
+    base=$(_repo_raw_base_for_ref "$ref")
+    mkdir -p "$stage/webpanel/static"
+
+    info "Staging WebPanel files from ${ref}..."
+    for rel in "${files[@]}"; do
+        url="${base}/${rel}"
+        local_target="${stage}/${rel}"
+        if ! _deploy_http_get "$url" "$local_target" || [[ ! -s "$local_target" ]]; then
+            rm -rf "$stage"
+            error "Failed to download ${rel} from ${ref}"
+            return 1
+        fi
+        if ! _verify_checksum_if_present "$sums_file" "$rel" "$local_target"; then
+            rm -rf "$stage"
+            return 1
+        fi
+    done
+
+    if command -v python3 &>/dev/null; then
+        if ! python3 -m py_compile \
+            "${stage}/webpanel/__init__.py" \
+            "${stage}/webpanel/auth.py" \
+            "${stage}/webpanel/probe.py" \
+            "${stage}/webpanel/ops.py" \
+            "${stage}/webpanel/server.py" 2>/dev/null; then
+            rm -rf "$stage"
+            error "Staged WebPanel Python syntax check failed; aborting WebPanel update"
+            return 1
+        fi
+    fi
+
+    if $REMOTE; then
+        if ! tar -cf - -C "$stage/webpanel" . | ssh_cmd "mkdir -p $(quote_sh "$dst/static") && tar --no-same-owner -xf - -C $(quote_sh "$dst")"; then
+            rm -rf "$stage"
+            error "Failed to copy staged WebPanel files to remote host"
+            return 1
+        fi
+        if [[ -n "$manage_src" && -f "$manage_src" ]]; then
+            if ! ssh_copy "$manage_src" "$dst/manage.sh" || ! run "chmod 755 $(quote_sh "$dst/manage.sh")"; then
+                rm -rf "$stage"
+                error "Failed to sync $dst/manage.sh on remote host"
+                return 1
+            fi
+        fi
+        run "chmod 700 $(quote_sh "$dst") && chmod 755 $(quote_sh "$dst/static") && chmod 644 $(quote_sh "$dst")/*.py $(quote_sh "$dst/static")/*" || true
+    else
+        local need_sudo=false
+        [[ ! -w "$dst" && $EUID -ne 0 ]] && need_sudo=true
+        if $need_sudo && command -v sudo &>/dev/null; then
+            sudo mkdir -p "$dst/static" || { rm -rf "$stage"; return 1; }
+            sudo cp -a "$stage/webpanel/." "$dst/" || { rm -rf "$stage"; return 1; }
+            if [[ -n "$manage_src" && -f "$manage_src" ]]; then
+                sudo install -m 0755 "$manage_src" "$dst/manage.sh" || { rm -rf "$stage"; return 1; }
+            fi
+            sudo chmod 700 "$dst" && sudo chmod 755 "$dst/static" && sudo chmod 644 "$dst"/*.py "$dst/static"/* || true
+        else
+            mkdir -p "$dst/static" || { rm -rf "$stage"; return 1; }
+            cp -a "$stage/webpanel/." "$dst/" || { rm -rf "$stage"; return 1; }
+            if [[ -n "$manage_src" && -f "$manage_src" ]]; then
+                install -m 0755 "$manage_src" "$dst/manage.sh" || { cp "$manage_src" "$dst/manage.sh" && chmod 755 "$dst/manage.sh"; } || { rm -rf "$stage"; return 1; }
+            fi
+            chmod 700 "$dst" && chmod 755 "$dst/static" && chmod 644 "$dst"/*.py "$dst/static"/* || true
+        fi
+    fi
+
+    rm -rf "$stage"
+    success "Synced WebPanel package at $dst"
+
+    if run_q "command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet 3xui-deploy-web 2>/dev/null"; then
+        if [[ "${WEBPANEL_NO_SELF_RESTART:-0}" == "1" ]]; then
+            printf 'WEBPANEL_RESTART_REQUIRED=true\n'
+        else
+            if $REMOTE; then
+                run "systemctl restart 3xui-deploy-web" || warn "Failed to restart 3xui-deploy-web service"
+            elif [[ $EUID -eq 0 ]]; then
+                systemctl restart 3xui-deploy-web || warn "Failed to restart 3xui-deploy-web service"
+            elif command -v sudo &>/dev/null; then
+                sudo systemctl restart 3xui-deploy-web || warn "Failed to restart 3xui-deploy-web service"
+            fi
+        fi
+    fi
+    return 0
+}
+
+_can_write_bin_path() {
+    local p="$1" d
+    d=$(dirname "$p")
+    [[ -w "$p" ]] && return 0
+    [[ -d "$d" && -w "$d" ]] && return 0
+    [[ ! -e "$d" && -w "$(dirname "$d")" ]] && return 0
+    return 1
 }
 
 self_install() {
@@ -9448,14 +9761,17 @@ self_install() {
         bash -n "$tmp_script" 2>/dev/null || { rm -f "$tmp_script"; error "Script syntax check failed"; return 1; }
     else
         info "Downloading latest manager script from GitHub..."
-        if ! _download_script_to "$tmp_script"; then
+        if ! _download_script_to "$tmp_script" "main"; then
             rm -f "$tmp_script"
             error "Download or validation failed"
             return 1
         fi
     fi
 
-    if [[ $EUID -eq 0 ]]; then
+    local bin_dir
+    bin_dir=$(dirname "$BIN_INSTALL_PATH")
+    if [[ $EUID -eq 0 ]] || _can_write_bin_path "$BIN_INSTALL_PATH"; then
+        mkdir -p "$bin_dir"
         install -m 0755 "$tmp_script" "$BIN_INSTALL_PATH" || { cp "$tmp_script" "$BIN_INSTALL_PATH" && chmod 755 "$BIN_INSTALL_PATH"; }
     else
         info "Installing to $BIN_INSTALL_PATH (sudo required)..."
@@ -9473,19 +9789,104 @@ self_install() {
 }
 
 self_update() {
-    local tmp_script
-    tmp_script=$(mktemp /tmp/3xui-update.XXXXXX.sh) || { error "Failed to create temp file"; return 1; }
-    chmod 600 "$tmp_script" 2>/dev/null || true
+    local check_only=false force_update=false requested_ref="" arg=""
+    for arg in "$@"; do
+        case "$arg" in
+            --check)     check_only=true ;;
+            --force|-f)  force_update=true ;;
+            -*)
+                error "Unknown self-update option: $arg (use: self-update [vX.Y.Z|main|--check|--force])"
+                return 1
+                ;;
+            *)
+                if [[ -n "$requested_ref" ]]; then
+                    error "Unexpected extra argument to self-update: $arg"
+                    return 1
+                fi
+                requested_ref="$arg"
+                ;;
+        esac
+    done
 
-    info "Downloading latest version from ${REPO_URL}..."
-    if ! _download_script_to "$tmp_script"; then
-        rm -f "$tmp_script"
-        error "Failed to download or validate updated script"
+    if $check_only; then
+        _deploy_version_info --check
+        return $?
+    fi
+
+    if [[ -n "$requested_ref" ]] && ! _deploy_validate_ref "$requested_ref"; then
+        error "Invalid target version/ref '$requested_ref' (expected vX.Y.Z or main)"
         return 1
     fi
 
+    if $REMOTE; then
+        init_master_connection || return 1
+    fi
+
+    local target_ref="" target_ver="" channel="release" auto_resolved=false
+    if [[ -n "$requested_ref" ]]; then
+        target_ref="$requested_ref"
+        if [[ "$target_ref" == v* ]]; then
+            target_ver="${target_ref#v}"
+            channel="release"
+        else
+            channel="main"
+            target_ver=$(_deploy_http_get "$(_repo_raw_base_for_ref main)/VERSION" 2>/dev/null | tr -d '[:space:]' || true)
+            [[ "$target_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || target_ver=""
+        fi
+    else
+        auto_resolved=true
+        local resolved=""
+        resolved=$(_deploy_latest_release_ref || true)
+        IFS='|' read -r target_ref target_ver channel <<< "$resolved"
+        target_ref="${target_ref:-main}"
+        channel="${channel:-main}"
+    fi
+
+    local wp_ver=""
+    wp_ver=$(_deploy_read_installed_webpanel_version || true)
+    if ! $force_update && [[ -n "$target_ver" ]]; then
+        local cmp=""
+        cmp=$(_semver_compare "$target_ver" "$DEPLOY_VERSION" 2>/dev/null || true)
+        if [[ "$cmp" == "0" ]] && { [[ -z "$wp_ver" ]] || [[ "$wp_ver" == "$target_ver" ]]; }; then
+            success "Already up to date (3xui-deploy v${DEPLOY_VERSION}, ref: ${target_ref})"
+            printf 'UPDATED_FROM=%s\nUPDATED_TO=%s\nUPDATED_REF=%s\n' "$DEPLOY_VERSION" "$DEPLOY_VERSION" "$target_ref"
+            return 0
+        fi
+        if $auto_resolved && [[ "$cmp" == "-1" ]]; then
+            success "Current v${DEPLOY_VERSION} is already newer than latest release v${target_ver}"
+            printf 'UPDATED_FROM=%s\nUPDATED_TO=%s\nUPDATED_REF=%s\n' "$DEPLOY_VERSION" "$DEPLOY_VERSION" "$target_ref"
+            return 0
+        fi
+    fi
+
+    local tmp_script tmp_sums
+    tmp_script=$(mktemp /tmp/3xui-update.XXXXXX.sh) || { error "Failed to create temp file"; return 1; }
+    tmp_sums=$(mktemp /tmp/3xui-sums.XXXXXX) || { rm -f "$tmp_script"; error "Failed to create temp checksum file"; return 1; }
+    chmod 600 "$tmp_script" "$tmp_sums" 2>/dev/null || true
+
+    if [[ "$target_ref" == v* ]]; then
+        if _download_release_checksums "$target_ref" "$tmp_sums"; then
+            info "Downloaded SHA256SUMS.txt for ${target_ref}"
+        else
+            : > "$tmp_sums"
+        fi
+    else
+        : > "$tmp_sums"
+    fi
+
+    info "Downloading 3xui-deploy (${target_ref}${target_ver:+ · v${target_ver}}) from ${REPO_URL}..."
+    if ! _download_script_to "$tmp_script" "$target_ref" "$tmp_sums"; then
+        rm -f "$tmp_script" "$tmp_sums"
+        error "Failed to download or validate updated script from ${target_ref}"
+        return 1
+    fi
+
+    local new_ver=""
+    new_ver=$(_deploy_extract_script_version "$tmp_script" || true)
+    new_ver="${new_ver:-${target_ver:-unknown}}"
+
     local updated=false
-    if [[ -f "${0:-}" && "$0" != /dev/fd/* && "$0" != /proc/* && "$0" != "bash" && "$0" != "-bash" ]]; then
+    if [[ -f "${0:-}" && "$0" != /dev/fd/* && "$0" != /proc/* && "$0" != "bash" && "$0" != "-bash" ]] && grep -q '# 3X-UI Manager' "$0" 2>/dev/null; then
         if [[ -w "$0" ]]; then
             install -m 0755 "$tmp_script" "$0" && updated=true
         elif [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null; then
@@ -9493,8 +9894,10 @@ self_update() {
         fi
     fi
 
-    if [[ -e "$BIN_INSTALL_PATH" && "$(realpath "$BIN_INSTALL_PATH" 2>/dev/null || echo "$BIN_INSTALL_PATH")" != "$(realpath "${0:-}" 2>/dev/null || echo "")" ]]; then
-        if [[ $EUID -eq 0 || -w "$BIN_INSTALL_PATH" ]]; then
+    local bin_dir
+    bin_dir=$(dirname "$BIN_INSTALL_PATH")
+    if [[ -e "$BIN_INSTALL_PATH" ]] && [[ "$(realpath "$BIN_INSTALL_PATH" 2>/dev/null || echo "$BIN_INSTALL_PATH")" != "$(realpath "${0:-}" 2>/dev/null || echo "")" ]]; then
+        if [[ $EUID -eq 0 ]] || _can_write_bin_path "$BIN_INSTALL_PATH"; then
             cp -a "$BIN_INSTALL_PATH" "${BIN_INSTALL_PATH}.bak" 2>/dev/null || true
             install -m 0755 "$tmp_script" "$BIN_INSTALL_PATH" && updated=true
         elif command -v sudo &>/dev/null; then
@@ -9504,14 +9907,18 @@ self_update() {
     fi
 
     if ! $updated; then
-        if [[ $EUID -eq 0 ]]; then
+        if [[ $EUID -eq 0 ]] || _can_write_bin_path "$BIN_INSTALL_PATH"; then
+            mkdir -p "$bin_dir"
             install -m 0755 "$tmp_script" "$BIN_INSTALL_PATH" && updated=true
         elif command -v sudo &>/dev/null; then
             sudo install -m 0755 "$tmp_script" "$BIN_INSTALL_PATH" && updated=true
         fi
     fi
 
-    if [[ -f "$INSTALL_DIR/webpanel/manage.sh" && "$(realpath "$INSTALL_DIR/webpanel/manage.sh" 2>/dev/null || echo "$INSTALL_DIR/webpanel/manage.sh")" != "$(realpath "${0:-}" 2>/dev/null || echo "")" ]]; then
+    local wp_sync_rc=0
+    if run_q "test -f $(quote_sh "$INSTALL_DIR/webpanel/server.py")"; then
+        _sync_webpanel_from_ref "$target_ref" "$tmp_sums" "$tmp_script" || wp_sync_rc=1
+    elif ! $REMOTE && [[ -f "$INSTALL_DIR/webpanel/manage.sh" ]] && [[ "$(realpath "$INSTALL_DIR/webpanel/manage.sh" 2>/dev/null || echo "$INSTALL_DIR/webpanel/manage.sh")" != "$(realpath "${0:-}" 2>/dev/null || echo "")" ]]; then
         if [[ $EUID -eq 0 || -w "$INSTALL_DIR/webpanel/manage.sh" ]]; then
             install -m 0755 "$tmp_script" "$INSTALL_DIR/webpanel/manage.sh" || true
         elif command -v sudo &>/dev/null; then
@@ -9519,9 +9926,14 @@ self_update() {
         fi
     fi
 
-    rm -f "$tmp_script"
+    rm -f "$tmp_script" "$tmp_sums"
+    if (( wp_sync_rc != 0 )); then
+        error "Manager script updated to v${new_ver}, but WebPanel sync failed"
+        return 1
+    fi
     if $updated; then
-        success "Updated manager script successfully! Re-run to use the new version."
+        printf 'UPDATED_FROM=%s\nUPDATED_TO=%s\nUPDATED_REF=%s\n' "$DEPLOY_VERSION" "$new_ver" "$target_ref"
+        success "Updated 3xui-deploy: v${DEPLOY_VERSION} -> v${new_ver} (${target_ref})"
     else
         error "Could not write updated script"
         return 1
@@ -9701,9 +10113,22 @@ main() {
                 XUI_DEBUG=1
                 shift
                 ;;
+            -V|--version)
+                printf '3xui-deploy v%s\n' "$DEPLOY_VERSION"
+                exit 0
+                ;;
             --force-compat)
                 FORCE_COMPAT=true
                 shift
+                ;;
+            --check|--force|-f)
+                if [[ -n "$cli_cmd" ]]; then
+                    cli_args+=("$1")
+                    shift
+                else
+                    error "Option '$1' must follow a command (e.g. 'self-update $1' or 'version $1')"
+                    exit 1
+                fi
                 ;;
             -h|--help)
                 usage
@@ -9738,8 +10163,9 @@ main() {
     if [[ -n "$cli_cmd" ]]; then
         case "$cli_cmd" in
             help)         usage; exit 0 ;;
+            version)      deploy_version_cmd ${cli_args[@]+"${cli_args[@]}"}; exit $? ;;
             self-install) self_install; exit $? ;;
-            self-update)  self_update; exit $? ;;
+            self-update)  self_update ${cli_args[@]+"${cli_args[@]}"}; exit $? ;;
         esac
 
         local _needs_tty=false

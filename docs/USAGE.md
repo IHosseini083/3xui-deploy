@@ -89,6 +89,7 @@ When you configure a panel domain via `proxy setup` (or set `webDomain` in Panel
   - **Decoy & Stealth, Inbounds & Audit**: Manage decoy themes and probe-redirection rules + simulator, inspect Xray inbounds and Xray Core status, and run security audits.
   - **Deploy, Backups, Logs & History**: Deploy/redeploy SQLite or PostgreSQL stacks, run compatibility preflight checks, perform rollback-safe updates, create/restore/prune backups, configure daily backup cron schedules, update GeoIP/GeoSite datasets, filter 6 log sources, and inspect persistent operation history.
 - **CLI Commands**: `webpanel enable`, `webpanel status`, `webpanel reset-password`, `webpanel update-settings`, `webpanel logs`, `webpanel disable`.
+- **Versioning & Full-Stack Self-Update**: Run `3xui-deploy --version`, `3xui-deploy version --check`, or `3xui-deploy self-update [vX.Y.Z|main|--check|--force]` (or use **Deploy & Updates → 3xui-deploy Version & Self-Update** in the WebPanel). `self-update` tracks GitHub Releases (falling back to `main`), verifies `SHA256SUMS.txt` when present, updates `manage.sh` + `/usr/local/bin/3xui-deploy` + all installed WebPanel files atomically, and schedules a clean `3xui-deploy-web` service reload.
 
 ---
 

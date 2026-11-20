@@ -19,6 +19,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from . import __version__ as WEBPANEL_VERSION
 from . import auth, ops, probe
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -170,7 +171,7 @@ class DeployHTTPServer(ThreadingHTTPServer):
 
 
 class DeployRequestHandler(BaseHTTPRequestHandler):
-    server_version = "3xui-deploy-web/2.0"
+    server_version = f"3xui-deploy-web/{WEBPANEL_VERSION}"
     sys_version = ""
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -483,6 +484,7 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
                         "configured": self.auth_store.has_users(),
                         "domain": self.cfg.allowed_domain,
                         "base_path": self.cfg.base_path,
+                        "version": WEBPANEL_VERSION,
                     },
                 )
                 return
@@ -494,8 +496,18 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
                     "csrf_token": sess["csrf_token"],
                     "domain": self.cfg.allowed_domain,
                     "base_path": self.cfg.base_path,
+                    "version": WEBPANEL_VERSION,
                 },
             )
+            return
+
+        if route == "/api/version":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            params = self._query_params()
+            check_remote = params.get("check", "").lower() in ("1", "true")
+            self._send_json(200, self.deploy_ops.get_version_info(check_remote=check_remote))
             return
 
         if route == "/api/auth/sessions":
@@ -756,8 +768,10 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/self-update":
-            self.auth_store.audit_log("self_update", actor, client_ip, "")
-            res = self.deploy_ops.run_lifecycle("self_update", async_mode=async_mode, actor=actor)
+            target = str(body.get("target", "")).strip()
+            force = bool(body.get("force", False))
+            self.auth_store.audit_log("self_update", actor, client_ip, f"target={target or 'latest'} force={force}")
+            res = self.deploy_ops.run_self_update(target=target, force=force, async_mode=async_mode, actor=actor)
             self._send_op_result(res)
             return
 

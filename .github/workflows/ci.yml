@@ -15,8 +15,32 @@ jobs:
 
       - name: Verify LF line endings
         run: |
-          if grep -q $'\r' manage.sh tests/test_manage.sh tests/test_compat.sh webpanel/*.py tests/test_webpanel.py; then
+          if grep -q $'\r' VERSION CHANGELOG.md manage.sh tests/*.sh tests/*.py webpanel/*.py webpanel/static/* .github/workflows/*.yml; then
             echo "ERROR: source files contain CRLF line endings"
+            exit 1
+          fi
+
+      - name: Verify version consistency
+        run: |
+          VER=$(tr -d '[:space:]' < VERSION)
+          if ! [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: VERSION '$VER' is not valid SemVer"
+            exit 1
+          fi
+          SCRIPT_VER=$(sed -n 's/^DEPLOY_VERSION="\([^"]*\)".*/\1/p' manage.sh | head -n 1)
+          WP_VER=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' webpanel/__init__.py | head -n 1)
+          if [[ "$SCRIPT_VER" != "$VER" || "$WP_VER" != "$VER" ]]; then
+            echo "ERROR: Version mismatch: VERSION=$VER manage.sh=$SCRIPT_VER webpanel=$WP_VER"
+            exit 1
+          fi
+          if ! grep -qF "## [v${VER}]" CHANGELOG.md; then
+            echo "ERROR: CHANGELOG.md is missing entry '## [v${VER}]'"
+            exit 1
+          fi
+          chmod +x manage.sh
+          OUT_VER=$(./manage.sh --version)
+          if [[ "$OUT_VER" != "3xui-deploy v${VER}" ]]; then
+            echo "ERROR: Unexpected './manage.sh --version' output: '$OUT_VER'"
             exit 1
           fi
 

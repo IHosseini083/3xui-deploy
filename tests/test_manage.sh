@@ -782,6 +782,112 @@ CADDY
     INSTALL_DIR="$XUI_INSTALL_DIR"
 }
 
+test_versioning_and_self_update() {
+    local v_file v_script v_wp
+    v_file=$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")
+    v_script=$(_deploy_extract_script_version "$REPO_ROOT/manage.sh")
+    v_wp=$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO_ROOT/webpanel/__init__.py" | head -n 1)
+
+    assert_eq "$v_file" "$DEPLOY_VERSION" "VERSION matches DEPLOY_VERSION"
+    assert_eq "$v_file" "$v_script" "VERSION matches extract script version"
+    assert_eq "$v_file" "$v_wp" "VERSION matches webpanel.__version__"
+    assert_contains "$(< "$REPO_ROOT/CHANGELOG.md")" "## [v${v_file}]" "CHANGELOG.md documents current version"
+
+    assert_eq "1"  "$(_semver_compare "2.0.1" "2.0.0")" "_semver_compare 2.0.1 > 2.0.0"
+    assert_eq "0"  "$(_semver_compare "2.0.0" "2.0.0")" "_semver_compare 2.0.0 == 2.0.0"
+    assert_eq "-1" "$(_semver_compare "1.9.9" "2.0.0")" "_semver_compare 1.9.9 < 2.0.0"
+
+    assert_ok   "_deploy_validate_ref accepts v2.0.0" _deploy_validate_ref "v2.0.0"
+    assert_ok   "_deploy_validate_ref accepts v2.1.0-rc.1" _deploy_validate_ref "v2.1.0-rc.1"
+    assert_ok   "_deploy_validate_ref accepts main" _deploy_validate_ref "main"
+    assert_fail "_deploy_validate_ref rejects bad ref" _deploy_validate_ref "../main"
+    assert_fail "_deploy_validate_ref rejects short tag" _deploy_validate_ref "v2.0"
+    assert_fail "_deploy_validate_ref rejects injection" _deploy_validate_ref "v2.0.0;id"
+
+    local v_out
+    v_out=$(deploy_version_cmd)
+    assert_contains "$v_out" "3xui-deploy v${DEPLOY_VERSION}" "deploy_version_cmd reports current version"
+
+    local orig_install="$INSTALL_DIR"
+    local orig_bin="$BIN_INSTALL_PATH"
+    local upd_dir="$TEST_TMP/ver-test"
+    mkdir -p "$upd_dir/webpanel/static" "$upd_dir/bin"
+    INSTALL_DIR="$upd_dir"
+    BIN_INSTALL_PATH="$upd_dir/bin/3xui-deploy"
+    printf '__version__ = "%s"\n' "$DEPLOY_VERSION" > "$upd_dir/webpanel/__init__.py"
+    printf '# mock\n' > "$upd_dir/webpanel/server.py"
+
+    _deploy_latest_release_ref() { printf 'v9.9.9|9.9.9|release'; }
+    local chk_out
+    chk_out=$(_deploy_version_info --check)
+    assert_contains "$chk_out" "DEPLOY_UPDATE_AVAILABLE=true" "version check detects newer release"
+    assert_contains "$chk_out" "DEPLOY_LATEST_VERSION=9.9.9" "version check prints latest version"
+    assert_contains "$chk_out" "DEPLOY_CHANNEL=release" "version check reports release channel"
+
+    _deploy_latest_release_ref() { printf 'v%s|%s|release' "$DEPLOY_VERSION" "$DEPLOY_VERSION"; }
+    local skip_out
+    skip_out=$(self_update)
+    assert_contains "$skip_out" "Already up to date" "self_update skips matching version without --force"
+
+    assert_fail "self_update rejects invalid ref" self_update "not-a-tag" >/dev/null 2>&1
+    assert_fail "self_update rejects unknown option" self_update "--bogus" >/dev/null 2>&1
+
+    # Mock newer release download + SHA-256 verification + WebPanel sync
+    local mock_remote="$TEST_TMP/mock-remote"
+    mkdir -p "$mock_remote/webpanel/static"
+    cat > "$mock_remote/manage.sh" <<'EOF'
+#!/usr/bin/env bash
+# 3X-UI Manager
+DEPLOY_VERSION="2.9.0"
+exit 0
+EOF
+    printf '__version__ = "2.9.0"\n' > "$mock_remote/webpanel/__init__.py"
+    printf 'AUTH=1\n' > "$mock_remote/webpanel/auth.py"
+    printf 'PROBE=1\n' > "$mock_remote/webpanel/probe.py"
+    printf 'OPS=1\n' > "$mock_remote/webpanel/ops.py"
+    printf 'SERVER=1\n' > "$mock_remote/webpanel/server.py"
+    printf '<!doctype html>\n' > "$mock_remote/webpanel/static/index.html"
+    printf 'body{}\n' > "$mock_remote/webpanel/static/app.css"
+    printf 'console.log(1);\n' > "$mock_remote/webpanel/static/app.js"
+    (cd "$mock_remote" && if command -v sha256sum >/dev/null 2>&1; then sha256sum manage.sh webpanel/__init__.py webpanel/auth.py webpanel/probe.py webpanel/ops.py webpanel/server.py webpanel/static/index.html webpanel/static/app.css webpanel/static/app.js; else shasum -a 256 manage.sh webpanel/__init__.py webpanel/auth.py webpanel/probe.py webpanel/ops.py webpanel/server.py webpanel/static/index.html webpanel/static/app.css webpanel/static/app.js; fi) > "$mock_remote/SHA256SUMS.txt"
+
+    # Negative checksum check
+    printf 'tampered\n' > "$mock_remote/tampered.sh"
+    assert_fail "_verify_checksum_if_present rejects tampered manage.sh" _verify_checksum_if_present "$mock_remote/SHA256SUMS.txt" "manage.sh" "$mock_remote/tampered.sh" >/dev/null 2>&1
+
+    _deploy_latest_release_ref() { printf 'v2.9.0|2.9.0|release'; }
+    _download_release_checksums() { cp "$mock_remote/SHA256SUMS.txt" "$2"; }
+    _deploy_http_get() {
+        local url="$1" dst="${2:-}"
+        local rel="${url#*v2.9.0/}"
+        if [[ -n "$dst" ]]; then
+            cp "$mock_remote/$rel" "$dst"
+        else
+            cat "$mock_remote/$rel"
+        fi
+    }
+    run_q() {
+        case "$1" in
+            *"test -f "*) bash -c "$1" &>/dev/null ;;
+            *"systemctl is-active --quiet 3xui-deploy-web"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    local upd_out
+    upd_out=$(WEBPANEL_NO_SELF_RESTART=1 self_update)
+    assert_contains "$upd_out" "UPDATED_FROM=${DEPLOY_VERSION}" "self_update reports previous version"
+    assert_contains "$upd_out" "UPDATED_TO=2.9.0" "self_update reports updated script version"
+    assert_contains "$upd_out" "UPDATED_REF=v2.9.0" "self_update reports applied ref"
+    assert_contains "$upd_out" "WEBPANEL_RESTART_REQUIRED=true" "self_update signals deferred WebPanel restart"
+    assert_eq "2.9.0" "$(_deploy_extract_script_version "$BIN_INSTALL_PATH")" "self_update installed new CLI binary"
+    assert_contains "$(< "$upd_dir/webpanel/__init__.py")" "2.9.0" "self_update synced WebPanel version"
+    assert_ok "self_update synced webpanel/manage.sh" test -x "$upd_dir/webpanel/manage.sh"
+
+    INSTALL_DIR="$orig_install"
+    BIN_INSTALL_PATH="$orig_bin"
+}
+
 test_validators
 test_panel_parsing_and_urls
 test_caddy_and_decoy
@@ -792,6 +898,7 @@ test_ssh_config_hardening
 test_subscription_verification
 test_security_audit
 test_extended_cli_and_guards
+test_versioning_and_self_update
 
 printf 'Tests complete: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 (( FAIL_COUNT == 0 ))

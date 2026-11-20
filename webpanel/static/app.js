@@ -38,6 +38,7 @@
     csrfToken: "",
     domain: "",
     basePath: "/deploy/",
+    version: "",
     currentView: "overview",
     activeTabs: {
       network: "proxy",
@@ -416,6 +417,18 @@
     }
     if (typeof onComplete === "function") {
       onComplete(job);
+    }
+    if (job.status === "succeeded" && job.meta && job.meta.restart_required) {
+      showToast(
+        "3xui-deploy updated to v" +
+          (job.meta.updated_to || "latest") +
+          " — reloading WebPanel...",
+        "ok",
+      );
+      window.setTimeout(() => {
+        window.location.reload();
+      }, 3000);
+      return;
     }
     loadActiveView();
   }
@@ -1341,6 +1354,14 @@
       : "Not Deployed";
     dp.className = "pill " + (ov.deployed ? "pill-ok" : "pill-warn");
 
+    const verInfo = ov.version || {};
+    const deployVer = verInfo.deploy || state.version || "--";
+    const vp = el("deploy-ver-pill");
+    vp.textContent = "v" + deployVer;
+    vp.className =
+      "pill mono-num " +
+      (verInfo.in_sync === false ? "pill-warn" : "pill-neutral");
+
     const p = data.parsed || {};
     renderKvList(el("compat-summary"), [
       ["Detected Version", p.detected_version || "unknown"],
@@ -1499,7 +1520,10 @@
       api("api/auth/sessions"),
     ]);
     el("wp-idle-input").value = ov.webpanel.idle_minutes || "30";
+    const vInfo = ov.version || {};
     renderKvList(el("settings-summary"), [
+      ["3xui-deploy Version", "v" + (vInfo.deploy || state.version || "--")],
+      ["WebPanel Version", "v" + (vInfo.webpanel || state.version || "--")],
       ["Exclusive Path", ov.webpanel.path],
       ["Allowed Domain", ov.proxy.domain || state.domain],
       ["Loopback Bind", "127.0.0.1:" + ov.webpanel.port],
@@ -2205,14 +2229,69 @@
       runOperation("api/deploy", { db_type: dbType, pg_user: pgUser });
     });
 
-    el("self-update-btn").addEventListener("click", async () => {
+    el("check-self-update-btn").addEventListener("click", async () => {
+      const btn = el("check-self-update-btn");
+      const box = el("self-update-status");
+      setBusy(btn, true, "Checking...");
+      try {
+        const res = await api("api/version?check=1");
+        const cur = res.current_version || state.version || "--";
+        const latest = res.latest_version || "unknown";
+        const ref = res.latest_ref || "main";
+        const chan = res.channel || "main";
+        if (res.update_available === true) {
+          box.textContent =
+            "Update available: v" +
+            cur +
+            " -> v" +
+            latest +
+            " (" +
+            chan +
+            ": " +
+            ref +
+            ")";
+          box.className = "alert alert-info";
+        } else if (res.update_available === false) {
+          box.textContent =
+            "Up to date on v" + cur + " (" + chan + ": " + ref + ")";
+          box.className = "alert alert-ok";
+        } else {
+          box.textContent =
+            "Current v" + cur + " · Remote version unavailable.";
+          box.className = "alert alert-info";
+        }
+        box.classList.remove("hidden");
+      } catch (err) {
+        box.textContent = err.message;
+        box.className = "alert alert-error";
+        box.classList.remove("hidden");
+      } finally {
+        setBusy(btn, false);
+      }
+    });
+
+    el("self-update-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const target = el("self-update-target").value.trim();
+      const force = el("self-update-force").checked;
       const ok = await askConfirm({
-        title: "Update 3xui-deploy Manager Script",
-        message: "Download and verify the latest manage.sh from GitHub main?",
-        confirmLabel: "Update Script",
+        title: "Update 3xui-deploy",
+        message:
+          "Download, checksum-verify, and apply " +
+          (target || "the latest GitHub release") +
+          "?",
+        bullets: [
+          "Updates manage.sh, global CLI, and all installed WebPanel files.",
+          "If the WebPanel service restarts, the page will reload automatically.",
+        ],
+        confirmLabel: "Update 3xui-deploy",
       });
       if (!ok) return;
-      runOperation("api/self-update", {}, { button: el("self-update-btn") });
+      runOperation(
+        "api/self-update",
+        { target, force },
+        { button: el("self-update-btn") },
+      );
     });
 
     el("compat-refresh-btn").addEventListener("click", loadCompatAndDeploy);
@@ -2415,6 +2494,11 @@
       const status = await api("api/auth/status");
       state.domain = status.domain || window.location.hostname;
       state.basePath = status.base_path || "/deploy/";
+      state.version = status.version || "";
+      if (state.version) {
+        el("login-version").textContent = "v" + state.version;
+        el("sidebar-version").textContent = "v" + state.version;
+      }
       if (state.domain) {
         const pill = el("login-domain-pill");
         pill.textContent =

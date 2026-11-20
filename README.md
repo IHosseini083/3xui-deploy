@@ -1,6 +1,7 @@
 # 3X-UI Deploy & VPS Manager
 
 [![CI](https://github.com/IHosseini083/3xui-deploy/actions/workflows/ci.yml/badge.svg)](https://github.com/IHosseini083/3xui-deploy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/IHosseini083/3xui-deploy)](https://github.com/IHosseini083/3xui-deploy/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A zero-dependency Bash TUI & CLI manager for deploying, hardening, monitoring, and maintaining the [mhsanaei/3x-ui](https://github.com/mhsanaei/3x-ui) Xray panel via Docker Compose — **locally on a VPS or remotely from your workstation over multiplexed SSH**.
@@ -95,6 +96,7 @@ manage.sh [OPTIONS] [COMMAND] [ARGS]
 | `-y, --yes` | Auto-confirm confirmation prompts |
 | `-v, --verbose` | Enable debug logging output |
 | `--force-compat` | Override unsupported 3X-UI version or preflight checks |
+| `-V, --version` | Print installed `3xui-deploy` version |
 | `-h, --help` | Show CLI help |
 
 ### Commands
@@ -120,8 +122,19 @@ manage.sh [OPTIONS] [COMMAND] [ARGS]
 | `webpanel [enable\|disable\|status\|reset-password\|logs]` | Manage standalone Web Management Panel (`/deploy/`) |
 | `inbounds [list\|verify\|sync-proxy\|sync-fw]` | List Xray inbounds, verify TCP/UDP sockets, sync Caddy routes & firewall rules |
 | `audit` | Run the built-in security & configuration audit |
+| `version [--check]` | Show installed version or check for new GitHub releases |
 | `self-install` | Install `manage.sh` globally to `/usr/local/bin/3xui-deploy` |
-| `self-update` | Update `manage.sh` / `/usr/local/bin/3xui-deploy` from GitHub `main` |
+| `self-update [tag\|main\|--check\|--force]` | Update `manage.sh`, `/usr/local/bin/3xui-deploy`, and installed WebPanel from latest GitHub release (fallback `main`) |
+
+---
+
+## Versioning & Releases
+
+`3xui-deploy` follows [Semantic Versioning](https://semver.org/) tracked consistently across `VERSION`, `manage.sh` (`DEPLOY_VERSION`), `webpanel/__init__.py` (`__version__`), and `CHANGELOG.md`.
+
+- Check for updates cleanly from CLI or WebPanel: `./manage.sh version --check` or `./manage.sh self-update --check`.
+- Upgrade to the latest GitHub Release (with automatic `SHA256SUMS.txt` verification and WebPanel file synchronization): `./manage.sh self-update` (or pin a specific release/branch via `./manage.sh self-update v2.0.0` or `./manage.sh self-update main`).
+- Maintainer release flow: update `VERSION`, `DEPLOY_VERSION` in `manage.sh`, `__version__` in `webpanel/__init__.py`, and `CHANGELOG.md`, then push tag `vX.Y.Z` (`git tag vX.Y.Z && git push origin vX.Y.Z`) to trigger [release.yml](.github/workflows/release.yml).
 
 ---
 

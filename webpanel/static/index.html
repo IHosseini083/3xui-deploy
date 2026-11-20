@@ -168,7 +168,8 @@
           </button>
         </form>
         <p class="login-footnote">
-          Strict domain-isolated HTTPS management endpoint.
+          <span>Strict domain-isolated HTTPS management endpoint.</span>
+          <span id="login-version" class="mono-num"></span>
         </p>
       </section>
     </main>
@@ -277,6 +278,12 @@
           <div class="sidebar-user">
             <span class="muted">Operator</span>
             <strong id="sidebar-username">admin</strong>
+          </div>
+          <div class="sidebar-version-row">
+            <span class="muted">Version</span>
+            <span id="sidebar-version" class="pill pill-neutral mono-num"
+              >v--</span
+            >
           </div>
           <button
             id="logout-btn"
@@ -1543,15 +1550,50 @@
                   </button>
                 </form>
                 <hr class="sep" />
-                <div class="panel-header-tight">
-                  <h4 class="subheading">Manager CLI Maintenance</h4>
-                  <button
-                    id="self-update-btn"
-                    type="button"
-                    class="btn btn-ghost btn-sm"
-                  >
-                    Update 3xui-deploy Script
-                  </button>
+                <div class="stack-sm">
+                  <div class="panel-header-tight">
+                    <h4 class="subheading">
+                      3xui-deploy Version &amp; Self-Update
+                    </h4>
+                    <div class="btn-row">
+                      <span
+                        id="deploy-ver-pill"
+                        class="pill pill-neutral mono-num"
+                        >v--</span
+                      >
+                      <button
+                        id="check-self-update-btn"
+                        type="button"
+                        class="btn btn-ghost btn-sm"
+                      >
+                        Check for Updates
+                      </button>
+                    </div>
+                  </div>
+                  <div
+                    id="self-update-status"
+                    class="alert alert-info hidden"
+                  ></div>
+                  <form id="self-update-form" class="stack-sm">
+                    <div class="inline-form">
+                      <input
+                        id="self-update-target"
+                        type="text"
+                        placeholder="latest release (or v2.x.y / main)"
+                      />
+                      <button
+                        id="self-update-btn"
+                        type="submit"
+                        class="btn btn-primary btn-sm"
+                      >
+                        Update 3xui-deploy
+                      </button>
+                    </div>
+                    <label class="checkbox-row">
+                      <input id="self-update-force" type="checkbox" />
+                      <span>Force reinstall same version</span>
+                    </label>
+                  </form>
                 </div>
               </article>
 

@@ -190,6 +190,8 @@ class ProbeTests(unittest.TestCase):
 
 class ServerIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._prev_testing = os.environ.get("XUI_TESTING")
+        os.environ["XUI_TESTING"] = "1"
         self.tmpdir = tempfile.TemporaryDirectory()
         self.install_dir = os.path.join(self.tmpdir.name, "opt-3x-ui")
         self.backup_dir = os.path.join(self.tmpdir.name, "backups")
@@ -228,6 +230,10 @@ class ServerIntegrationTests(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
         self.tmpdir.cleanup()
+        if self._prev_testing is None:
+            os.environ.pop("XUI_TESTING", None)
+        else:
+            os.environ["XUI_TESTING"] = self._prev_testing
 
     def _request(
         self,
@@ -547,6 +553,87 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertIsNone(re.search(r"\.style\.", js_txt))
         self.assertIsNone(re.search(r'(?:src|href)\s*=\s*["\']https?://', html_txt, re.IGNORECASE))
         self.assertIsNone(re.search(r'https?://', css_txt, re.IGNORECASE))
+
+    def test_version_endpoint_and_self_update(self) -> None:
+        st, _, status_txt = self._request("GET", "/api/auth/status", headers={"Host": "panel.example.com"})
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(status_txt).get("version"), "2.0.0")
+
+        cookie_kv, csrf = self._login_session()
+        auth_hdrs = {
+            "Host": "panel.example.com",
+            "Cookie": cookie_kv,
+            "X-CSRF-Token": csrf,
+            "Origin": "https://panel.example.com",
+        }
+
+        st, _, ov_txt = self._request("GET", "/api/overview", headers={"Host": "panel.example.com", "Cookie": cookie_kv})
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(ov_txt)["version"]["webpanel"], "2.0.0")
+
+        st, _, ver_txt = self._request("GET", "/api/version", headers={"Host": "panel.example.com", "Cookie": cookie_kv})
+        self.assertEqual(st, 200)
+        self.assertEqual(json.loads(ver_txt)["current_version"], "2.0.0")
+
+        check_out = "\n".join(
+            [
+                "DEPLOY_CURRENT_VERSION=2.0.0",
+                "DEPLOY_WEBPANEL_VERSION=2.0.0",
+                "DEPLOY_LATEST_VERSION=2.1.0",
+                "DEPLOY_LATEST_REF=v2.1.0",
+                "DEPLOY_CHANNEL=release",
+                "DEPLOY_UPDATE_AVAILABLE=true",
+                "DEPLOY_RELEASE_URL=https://github.com/IHosseini083/3xui-deploy/releases/tag/v2.1.0",
+            ]
+        )
+        with mock.patch.object(self.deploy_ops, "_run_manage", return_value=(0, check_out)):
+            st, _, chk_txt = self._request("GET", "/api/version?check=1", headers={"Host": "panel.example.com", "Cookie": cookie_kv})
+            self.assertEqual(st, 200)
+            chk_data = json.loads(chk_txt)
+            self.assertTrue(chk_data["update_available"])
+            self.assertEqual(chk_data["latest_version"], "2.1.0")
+            self.assertEqual(chk_data["channel"], "release")
+
+        # Reject invalid target version ref
+        st, _, _ = self._request("POST", "/api/self-update", headers=auth_hdrs, body={"target": "../bad"})
+        self.assertEqual(st, 400)
+
+        # Async self-update streams metadata and triggers deferred restart callback cleanly
+        with (
+            mock.patch.object(
+                self.deploy_ops,
+                "_run_manage_streaming",
+                return_value=(
+                    0,
+                    "UPDATED_FROM=2.0.0\nUPDATED_TO=2.1.0\nUPDATED_REF=v2.1.0\nWEBPANEL_RESTART_REQUIRED=true\n[OK] Updated",
+                ),
+            ) as stream_mock,
+            mock.patch.object(self.deploy_ops, "_schedule_webpanel_restart") as restart_mock,
+        ):
+            st, _, upd_txt = self._request(
+                "POST",
+                "/api/self-update",
+                headers=auth_hdrs,
+                body={"target": "v2.1.0", "force": True, "async": True},
+            )
+            self.assertEqual(st, 202)
+            job_id = json.loads(upd_txt)["job"]["id"]
+
+            deadline = time.monotonic() + 3.0
+            final_job = None
+            while time.monotonic() < deadline:
+                cur = self.deploy_ops.get_job(job_id)
+                if cur and cur["status"] in ("succeeded", "failed"):
+                    final_job = cur
+                    break
+                time.sleep(0.05)
+
+            self.assertIsNotNone(final_job)
+            self.assertEqual(final_job["status"], "succeeded")
+            self.assertEqual(final_job["meta"].get("updated_to"), "2.1.0")
+            self.assertTrue(final_job["meta"].get("restart_required"))
+            self.assertEqual(stream_mock.call_args.args[0], ["self-update", "--force", "v2.1.0"])
+            restart_mock.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v2.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Determine & verify release version
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          TAG="${INPUT_TAG#refs/tags/}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Invalid release tag '$TAG'"
+            exit 1
+          fi
+          EXPECTED_VER="${TAG#v}"
+          FILE_VER=$(tr -d '[:space:]' < VERSION)
+          SCRIPT_VER=$(sed -n 's/^DEPLOY_VERSION="\([^"]*\)".*/\1/p' manage.sh | head -n 1)
+          WP_VER=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' webpanel/__init__.py | head -n 1)
+          if [[ "$FILE_VER" != "$EXPECTED_VER" || "$SCRIPT_VER" != "$EXPECTED_VER" || "$WP_VER" != "$EXPECTED_VER" ]]; then
+            echo "ERROR: Version mismatch for tag $TAG (VERSION=$FILE_VER, manage.sh=$SCRIPT_VER, webpanel=$WP_VER)"
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Verify LF endings & run full validation suite
+        run: |
+          if grep -q $'\r' VERSION CHANGELOG.md manage.sh tests/*.sh tests/*.py webpanel/*.py webpanel/static/* .github/workflows/*.yml; then
+            echo "ERROR: CRLF detected"
+            exit 1
+          fi
+          bash -n manage.sh tests/test_manage.sh tests/test_compat.sh
+          bash tests/test_manage.sh
+          bash tests/test_compat.sh
+          python3 -m py_compile webpanel/__init__.py webpanel/auth.py webpanel/probe.py webpanel/ops.py webpanel/server.py tests/test_webpanel.py
+          python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Generate SHA256SUMS.txt & release notes
+        run: |
+          sha256sum \
+            manage.sh \
+            VERSION \
+            webpanel/__init__.py \
+            webpanel/auth.py \
+            webpanel/probe.py \
+            webpanel/ops.py \
+            webpanel/server.py \
+            webpanel/static/index.html \
+            webpanel/static/app.css \
+            webpanel/static/app.js > SHA256SUMS.txt
+          awk -v hdr="## [${RELEASE_TAG}]" '
+            index($0, hdr) == 1 { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > release_notes.md
+          if [[ ! -s release_notes.md ]]; then
+            printf 'Release %s\n' "$RELEASE_TAG" > release_notes.md
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x manage.sh
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" manage.sh SHA256SUMS.txt --clobber
+            gh release edit "$RELEASE_TAG" --notes-file release_notes.md
+          else
+            gh release create "$RELEASE_TAG" manage.sh SHA256SUMS.txt \
+              --title "3xui-deploy ${RELEASE_TAG}" \
+              --notes-file release_notes.md
+          fi
