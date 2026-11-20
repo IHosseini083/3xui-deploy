@@ -599,41 +599,40 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(st, 400)
 
         # Async self-update streams metadata and triggers deferred restart callback cleanly
-        with (
-            mock.patch.object(
-                self.deploy_ops,
-                "_run_manage_streaming",
-                return_value=(
-                    0,
-                    "UPDATED_FROM=2.0.0\nUPDATED_TO=2.1.0\nUPDATED_REF=v2.1.0\nWEBPANEL_RESTART_REQUIRED=true\n[OK] Updated",
-                ),
-            ) as stream_mock,
-            mock.patch.object(self.deploy_ops, "_schedule_webpanel_restart") as restart_mock,
-        ):
-            st, _, upd_txt = self._request(
-                "POST",
-                "/api/self-update",
-                headers=auth_hdrs,
-                body={"target": "v2.1.0", "force": True, "async": True},
-            )
-            self.assertEqual(st, 202)
-            job_id = json.loads(upd_txt)["job"]["id"]
+        with mock.patch.object(
+            self.deploy_ops,
+            "_run_manage_streaming",
+            return_value=(
+                0,
+                "UPDATED_FROM=2.0.0\nUPDATED_TO=2.1.0\nUPDATED_REF=v2.1.0\nWEBPANEL_RESTART_REQUIRED=true\n[OK] Updated",
+            ),
+        ) as stream_mock:
+            with mock.patch.object(self.deploy_ops, "_schedule_webpanel_restart") as restart_mock:
+                st, _, upd_txt = self._request(
+                    "POST",
+                    "/api/self-update",
+                    headers=auth_hdrs,
+                    body={"target": "v2.1.0", "force": True, "async": True},
+                )
+                self.assertEqual(st, 202)
+                job_id = json.loads(upd_txt)["job"]["id"]
 
-            deadline = time.monotonic() + 3.0
-            final_job = None
-            while time.monotonic() < deadline:
-                cur = self.deploy_ops.get_job(job_id)
-                if cur and cur["status"] in ("succeeded", "failed"):
-                    final_job = cur
-                    break
-                time.sleep(0.05)
+                deadline = time.monotonic() + 3.0
+                final_job = None
+                while time.monotonic() < deadline:
+                    cur = self.deploy_ops.get_job(job_id)
+                    if cur and cur["status"] in ("succeeded", "failed"):
+                        if cur["status"] == "failed" or restart_mock.called:
+                            final_job = cur
+                            break
+                    time.sleep(0.05)
 
-            self.assertIsNotNone(final_job)
-            self.assertEqual(final_job["status"], "succeeded")
-            self.assertEqual(final_job["meta"].get("updated_to"), "2.1.0")
-            self.assertTrue(final_job["meta"].get("restart_required"))
-            self.assertEqual(stream_mock.call_args.args[0], ["self-update", "--force", "v2.1.0"])
-            restart_mock.assert_called_once()
+                self.assertIsNotNone(final_job)
+                self.assertEqual(final_job["status"], "succeeded")
+                self.assertEqual(final_job["meta"].get("updated_to"), "2.1.0")
+                self.assertTrue(final_job["meta"].get("restart_required"))
+                self.assertEqual(stream_mock.call_args.args[0], ["self-update", "--force", "v2.1.0"])
+                restart_mock.assert_called_once()
 
 
 if __name__ == "__main__":

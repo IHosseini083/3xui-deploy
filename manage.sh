@@ -9634,7 +9634,7 @@ _download_script_to() {
     _deploy_http_get "$url" "$dst" || return 1
     [[ -s "$dst" ]] || return 1
     head -n 1 "$dst" | grep -q '^#!/usr/bin/env bash' || return 1
-    grep -q '# 3X-UI Manager' "$dst" || return 1
+    head -n 5 "$dst" | grep -q '^# 3X-UI Manager$' || return 1
     _verify_checksum_if_present "$sums_file" "manage.sh" "$dst" || return 1
     bash -n "$dst" 2>/dev/null
 }
@@ -9756,7 +9756,7 @@ self_install() {
     tmp_script=$(mktemp /tmp/3xui-install.XXXXXX.sh) || { error "Failed to create temp file"; return 1; }
     chmod 600 "$tmp_script" 2>/dev/null || true
 
-    if [[ -f "${0:-}" && "$0" != /dev/fd/* && "$0" != /proc/* && "$0" != "bash" && "$0" != "-bash" ]] && grep -q '3X-UI Manager' "$0" 2>/dev/null; then
+    if [[ "${XUI_SOURCE_ONLY:-0}" != "1" && -f "${0:-}" && "$0" != /dev/fd/* && "$0" != /proc/* && "$0" != "bash" && "$0" != "-bash" ]] && head -n 5 "$0" 2>/dev/null | grep -q '^# 3X-UI Manager$'; then
         cp "$0" "$tmp_script" || { rm -f "$tmp_script"; error "Failed to copy script"; return 1; }
         bash -n "$tmp_script" 2>/dev/null || { rm -f "$tmp_script"; error "Script syntax check failed"; return 1; }
     else
@@ -9886,7 +9886,7 @@ self_update() {
     new_ver="${new_ver:-${target_ver:-unknown}}"
 
     local updated=false
-    if [[ -f "${0:-}" && "$0" != /dev/fd/* && "$0" != /proc/* && "$0" != "bash" && "$0" != "-bash" ]] && grep -q '# 3X-UI Manager' "$0" 2>/dev/null; then
+    if [[ "${XUI_SOURCE_ONLY:-0}" != "1" && -f "${0:-}" && "$0" != /dev/fd/* && "$0" != /proc/* && "$0" != "bash" && "$0" != "-bash" ]] && head -n 5 "$0" 2>/dev/null | grep -q '^# 3X-UI Manager$'; then
         if [[ -w "$0" ]]; then
             install -m 0755 "$tmp_script" "$0" && updated=true
         elif [[ $EUID -ne 0 ]] && command -v sudo &>/dev/null; then
