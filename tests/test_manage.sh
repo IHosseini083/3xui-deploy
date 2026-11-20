@@ -721,6 +721,67 @@ CONF
     INSTALL_DIR="$XUI_INSTALL_DIR"
 }
 
+# ─── 10. Cert Revocation, Caddy Fallback & Firewall Lockout Guards ──────────
+test_extended_cli_and_guards() {
+    REMOTE=false
+    AUTO_YES=true
+    INTERACTIVE=false
+    local ext_dir="$TEST_TMP/ext-install"
+    mkdir -p "$ext_dir/cert/rev.example.com" "$ext_dir/caddy"
+    INSTALL_DIR="$ext_dir"
+    : > "$ext_dir/cert/rev.example.com/fullchain.pem"
+    : > "$ext_dir/cert/rev.example.com/privkey.pem"
+
+    cat > "$ext_dir/caddy/proxy.conf" <<'CONF'
+PROXY_ENABLED="true"
+PROXY_DOMAIN="rev.example.com"
+PROXY_PORT="443"
+PROXY_EMAIL="ops@example.com"
+SUB_MODE="none"
+CONF
+    cat > "$ext_dir/caddy/Caddyfile" <<'CADDY'
+rev.example.com {
+    tls /root/cert/rev.example.com/fullchain.pem /root/cert/rev.example.com/privkey.pem
+}
+CADDY
+
+    local INBOUNDS_OVERRIDE=""
+    is_deployed() { return 0; }
+    _is_postgres_backend() { return 1; }
+    is_running() { return 1; }
+    is_pg_running() { return 1; }
+    is_caddy_running() { return 1; }
+    get_panel_info() { PANEL_PORT="2053"; PANEL_PATH="/sec/"; load_proxy_conf; return 1; }
+    run_q() {
+        case "$1" in
+            "command -v certbot") return 1 ;;
+            *) bash -c "$1" &>/dev/null ;;
+        esac
+    }
+    run_out() { bash -c "$1" 2>/dev/null; }
+    run() { bash -c "$1"; }
+
+    assert_fail "cert_revoke rejects invalid reason" cert_revoke "rev.example.com" "bogus" >/dev/null 2>&1
+    assert_fail "cert_revoke rejects traversal domain" cert_revoke "../etc" "unspecified" >/dev/null 2>&1
+    assert_ok   "cert_revoke deletes local cert dir & updates Caddy" cert_revoke "rev.example.com" "superseded" >/dev/null
+    assert_fail "cert_revoke removed local cert dir" test -d "$ext_dir/cert/rev.example.com"
+    assert_not_contains "$(< "$ext_dir/caddy/Caddyfile")" "tls /root/cert/rev.example.com/" "Caddyfile reverted away from deleted cert"
+
+    # Firewall lockout protection refuses closing SSH port 22 or active proxy port 443
+    _fw_detect_backend() { printf 'ufw'; }
+    SSH_PORT="22"
+    assert_fail "firewall_cli_dispatch refuses closing SSH port 22" firewall_cli_dispatch close 22 tcp >/dev/null 2>&1
+    assert_fail "firewall_cli_dispatch refuses closing active proxy port 443" firewall_cli_dispatch close 443 tcp >/dev/null 2>&1
+
+    # panel_settings_show prints structured KEY=VALUE lines
+    local kv_out
+    kv_out=$(panel_settings_show)
+    assert_contains "$kv_out" "PROXY_DOMAIN=rev.example.com" "panel_settings_show prints PROXY_DOMAIN"
+    assert_contains "$kv_out" "PANEL_PATH=/sec/" "panel_settings_show prints PANEL_PATH"
+
+    INSTALL_DIR="$XUI_INSTALL_DIR"
+}
+
 test_validators
 test_panel_parsing_and_urls
 test_caddy_and_decoy
@@ -730,6 +791,7 @@ test_stdin_credentials
 test_ssh_config_hardening
 test_subscription_verification
 test_security_audit
+test_extended_cli_and_guards
 
 printf 'Tests complete: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 (( FAIL_COUNT == 0 ))

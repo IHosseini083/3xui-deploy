@@ -5,8 +5,10 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -343,6 +345,208 @@ class ServerIntegrationTests(unittest.TestCase):
             self.assertTrue(passed_env.get("HOME"))
             self.assertIn("/usr/local/sbin", passed_env.get("PATH", ""))
             self.assertEqual(passed_env.get("NO_COLOR"), "1")
+
+    def _login_session(self) -> tuple[str, str]:
+        st, hdrs, txt = self._request(
+            "POST",
+            "/api/auth/login",
+            headers={
+                "Host": "panel.example.com",
+                "Origin": "https://panel.example.com",
+                "X-Forwarded-Proto": "https",
+            },
+            body={"username": "admin", "password": "PanelSecretPass!2026"},
+        )
+        self.assertEqual(st, 200)
+        csrf = json.loads(txt)["csrf_token"]
+        cookie_kv = hdrs.get("Set-Cookie", "").split(";", 1)[0]
+        return cookie_kv, csrf
+
+    def test_jobs_sse_stream_and_history_redaction(self) -> None:
+        cookie_kv, csrf = self._login_session()
+
+        def _fake_stream(args, on_line=None, timeout=240, stdin_text=None):
+            if on_line:
+                on_line("[INFO] [update:pull] Pulling image")
+                on_line("[OK] PG Pass : SuperSecretPG99!")
+            return 0, "[OK] Done"
+
+        with mock.patch.object(self.deploy_ops, "_run_manage_streaming", side_effect=_fake_stream):
+            st, _, txt = self._request(
+                "POST",
+                "/api/lifecycle",
+                headers={
+                    "Host": "panel.example.com",
+                    "Cookie": cookie_kv,
+                    "X-CSRF-Token": csrf,
+                    "Origin": "https://panel.example.com",
+                },
+                body={"action": "restart", "async": True},
+            )
+            self.assertEqual(st, 202)
+            job = json.loads(txt)["job"]
+            job_id = job["id"]
+
+            # Wait briefly for daemon job thread to finish
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                cur = self.deploy_ops.get_job(job_id)
+                if cur and cur["status"] in ("succeeded", "failed"):
+                    break
+                time.sleep(0.05)
+
+        st, _, list_txt = self._request(
+            "GET",
+            "/api/jobs",
+            headers={"Host": "panel.example.com", "Cookie": cookie_kv},
+        )
+        self.assertEqual(st, 200)
+        jobs = json.loads(list_txt)["jobs"]
+        self.assertTrue(any(j["id"] == job_id and j["status"] == "succeeded" for j in jobs))
+
+        # Incremental poll & SSE stream both expose redacted lines
+        st, _, job_txt = self._request(
+            "GET",
+            f"/api/jobs/{job_id}?since=0",
+            headers={"Host": "panel.example.com", "Cookie": cookie_kv},
+        )
+        self.assertEqual(st, 200)
+        job_data = json.loads(job_txt)
+        joined = "\n".join(job_data["lines"])
+        self.assertNotIn("SuperSecretPG99!", joined)
+        self.assertIn("[REDACTED]", joined)
+
+        st, sse_hdrs, sse_body = self._request(
+            "GET",
+            f"/api/jobs/{job_id}/stream",
+            headers={"Host": "panel.example.com", "Cookie": cookie_kv},
+        )
+        self.assertEqual(st, 200)
+        self.assertIn("text/event-stream", sse_hdrs.get("Content-Type", ""))
+        self.assertIn("event: done", sse_body)
+
+        with open(self.deploy_ops.ops_history_path, "r", encoding="utf-8") as fh:
+            hist_raw = fh.read()
+        self.assertNotIn("SuperSecretPG99!", hist_raw)
+
+    def test_certs_network_credentials_and_backup_safety(self) -> None:
+        cookie_kv, csrf = self._login_session()
+        auth_hdrs = {
+            "Host": "panel.example.com",
+            "Cookie": cookie_kv,
+            "X-CSRF-Token": csrf,
+            "Origin": "https://panel.example.com",
+        }
+
+        # Certificate discovery
+        cert_dir = os.path.join(self.install_dir, "cert", "panel.example.com")
+        os.makedirs(cert_dir, exist_ok=True)
+        with open(os.path.join(cert_dir, "fullchain.pem"), "w", encoding="utf-8") as fh:
+            fh.write("DUMMY CERT\n")
+        with open(os.path.join(cert_dir, "privkey.pem"), "w", encoding="utf-8") as fh:
+            fh.write("DUMMY KEY\n")
+
+        st, _, certs_txt = self._request("GET", "/api/certs", headers={"Host": "panel.example.com", "Cookie": cookie_kv})
+        self.assertEqual(st, 200)
+        certs_data = json.loads(certs_txt)
+        self.assertEqual(len(certs_data["certs"]), 1)
+        self.assertEqual(certs_data["certs"][0]["domain"], "panel.example.com")
+
+        # Reject invalid cert domain / revocation reason
+        st, _, _ = self._request("POST", "/api/certs/issue", headers=auth_hdrs, body={"domain": "bad;domain"})
+        self.assertEqual(st, 400)
+        st, _, _ = self._request(
+            "POST",
+            "/api/certs/revoke",
+            headers=auth_hdrs,
+            body={"domain": "panel.example.com", "reason": "badreason"},
+        )
+        self.assertEqual(st, 400)
+
+        # Valid cert revoke dispatches cleanly to manage.sh
+        with mock.patch.object(self.deploy_ops, "_run_manage", return_value=(0, "[OK] Revoked")) as run_mock:
+            st, _, _ = self._request(
+                "POST",
+                "/api/certs/revoke",
+                headers=auth_hdrs,
+                body={"domain": "panel.example.com", "reason": "superseded"},
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(run_mock.call_args.args[0], ["certs", "revoke", "panel.example.com", "superseded"])
+
+        # Panel credentials update transmits password via stdin only and never logs it
+        with mock.patch.object(self.deploy_ops, "_run_manage", return_value=(0, "[OK] Updated")) as run_mock:
+            st, _, _ = self._request(
+                "POST",
+                "/api/network/panel/credentials",
+                headers=auth_hdrs,
+                body={"username": "opsadmin", "password": "VeryStrongPanelPass!2026"},
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(run_mock.call_args.args[0], ["settings", "reset-credentials"])
+            self.assertEqual(run_mock.call_args.kwargs["stdin_text"], "opsadmin\nVeryStrongPanelPass!2026\n")
+
+        audit_file = os.path.join(self.install_dir, "logs", "webpanel-audit.log")
+        with open(audit_file, "r", encoding="utf-8") as fh:
+            self.assertNotIn("VeryStrongPanelPass!2026", fh.read())
+
+        # Backup restore path traversal rejection
+        os.makedirs(self.backup_dir, exist_ok=True)
+        st, _, _ = self._request(
+            "POST",
+            "/api/backups/restore",
+            headers=auth_hdrs,
+            body={"name": "../../etc/passwd.tar.gz"},
+        )
+        self.assertEqual(st, 400)
+
+        # WebPanel idle timeout update syncs AuthStore dynamically
+        with mock.patch.object(self.deploy_ops, "_run_manage", return_value=(0, "[OK] updated")):
+            st, _, _ = self._request(
+                "PUT",
+                "/api/webpanel/settings",
+                headers=auth_hdrs,
+                body={"idle_minutes": 45},
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(self.auth_store.idle_seconds, 2700)
+
+    def test_static_assets_etag_gzip_and_csp_hygiene(self) -> None:
+        st, hdrs, _ = self._request(
+            "GET",
+            "/assets/app.css",
+            headers={"Host": "panel.example.com", "Accept-Encoding": "gzip"},
+        )
+        self.assertEqual(st, 200)
+        self.assertEqual(hdrs.get("Content-Encoding"), "gzip")
+        self.assertEqual(hdrs.get("Vary"), "Accept-Encoding")
+        etag = hdrs.get("ETag", "")
+        self.assertTrue(etag)
+        st_304, _, _ = self._request(
+            "GET",
+            "/assets/app.css",
+            headers={"Host": "panel.example.com", "If-None-Match": etag},
+        )
+        self.assertEqual(st_304, 304)
+
+        static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webpanel", "static")
+        with open(os.path.join(static_dir, "index.html"), "r", encoding="utf-8") as fh:
+            html_txt = fh.read()
+        with open(os.path.join(static_dir, "app.css"), "r", encoding="utf-8") as fh:
+            css_txt = fh.read()
+        with open(os.path.join(static_dir, "app.js"), "r", encoding="utf-8") as fh:
+            js_txt = fh.read()
+
+        # Strict CSP & XSS invariants
+        self.assertIsNone(re.search(r"<script(?![^>]*\bsrc=)", html_txt, re.IGNORECASE))
+        self.assertIsNone(re.search(r"\bon[a-z]+\s*=", html_txt, re.IGNORECASE))
+        self.assertIsNone(re.search(r"\bstyle\s*=", html_txt, re.IGNORECASE))
+        self.assertNotIn("innerHTML", js_txt)
+        self.assertNotIn("outerHTML", js_txt)
+        self.assertNotIn("insertAdjacentHTML", js_txt)
+        self.assertIsNone(re.search(r"\.style\.", js_txt))
+        self.assertIsNone(re.search(r'(?:src|href)\s*=\s*["\']https?://', html_txt, re.IGNORECASE))
+        self.assertIsNone(re.search(r'https?://', css_txt, re.IGNORECASE))
 
 
 if __name__ == "__main__":

@@ -37,6 +37,9 @@ REDACT_PATTERNS = (
     (re.compile(r"(-password=)[^\s'\"]+"), r"\1[REDACTED]"),
     (re.compile(r"(SSH_PASS(?:_B64)?=)[^\s'\"]+"), r"\1[REDACTED]"),
     (re.compile(r"(Bearer\s+)[A-Za-z0-9._-]+", re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"(PG Pass\s*:\s*)\S+"), r"\1[REDACTED]"),
+    (re.compile(r"(Generated password\s*:\s*)\S+"), r"\1[REDACTED]"),
+    (re.compile(r"(WebPanel Auth\s*:\s*\S+\s*/\s*)\S+"), r"\1[REDACTED]"),
 )
 
 
@@ -385,6 +388,13 @@ class AuthStore:
                 )
             out.sort(key=lambda item: (not item["current"], item["last_seen"]), reverse=False)
             return out
+
+    def set_idle_minutes(self, idle_minutes: int) -> int:
+        """Update idle session timeout dynamically without dropping active sessions."""
+        clamped = max(5, min(1440, int(idle_minutes)))
+        with self._lock:
+            self.idle_seconds = clamped * 60
+        return clamped
 
     def revoke_other_sessions(self, current_token: str, username: str, client_ip: str = "") -> int:
         """Revoke all sessions belonging to username except current_token."""

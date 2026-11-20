@@ -2,12 +2,21 @@
 <html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>3xui-deploy · Management Panel</title>
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="dark light" />
+    <title>3xui-deploy · Control Plane</title>
     <link rel="stylesheet" href="assets/app.css" />
   </head>
   <body>
-    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+    <div
+      id="toast-container"
+      class="toast-container"
+      aria-live="polite"
+      aria-atomic="true"
+    ></div>
 
     <!-- Confirmation Modal -->
     <div
@@ -18,8 +27,22 @@
       aria-labelledby="confirm-title"
     >
       <div class="modal-card">
-        <h3 id="confirm-title">Confirm Action</h3>
+        <div class="modal-header">
+          <span id="confirm-tone-badge" class="pill pill-warn">Confirm</span>
+          <h3 id="confirm-title">Confirm Action</h3>
+        </div>
         <p id="confirm-message" class="muted"></p>
+        <ul id="confirm-bullets" class="modal-bullets hidden"></ul>
+        <div id="confirm-phrase-wrap" class="field hidden">
+          <span id="confirm-phrase-label">Type phrase to confirm</span>
+          <input
+            id="confirm-phrase-input"
+            type="text"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+        </div>
         <div class="modal-actions">
           <button id="confirm-cancel" type="button" class="btn btn-ghost">
             Cancel
@@ -31,18 +54,75 @@
       </div>
     </div>
 
+    <!-- Live Operation Drawer -->
+    <aside
+      id="task-drawer"
+      class="task-drawer hidden"
+      aria-label="Live Operation Console"
+    >
+      <div class="task-drawer-header">
+        <div class="task-drawer-title-group">
+          <span id="task-status-pill" class="pill pill-neutral">Idle</span>
+          <h3 id="task-title">Operation Progress</h3>
+        </div>
+        <div class="btn-row">
+          <button id="task-copy-btn" type="button" class="btn btn-ghost btn-sm">
+            Copy
+          </button>
+          <button
+            id="task-close-btn"
+            type="button"
+            class="icon-btn"
+            aria-label="Close operation console"
+          >
+            &times;
+          </button>
+        </div>
+      </div>
+      <div class="task-progress-meta">
+        <span id="task-stage" class="muted">Waiting...</span>
+        <span id="task-pct" class="mono-num">0%</span>
+      </div>
+      <progress
+        id="task-progress-bar"
+        class="meter meter-accent"
+        max="100"
+        value="0"
+      ></progress>
+      <div id="task-summary" class="alert alert-info hidden"></div>
+      <pre id="task-output" class="code-box code-drawer"></pre>
+      <div class="task-drawer-footer">
+        <span id="task-meta" class="muted"></span>
+        <button id="task-hide-btn" type="button" class="btn btn-ghost btn-sm">
+          Minimize
+        </button>
+      </div>
+    </aside>
+
     <!-- Login View -->
     <main id="login-view" class="login-shell">
       <section class="login-card">
-        <div class="brand-mark">
-          <span class="brand-dot"></span>
-          <span>3xui-deploy</span>
+        <div class="login-brand">
+          <div class="brand-mark">
+            <span class="brand-dot"></span>
+            <span>3xui-deploy</span>
+          </div>
+          <button
+            id="login-theme-toggle"
+            type="button"
+            class="btn btn-ghost btn-sm"
+            aria-label="Toggle color theme"
+          >
+            Theme
+          </button>
         </div>
-        <h1>Deployment Console</h1>
-        <p class="muted">
-          Sign in to manage 3x-ui compatibility, decoy camouflage, probe
-          redirection, and lifecycle operations.
-        </p>
+        <div>
+          <h1>Control Plane Sign In</h1>
+          <p class="muted">
+            Manage 3x-ui deployment, SSL certificates, domains, network tuning,
+            and stealth routing from one mobile-ready console.
+          </p>
+        </div>
         <div id="login-domain-pill" class="pill pill-neutral hidden"></div>
         <div
           id="login-error"
@@ -62,13 +142,22 @@
           </label>
           <label class="field">
             <span>Password</span>
-            <input
-              id="login-password"
-              name="password"
-              type="password"
-              autocomplete="current-password"
-              required
-            />
+            <div class="input-group">
+              <input
+                id="login-password"
+                name="password"
+                type="password"
+                autocomplete="current-password"
+                required
+              />
+              <button
+                type="button"
+                class="btn btn-ghost btn-sm pw-toggle-btn"
+                data-toggle-pw="login-password"
+              >
+                Show
+              </button>
+            </div>
           </label>
           <button
             id="login-submit"
@@ -79,7 +168,7 @@
           </button>
         </form>
         <p class="login-footnote">
-          Access restricted to the configured HTTPS panel domain.
+          Strict domain-isolated HTTPS management endpoint.
         </p>
       </section>
     </main>
@@ -96,36 +185,97 @@
             id="sidebar-close"
             type="button"
             class="icon-btn mobile-only"
-            aria-label="Close menu"
+            aria-label="Close navigation menu"
           >
             &times;
           </button>
         </div>
 
-        <nav class="nav-list">
-          <button type="button" class="nav-item active" data-view="overview">
-            Overview
-          </button>
-          <button type="button" class="nav-item" data-view="compat">
-            Compatibility &amp; Updates
-          </button>
-          <button type="button" class="nav-item" data-view="probe">
-            Decoy &amp; Probe Redirect
-          </button>
-          <button type="button" class="nav-item" data-view="proxy">
-            Proxy, Inbounds &amp; Audit
-          </button>
-          <button type="button" class="nav-item" data-view="backups">
-            Backups &amp; Logs
-          </button>
-          <button type="button" class="nav-item" data-view="settings">
-            Settings &amp; Sessions
-          </button>
+        <nav class="nav-groups">
+          <div class="nav-group">
+            <span class="nav-group-label">Monitor</span>
+            <button type="button" class="nav-item active" data-view="overview">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"
+                />
+              </svg>
+              <span>Dashboard</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <span class="nav-group-label">Networking &amp; Security</span>
+            <button type="button" class="nav-item" data-view="certs">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"
+                />
+              </svg>
+              <span>SSL Certificates</span>
+            </button>
+            <button type="button" class="nav-item" data-view="network">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.91 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2s.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2s.07-1.35.16-2h4.68c.09.65.16 1.32.16 2s-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.65-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2s-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z"
+                />
+              </svg>
+              <span>Domains &amp; Network</span>
+            </button>
+            <button type="button" class="nav-item" data-view="probe">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"
+                />
+              </svg>
+              <span>Decoy &amp; Stealth</span>
+            </button>
+            <button type="button" class="nav-item" data-view="inbounds">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"
+                />
+              </svg>
+              <span>Inbounds &amp; Audit</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <span class="nav-group-label">Operations</span>
+            <button type="button" class="nav-item" data-view="deploy">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"
+                />
+              </svg>
+              <span>Deploy &amp; Updates</span>
+            </button>
+            <button type="button" class="nav-item" data-view="operations">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"
+                />
+              </svg>
+              <span>Backups, Logs &amp; History</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <span class="nav-group-label">Access</span>
+            <button type="button" class="nav-item" data-view="settings">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
+                />
+              </svg>
+              <span>Settings &amp; Access</span>
+            </button>
+          </div>
         </nav>
 
         <div class="sidebar-footer">
           <div class="sidebar-user">
-            <span class="muted">Signed in as</span>
+            <span class="muted">Operator</span>
             <strong id="sidebar-username">admin</strong>
           </div>
           <button
@@ -151,10 +301,24 @@
             >
               &#9776;
             </button>
-            <h2 id="view-title">Overview</h2>
+            <div class="topbar-title-wrap">
+              <h2 id="view-title">Dashboard</h2>
+              <span id="view-subtitle" class="topbar-subtitle muted"
+                >System health, containers &amp; live metrics</span
+              >
+            </div>
           </div>
           <div class="topbar-right">
-            <span id="topbar-domain" class="pill pill-neutral"></span>
+            <button
+              id="activity-pill"
+              type="button"
+              class="pill pill-neutral activity-btn"
+              title="Open Live Operation Console"
+            >
+              <span id="activity-dot" class="activity-dot"></span>
+              <span id="activity-label">Console</span>
+            </button>
+            <span id="topbar-domain" class="pill pill-neutral hide-xs"></span>
             <button
               id="theme-toggle"
               type="button"
@@ -173,144 +337,784 @@
         </header>
 
         <div class="content-area">
-          <!-- View 1: Overview -->
+          <!-- View 1: Dashboard -->
           <section id="view-overview" class="view-section">
+            <article class="panel hero-panel">
+              <div class="hero-main">
+                <div class="hero-badges">
+                  <span id="hero-health-pill" class="pill pill-neutral"
+                    >Loading...</span
+                  >
+                  <span id="hero-version-pill" class="pill pill-neutral"
+                    >--</span
+                  >
+                  <span id="hero-db-pill" class="pill pill-neutral">--</span>
+                </div>
+                <p id="hero-host-meta" class="muted">
+                  Inspecting deployment environment...
+                </p>
+              </div>
+              <div class="btn-row">
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  data-lifecycle="start"
+                >
+                  Start
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  data-lifecycle="restart"
+                >
+                  Restart
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-danger-outline"
+                  data-lifecycle="stop"
+                >
+                  Stop
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  data-lifecycle="reload_caddy"
+                >
+                  Reload Caddy
+                </button>
+                <button
+                  id="hero-backup-btn"
+                  type="button"
+                  class="btn btn-sm btn-primary"
+                >
+                  Backup Now
+                </button>
+              </div>
+            </article>
+
             <div class="grid-cards" id="overview-kpis"></div>
 
             <div class="grid-two">
-              <article class="panel">
+              <article class="panel stack-md">
                 <div class="panel-header">
-                  <h3>Stack Containers</h3>
-                  <div class="btn-row">
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-ghost"
-                      data-lifecycle="start"
-                    >
-                      Start
-                    </button>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-ghost"
-                      data-lifecycle="restart"
-                    >
-                      Restart
-                    </button>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-danger-outline"
-                      data-lifecycle="stop"
-                    >
-                      Stop
-                    </button>
-                  </div>
+                  <h3>Service Containers</h3>
+                  <span id="overview-container-count" class="pill pill-neutral"
+                    >0</span
+                  >
                 </div>
                 <div id="overview-containers" class="stack-sm"></div>
               </article>
 
-              <article class="panel">
+              <article class="panel stack-md">
                 <div class="panel-header">
-                  <h3>Exposed Endpoints &amp; Certificates</h3>
+                  <h3>Exposed Endpoints &amp; Security</h3>
                   <button
                     type="button"
                     class="btn btn-sm btn-ghost"
-                    data-lifecycle="reload_caddy"
+                    data-nav-jump="network"
                   >
-                    Reload Caddy
+                    Configure
                   </button>
                 </div>
                 <div id="overview-endpoints" class="kv-list"></div>
                 <hr class="sep" />
-                <h4 class="subheading">TLS Certificates</h4>
+                <div class="panel-header-tight">
+                  <h4 class="subheading">TLS Certificates</h4>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-nav-jump="certs"
+                  >
+                    Manage Certs
+                  </button>
+                </div>
                 <div id="overview-certs" class="stack-sm"></div>
               </article>
             </div>
 
-            <article class="panel">
+            <article class="panel stack-md">
               <div class="panel-header">
-                <h3>Last Operation Output</h3>
+                <h3>Recent Operations</h3>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost"
+                  data-nav-jump="operations"
+                >
+                  Full History
+                </button>
               </div>
-              <pre id="overview-op-output" class="code-box muted">
-No operations executed in this session yet.</pre
-              >
+              <div id="overview-recent-ops" class="stack-sm"></div>
             </article>
           </section>
 
-          <!-- View 2: Compatibility & Updates -->
-          <section id="view-compat" class="view-section hidden">
+          <!-- View 2: SSL Certificates -->
+          <section id="view-certs" class="view-section hidden">
+            <article class="panel hero-panel">
+              <div class="hero-badges" id="certs-status-pills"></div>
+              <div class="btn-row">
+                <button
+                  id="certs-renew-all-btn"
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                >
+                  Renew All Let's Encrypt
+                </button>
+                <button
+                  id="certs-force-renew-btn"
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                >
+                  Force Renew All
+                </button>
+              </div>
+            </article>
+
+            <article class="panel stack-md">
+              <div class="panel-header">
+                <h3>Installed &amp; Caddy-Managed Certificates</h3>
+                <span id="certs-count-pill" class="pill pill-neutral">0</span>
+              </div>
+              <div id="certs-list" class="stack-sm"></div>
+            </article>
+
             <div class="grid-two">
-              <article class="panel">
+              <article class="panel stack-md">
                 <div class="panel-header">
-                  <h3>3x-ui Version &amp; Capability Contract</h3>
-                  <button
-                    id="compat-refresh-btn"
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                  >
-                    Re-check
-                  </button>
+                  <h3>Issue Let's Encrypt Certificate</h3>
+                  <span class="pill pill-info">HTTP-01 Standalone</span>
                 </div>
-                <div id="compat-summary" class="kv-list"></div>
-                <pre id="compat-output" class="code-box"></pre>
+                <p class="muted">
+                  Temporarily pauses the Docker stack so Certbot binds port 80,
+                  issues a signed certificate, installs auto-renewal hooks, and
+                  restarts services automatically.
+                </p>
+                <form id="cert-issue-form" class="stack-sm">
+                  <label class="field">
+                    <span>Domain Name</span>
+                    <input
+                      id="cert-issue-domain"
+                      type="text"
+                      placeholder="panel.example.com"
+                      required
+                    />
+                  </label>
+                  <label class="field">
+                    <span>ACME Notification Email (optional)</span>
+                    <input
+                      id="cert-issue-email"
+                      type="email"
+                      placeholder="ops@example.com"
+                    />
+                  </label>
+                  <label class="field">
+                    <span>Post-Issuance Target</span>
+                    <select id="cert-issue-apply">
+                      <option value="caddy">
+                        Apply to Caddy Reverse Proxy (Recommended if matching)
+                      </option>
+                      <option value="none">
+                        Store in cert/ directory only (Caddy keeps ACME)
+                      </option>
+                      <option value="panel">
+                        Apply directly to 3X-UI (only when Caddy disabled)
+                      </option>
+                    </select>
+                  </label>
+                  <button type="submit" class="btn btn-primary">
+                    Issue Certificate
+                  </button>
+                </form>
               </article>
 
               <article class="panel stack-md">
                 <div class="panel-header">
-                  <h3>Pre-flight Test &amp; Safe Upgrade</h3>
+                  <h3>Generate Self-Signed Certificate</h3>
+                  <span class="pill pill-neutral">ECDSA P-256</span>
                 </div>
-                <form id="compat-test-form" class="inline-form">
-                  <input
-                    id="compat-test-tag"
-                    type="text"
-                    placeholder="e.g. v3.2.0 or v2.6.0"
-                    required
-                  />
-                  <button type="submit" class="btn btn-ghost">
-                    Pre-flight Check
-                  </button>
-                </form>
-                <hr class="sep" />
-                <form id="update-form" class="stack-sm">
+                <p class="muted">
+                  Useful for Cloudflare Full SSL, internal relays, or IP-based
+                  HTTPS access without public ACME validation.
+                </p>
+                <form id="cert-self-signed-form" class="stack-sm">
                   <label class="field">
-                    <span
-                      >Target Release Tag (leave blank for latest release)</span
-                    >
+                    <span>Domain or IP Address</span>
                     <input
-                      id="update-tag-input"
+                      id="cert-ss-host"
                       type="text"
-                      placeholder="latest release tag (recommended)"
+                      placeholder="panel.example.com or 203.0.113.10"
+                      required
                     />
                   </label>
-                  <label class="checkbox-row">
-                    <input id="update-force-compat" type="checkbox" />
-                    <span
-                      >Override unsupported version block
-                      (<code>--force-compat</code>)</span
-                    >
-                  </label>
-                  <div class="btn-row">
-                    <button type="submit" class="btn btn-primary">
-                      Pull, Verify &amp; Update
-                    </button>
-                    <button
-                      id="rollback-btn"
-                      type="button"
-                      class="btn btn-danger-outline"
-                    >
-                      Rollback Previous
-                    </button>
+                  <div class="grid-two-tight">
+                    <label class="field">
+                      <span>Validity (Days)</span>
+                      <input
+                        id="cert-ss-days"
+                        type="number"
+                        min="1"
+                        max="3650"
+                        value="3650"
+                        required
+                      />
+                    </label>
+                    <label class="field">
+                      <span>Apply Target</span>
+                      <select id="cert-ss-apply">
+                        <option value="none">Store in cert/ only</option>
+                        <option value="caddy">Apply to Caddy</option>
+                        <option value="panel">Apply to 3X-UI Direct</option>
+                      </select>
+                    </label>
                   </div>
+                  <button type="submit" class="btn btn-ghost">
+                    Generate Self-Signed Cert
+                  </button>
                 </form>
-                <pre id="update-output" class="code-box muted">
-Ready for pre-flight check or update.</pre
-                >
               </article>
             </div>
           </section>
 
-          <!-- View 3: Decoy & Probe Redirection -->
+          <!-- View 3: Domains & Network -->
+          <section id="view-network" class="view-section hidden">
+            <div class="tab-strip" role="tablist" data-tab-group="network">
+              <button
+                type="button"
+                class="tab-btn active"
+                data-tab-target="proxy"
+                role="tab"
+              >
+                Reverse Proxy &amp; Domains
+              </button>
+              <button
+                type="button"
+                class="tab-btn"
+                data-tab-target="panel"
+                role="tab"
+              >
+                Panel, Listen IP &amp; Subs
+              </button>
+              <button
+                type="button"
+                class="tab-btn"
+                data-tab-target="net"
+                role="tab"
+              >
+                DNS, BBR &amp; Firewall
+              </button>
+            </div>
+
+            <!-- Sub-tab: Proxy & Domains -->
+            <div class="tab-panel" data-tab-panel="network:proxy">
+              <div class="grid-two">
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>Caddy Reverse Proxy &amp; Domain Routing</h3>
+                    <span id="net-proxy-badge" class="pill pill-neutral"
+                      >--</span
+                    >
+                  </div>
+                  <form id="proxy-config-form" class="stack-sm">
+                    <label class="field">
+                      <span>Panel Primary Domain</span>
+                      <div class="inline-form">
+                        <input
+                          id="px-domain"
+                          type="text"
+                          placeholder="panel.example.com"
+                          required
+                        />
+                        <button
+                          id="px-dns-btn"
+                          type="button"
+                          class="btn btn-ghost"
+                        >
+                          Check DNS
+                        </button>
+                      </div>
+                    </label>
+                    <div
+                      id="px-dns-result"
+                      class="alert alert-info hidden"
+                    ></div>
+
+                    <div class="grid-two-tight">
+                      <label class="field">
+                        <span>HTTPS Listen Port</span>
+                        <input
+                          id="px-port"
+                          type="number"
+                          min="1"
+                          max="65535"
+                          value="443"
+                          required
+                        />
+                      </label>
+                      <label class="field">
+                        <span>ACME Contact Email</span>
+                        <input
+                          id="px-email"
+                          type="email"
+                          placeholder="ops@example.com"
+                        />
+                      </label>
+                    </div>
+
+                    <label class="field">
+                      <span>Subscription Proxy Mode</span>
+                      <select id="px-sub-mode">
+                        <option value="dedicated">
+                          Dedicated Subscription Domain (Recommended)
+                        </option>
+                        <option value="same">Same Domain as Panel</option>
+                        <option value="none">
+                          Disabled (Proxy Panel Only)
+                        </option>
+                      </select>
+                    </label>
+
+                    <div id="px-sub-fields" class="stack-sm">
+                      <div class="grid-two-tight">
+                        <label class="field" id="px-sub-domain-wrap">
+                          <span>Subscription Domain</span>
+                          <input
+                            id="px-sub-domain"
+                            type="text"
+                            placeholder="sub.example.com"
+                          />
+                        </label>
+                        <label class="field">
+                          <span>Internal Sub Port</span>
+                          <input
+                            id="px-sub-port"
+                            type="number"
+                            min="1"
+                            max="65535"
+                            value="2096"
+                          />
+                        </label>
+                      </div>
+                      <div class="grid-two-tight">
+                        <label class="field">
+                          <span>Subscription Path</span>
+                          <input id="px-sub-path" type="text" value="/sub/" />
+                        </label>
+                        <label class="field">
+                          <span>JSON Subscription Path</span>
+                          <input
+                            id="px-sub-json-path"
+                            type="text"
+                            value="/json/"
+                          />
+                        </label>
+                      </div>
+                    </div>
+
+                    <div class="rule-toggles">
+                      <span class="field-label">TLS Certificate Source</span>
+                      <label class="checkbox-row">
+                        <input id="px-use-panel-cert" type="checkbox" />
+                        <span
+                          >Use existing cert from
+                          <code>cert/&lt;panel_domain&gt;/</code> instead of
+                          Caddy ACME</span
+                        >
+                      </label>
+                      <label class="checkbox-row">
+                        <input id="px-use-sub-cert" type="checkbox" />
+                        <span
+                          >Use existing cert from
+                          <code>cert/&lt;sub_domain&gt;/</code> instead of Caddy
+                          ACME</span
+                        >
+                      </label>
+                    </div>
+
+                    <div class="btn-row">
+                      <button type="submit" class="btn btn-primary">
+                        Save Domain &amp; Sync Caddy
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-ghost"
+                        data-lifecycle="verify_proxy"
+                      >
+                        Verify Proxy
+                      </button>
+                      <button
+                        id="px-disable-btn"
+                        type="button"
+                        class="btn btn-danger-outline"
+                      >
+                        Disable Proxy
+                      </button>
+                    </div>
+                  </form>
+                </article>
+
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>Active Network Topology</h3>
+                  </div>
+                  <div id="net-topology-kv" class="kv-list"></div>
+                </article>
+              </div>
+            </div>
+
+            <!-- Sub-tab: Panel Settings, Listen IP & Subscriptions -->
+            <div class="tab-panel hidden" data-tab-panel="network:panel">
+              <div class="grid-two">
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>3X-UI Listening IP, Port &amp; Security</h3>
+                  </div>
+                  <form id="panel-settings-form" class="stack-sm">
+                    <div class="grid-two-tight">
+                      <label class="field">
+                        <span>Internal Panel Port</span>
+                        <input
+                          id="ps-port"
+                          type="number"
+                          min="1"
+                          max="65535"
+                          required
+                        />
+                      </label>
+                      <label class="field">
+                        <span>Session Max Age (min)</span>
+                        <input
+                          id="ps-session-age"
+                          type="number"
+                          min="5"
+                          max="10080"
+                          value="60"
+                        />
+                      </label>
+                    </div>
+
+                    <label class="field">
+                      <span>Panel Listen IP (<code>webListen</code>)</span>
+                      <input
+                        id="ps-listen-ip"
+                        type="text"
+                        placeholder="127.0.0.1 (blank/0.0.0.0 = all)"
+                      />
+                      <div class="preset-row">
+                        <span class="muted">Quick bind:</span>
+                        <button
+                          type="button"
+                          class="chip-btn"
+                          data-listen-preset="127.0.0.1"
+                        >
+                          127.0.0.1
+                        </button>
+                        <button
+                          type="button"
+                          class="chip-btn"
+                          data-listen-preset="::1"
+                        >
+                          ::1
+                        </button>
+                        <button
+                          type="button"
+                          class="chip-btn"
+                          data-listen-preset="0.0.0.0"
+                        >
+                          0.0.0.0
+                        </button>
+                      </div>
+                    </label>
+
+                    <label class="field">
+                      <span>Panel Web Base Path</span>
+                      <div class="inline-form">
+                        <input
+                          id="ps-webpath"
+                          type="text"
+                          placeholder="/panel/"
+                          required
+                        />
+                        <button
+                          id="ps-randomize-path-btn"
+                          type="button"
+                          class="btn btn-ghost"
+                        >
+                          Randomize
+                        </button>
+                      </div>
+                    </label>
+
+                    <label class="field">
+                      <span
+                        >Enforced <code>webDomain</code> (blank to clear)</span
+                      >
+                      <input
+                        id="ps-webdomain"
+                        type="text"
+                        placeholder="panel.example.com"
+                      />
+                    </label>
+
+                    <button type="submit" class="btn btn-primary">
+                      Apply Panel Settings
+                    </button>
+                  </form>
+
+                  <hr class="sep" />
+                  <h4 class="subheading">3X-UI Admin Credentials &amp; 2FA</h4>
+                  <form id="panel-creds-form" class="stack-sm">
+                    <div class="grid-two-tight">
+                      <label class="field">
+                        <span>3X-UI Username</span>
+                        <input id="pc-user" type="text" required />
+                      </label>
+                      <label class="field">
+                        <span>New Password (min 12 chars)</span>
+                        <div class="input-group">
+                          <input
+                            id="pc-pass"
+                            type="password"
+                            autocomplete="new-password"
+                            required
+                          />
+                          <button
+                            id="pc-gen-btn"
+                            type="button"
+                            class="btn btn-ghost btn-sm"
+                          >
+                            Gen
+                          </button>
+                        </div>
+                      </label>
+                    </div>
+                    <div class="btn-row">
+                      <button type="submit" class="btn btn-ghost">
+                        Reset 3X-UI Password
+                      </button>
+                      <button
+                        id="pc-reset-2fa-btn"
+                        type="button"
+                        class="btn btn-danger-outline"
+                      >
+                        Reset 2FA
+                      </button>
+                    </div>
+                  </form>
+                </article>
+
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>Subscription Server Settings</h3>
+                    <span id="sub-status-pill" class="pill pill-neutral"
+                      >--</span
+                    >
+                  </div>
+                  <form id="sub-settings-form" class="stack-sm">
+                    <label class="switch-row strong-toggle">
+                      <span>Enable 3X-UI Subscription Server</span>
+                      <span class="switch">
+                        <input
+                          id="sub-enable"
+                          type="checkbox"
+                          class="switch-input"
+                        />
+                        <span class="switch-track"></span>
+                      </span>
+                    </label>
+                    <div class="grid-two-tight">
+                      <label class="field">
+                        <span>Mode</span>
+                        <select id="sub-mode">
+                          <option value="dedicated">Dedicated Domain</option>
+                          <option value="same">Same Domain</option>
+                          <option value="direct">Direct (No Proxy)</option>
+                        </select>
+                      </label>
+                      <label class="field">
+                        <span>Subscription Port</span>
+                        <input
+                          id="sub-port"
+                          type="number"
+                          min="1"
+                          max="65535"
+                          value="2096"
+                        />
+                      </label>
+                    </div>
+                    <div class="grid-two-tight">
+                      <label class="field">
+                        <span>Subscription Domain</span>
+                        <input
+                          id="sub-domain"
+                          type="text"
+                          placeholder="sub.example.com"
+                        />
+                      </label>
+                      <label class="field">
+                        <span>Subscription Listen IP</span>
+                        <input
+                          id="sub-listen"
+                          type="text"
+                          placeholder="127.0.0.1"
+                        />
+                      </label>
+                    </div>
+                    <div class="grid-two-tight">
+                      <label class="field">
+                        <span>Subscription Path</span>
+                        <input id="sub-path" type="text" value="/sub/" />
+                      </label>
+                      <label class="field">
+                        <span>JSON Path</span>
+                        <input id="sub-json-path" type="text" value="/json/" />
+                      </label>
+                    </div>
+                    <label class="checkbox-row">
+                      <input id="sub-json-enable" type="checkbox" />
+                      <span>Enable JSON subscription endpoint</span>
+                    </label>
+                    <label class="checkbox-row">
+                      <input id="sub-encrypt" type="checkbox" />
+                      <span>Base64-encode subscription responses</span>
+                    </label>
+                    <button type="submit" class="btn btn-primary">
+                      Apply Subscription Config
+                    </button>
+                  </form>
+                </article>
+              </div>
+            </div>
+
+            <!-- Sub-tab: DNS, BBR & Firewall -->
+            <div class="tab-panel hidden" data-tab-panel="network:net">
+              <div class="grid-two">
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>DNS Verification &amp; Host Interfaces</h3>
+                  </div>
+                  <form id="dns-check-form" class="inline-form">
+                    <input
+                      id="dns-check-domain"
+                      type="text"
+                      placeholder="panel.example.com"
+                      required
+                    />
+                    <button type="submit" class="btn btn-primary">
+                      Check DNS
+                    </button>
+                  </form>
+                  <div
+                    id="dns-check-result"
+                    class="alert alert-info hidden"
+                  ></div>
+                  <h4 class="subheading">System DNS Resolvers</h4>
+                  <div id="net-resolvers-list" class="pill-wrap"></div>
+                  <h4 class="subheading">Host Network Interfaces</h4>
+                  <pre id="net-interfaces-box" class="code-box"></pre>
+                </article>
+
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>TCP BBR Tuning &amp; Host Firewall</h3>
+                    <span id="fw-backend-pill" class="pill pill-neutral"
+                      >--</span
+                    >
+                  </div>
+                  <div class="list-item">
+                    <div>
+                      <strong>Kernel Congestion Control</strong>
+                      <div id="bbr-status-meta" class="muted">--</div>
+                    </div>
+                    <button
+                      id="apply-bbr-btn"
+                      type="button"
+                      class="btn btn-ghost btn-sm"
+                    >
+                      Enable BBR + FQ
+                    </button>
+                  </div>
+                  <hr class="sep" />
+                  <div class="btn-row">
+                    <button
+                      id="fw-sync-btn"
+                      type="button"
+                      class="btn btn-primary btn-sm"
+                    >
+                      Auto-Sync Inbound Rules
+                    </button>
+                    <button
+                      id="fw-refresh-btn"
+                      type="button"
+                      class="btn btn-ghost btn-sm"
+                    >
+                      Refresh Rules
+                    </button>
+                  </div>
+                  <form id="firewall-port-form" class="inline-form">
+                    <input
+                      id="fw-port"
+                      type="number"
+                      min="1"
+                      max="65535"
+                      placeholder="Port"
+                      required
+                    />
+                    <select id="fw-proto">
+                      <option value="tcp">TCP</option>
+                      <option value="udp">UDP</option>
+                      <option value="both">TCP + UDP</option>
+                    </select>
+                    <button
+                      id="fw-open-btn"
+                      type="submit"
+                      class="btn btn-ghost btn-sm"
+                    >
+                      Open
+                    </button>
+                    <button
+                      id="fw-close-btn"
+                      type="button"
+                      class="btn btn-danger-outline btn-sm"
+                    >
+                      Close
+                    </button>
+                  </form>
+                  <pre id="firewall-output" class="code-box"></pre>
+                </article>
+              </div>
+            </div>
+          </section>
+
+          <!-- View 4: Decoy & Stealth -->
           <section id="view-probe" class="view-section hidden">
-            <div class="grid-two">
+            <div class="tab-strip" role="tablist" data-tab-group="probe">
+              <button
+                type="button"
+                class="tab-btn active"
+                data-tab-target="rules"
+                role="tab"
+              >
+                Probe Redirection Rules
+              </button>
+              <button
+                type="button"
+                class="tab-btn"
+                data-tab-target="sim"
+                role="tab"
+              >
+                Traffic Simulator
+              </button>
+              <button
+                type="button"
+                class="tab-btn"
+                data-tab-target="decoy"
+                role="tab"
+              >
+                Decoy Website Theme
+              </button>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="probe:rules">
               <article class="panel stack-md">
                 <div class="panel-header">
                   <h3>Probe &amp; Bot Redirection</h3>
@@ -324,9 +1128,16 @@ Ready for pre-flight check or update.</pre
                 ></div>
 
                 <form id="probe-form" class="stack-md">
-                  <label class="checkbox-row strong-toggle">
-                    <input id="probe-enabled" type="checkbox" />
+                  <label class="switch-row strong-toggle">
                     <span>Enable Probe &amp; Scanner Redirection</span>
+                    <span class="switch">
+                      <input
+                        id="probe-enabled"
+                        type="checkbox"
+                        class="switch-input"
+                      />
+                      <span class="switch-track"></span>
+                    </span>
                   </label>
 
                   <label class="field">
@@ -455,25 +1266,24 @@ Ready for pre-flight check or update.</pre
                     >
                   </div>
 
-                  <label class="field">
-                    <span
-                      >Custom Suspicious User-Agent Tokens
-                      (comma-separated)</span
-                    >
-                    <input
-                      id="probe-custom-ua"
-                      type="text"
-                      placeholder="masscan, custom-bot"
-                    />
-                  </label>
-                  <label class="field">
-                    <span>Custom Suspicious Paths (comma-separated)</span>
-                    <input
-                      id="probe-custom-paths"
-                      type="text"
-                      placeholder="/admin-login, /backup.zip"
-                    />
-                  </label>
+                  <div class="grid-two-tight">
+                    <label class="field">
+                      <span>Custom User-Agent Tokens (comma-separated)</span>
+                      <input
+                        id="probe-custom-ua"
+                        type="text"
+                        placeholder="masscan, custom-bot"
+                      />
+                    </label>
+                    <label class="field">
+                      <span>Custom Suspicious Paths (comma-separated)</span>
+                      <input
+                        id="probe-custom-paths"
+                        type="text"
+                        placeholder="/admin-login, /backup.zip"
+                      />
+                    </label>
+                  </div>
                   <div class="grid-two-tight">
                     <label class="field">
                       <span>Blocked Probe IPs / CIDRs</span>
@@ -514,274 +1324,509 @@ Ready for pre-flight check or update.</pre
                   </div>
                 </form>
               </article>
+            </div>
 
-              <div class="stack-md">
-                <article class="panel stack-md">
-                  <div class="panel-header">
-                    <h3>Rule &amp; Traffic Simulator</h3>
-                  </div>
-                  <p class="muted">
-                    Test how Caddy handles legitimate browsers, panel paths, and
-                    active probes without touching live traffic.
-                  </p>
-                  <form id="sim-form" class="stack-sm">
-                    <div class="grid-two-tight">
-                      <label class="field">
-                        <span>HTTP Method</span>
-                        <select id="sim-method">
-                          <option>GET</option>
-                          <option>HEAD</option>
-                          <option>POST</option>
-                          <option>TRACE</option>
-                          <option>PROPFIND</option>
-                        </select>
-                      </label>
-                      <label class="field">
-                        <span>Request Path</span>
-                        <input id="sim-path" type="text" value="/" />
-                      </label>
-                    </div>
+            <div class="tab-panel hidden" data-tab-panel="probe:sim">
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Rule &amp; Traffic Simulator</h3>
+                </div>
+                <p class="muted">
+                  Simulate how Caddy routes legitimate browsers, protected
+                  paths, and probes without modifying live configuration.
+                </p>
+                <form id="sim-form" class="stack-sm">
+                  <div class="grid-two-tight">
                     <label class="field">
-                      <span>User-Agent</span>
-                      <input
-                        id="sim-ua"
-                        type="text"
-                        value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0"
-                      />
-                    </label>
-                    <label class="field">
-                      <span>Client IP</span>
-                      <input id="sim-ip" type="text" value="198.51.100.42" />
-                    </label>
-                    <div class="btn-row">
-                      <button type="submit" class="btn btn-ghost">
-                        Simulate Request
-                      </button>
-                      <button
-                        type="button"
-                        class="chip-btn"
-                        id="sim-preset-browser"
-                      >
-                        Browser
-                      </button>
-                      <button
-                        type="button"
-                        class="chip-btn"
-                        id="sim-preset-scanner"
-                      >
-                        Scanner
-                      </button>
-                      <button
-                        type="button"
-                        class="chip-btn"
-                        id="sim-preset-env"
-                      >
-                        /.env Probe
-                      </button>
-                    </div>
-                  </form>
-                  <div id="sim-result" class="alert alert-info hidden"></div>
-                </article>
-
-                <article class="panel stack-md">
-                  <div class="panel-header">
-                    <h3>Legitimate Decoy Website</h3>
-                    <span
-                      id="decoy-custom-pill"
-                      class="pill pill-neutral"
-                    ></span>
-                  </div>
-                  <form id="decoy-form" class="stack-sm">
-                    <label class="field">
-                      <span>Template Theme</span>
-                      <select id="decoy-theme">
-                        <option value="cloud">
-                          Meridian Cloud Systems (Infrastructure / Edge)
-                        </option>
-                        <option value="studio">
-                          Northstar Digital Studio (Product &amp; Design)
-                        </option>
-                        <option value="docs">
-                          Atlas Engineering Docs (Technical Portal)
-                        </option>
+                      <span>HTTP Method</span>
+                      <select id="sim-method">
+                        <option>GET</option>
+                        <option>HEAD</option>
+                        <option>POST</option>
+                        <option>TRACE</option>
+                        <option>PROPFIND</option>
                       </select>
                     </label>
                     <label class="field">
-                      <span>Brand / Organization Name</span>
-                      <input id="decoy-name" type="text" required />
+                      <span>Request Path</span>
+                      <input id="sim-path" type="text" value="/" />
                     </label>
-                    <label class="field">
-                      <span>Tagline</span>
-                      <input id="decoy-tagline" type="text" required />
-                    </label>
-                    <label class="field">
-                      <span>Contact Email</span>
-                      <input id="decoy-email" type="email" required />
-                    </label>
-                    <label class="field">
-                      <span
-                        >Optional Custom index.html Override (leave blank to
-                        generate multi-page site)</span
-                      >
-                      <textarea
-                        id="decoy-custom-html"
-                        rows="4"
-                        placeholder="Leave blank to use built-in multi-page responsive decoy site..."
-                      ></textarea>
-                    </label>
-                    <button type="submit" class="btn btn-primary">
-                      Apply Decoy Website
-                    </button>
-                  </form>
-                </article>
-              </div>
-            </div>
-          </section>
-
-          <!-- View 4: Proxy, Inbounds & Audit -->
-          <section id="view-proxy" class="view-section hidden">
-            <div class="grid-two">
-              <article class="panel stack-md">
-                <div class="panel-header">
-                  <h3>Reverse Proxy &amp; Xray Inbounds</h3>
+                  </div>
+                  <label class="field">
+                    <span>User-Agent</span>
+                    <input
+                      id="sim-ua"
+                      type="text"
+                      value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0"
+                    />
+                  </label>
+                  <label class="field">
+                    <span>Client IP</span>
+                    <input id="sim-ip" type="text" value="198.51.100.42" />
+                  </label>
                   <div class="btn-row">
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-ghost"
-                      data-lifecycle="verify_proxy"
-                    >
-                      Verify Proxy
+                    <button type="submit" class="btn btn-primary">
+                      Simulate Request
                     </button>
                     <button
                       type="button"
-                      class="btn btn-sm btn-ghost"
-                      data-lifecycle="sync_inbounds_caddy"
+                      class="chip-btn"
+                      id="sim-preset-browser"
                     >
-                      Sync Loopback Inbounds
+                      Browser
                     </button>
                     <button
                       type="button"
-                      class="btn btn-sm btn-ghost"
-                      data-lifecycle="verify_inbounds"
+                      class="chip-btn"
+                      id="sim-preset-scanner"
                     >
-                      Verify Listeners
+                      Scanner
+                    </button>
+                    <button type="button" class="chip-btn" id="sim-preset-env">
+                      /.env Probe
                     </button>
                   </div>
-                </div>
-                <pre id="inbounds-output" class="code-box"></pre>
+                </form>
+                <div id="sim-result" class="alert alert-info hidden"></div>
               </article>
+            </div>
 
+            <div class="tab-panel hidden" data-tab-panel="probe:decoy">
               <article class="panel stack-md">
                 <div class="panel-header">
-                  <h3>Security &amp; Compliance Audit</h3>
-                  <button
-                    id="run-audit-btn"
-                    type="button"
-                    class="btn btn-primary btn-sm"
-                  >
-                    Run Audit
-                  </button>
+                  <h3>Legitimate Multi-Page Decoy Website</h3>
+                  <span id="decoy-custom-pill" class="pill pill-neutral"></span>
                 </div>
-                <div id="audit-counts" class="btn-row"></div>
-                <div id="audit-items" class="stack-sm"></div>
+                <form id="decoy-form" class="stack-sm">
+                  <label class="field">
+                    <span>Template Theme</span>
+                    <select id="decoy-theme">
+                      <option value="cloud">
+                        Meridian Cloud Systems (Infrastructure / Edge)
+                      </option>
+                      <option value="studio">
+                        Northstar Digital Studio (Product &amp; Design)
+                      </option>
+                      <option value="docs">
+                        Atlas Engineering Docs (Technical Portal)
+                      </option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Brand / Organization Name</span>
+                    <input id="decoy-name" type="text" required />
+                  </label>
+                  <label class="field">
+                    <span>Tagline</span>
+                    <input id="decoy-tagline" type="text" required />
+                  </label>
+                  <label class="field">
+                    <span>Contact Email</span>
+                    <input id="decoy-email" type="email" required />
+                  </label>
+                  <label class="field">
+                    <span
+                      >Optional Custom index.html Override (leave blank for
+                      multi-page template)</span
+                    >
+                    <textarea
+                      id="decoy-custom-html"
+                      rows="4"
+                      placeholder="Leave blank to use built-in multi-page responsive decoy site..."
+                    ></textarea>
+                  </label>
+                  <button type="submit" class="btn btn-primary">
+                    Apply Decoy Website
+                  </button>
+                </form>
               </article>
             </div>
           </section>
 
-          <!-- View 5: Backups & Logs -->
-          <section id="view-backups" class="view-section hidden">
+          <!-- View 5: Inbounds & Audit -->
+          <section id="view-inbounds" class="view-section hidden">
+            <article class="panel stack-md">
+              <div class="panel-header">
+                <h3>Xray Inbounds &amp; Protocol Listeners</h3>
+                <div class="btn-row">
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-lifecycle="verify_inbounds"
+                  >
+                    Verify Listeners
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-lifecycle="sync_inbounds_caddy"
+                  >
+                    Sync Loopback to Caddy
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    data-lifecycle="sync_firewall"
+                  >
+                    Sync Firewall
+                  </button>
+                </div>
+              </div>
+              <div id="inbounds-list" class="responsive-table"></div>
+              <details class="details-box">
+                <summary>Raw Inbounds &amp; Xray Core Report</summary>
+                <pre id="inbounds-output" class="code-box"></pre>
+                <div class="btn-row">
+                  <button
+                    id="xray-status-btn"
+                    type="button"
+                    class="btn btn-ghost btn-sm"
+                  >
+                    Inspect Xray Process &amp; Fail2ban
+                  </button>
+                </div>
+                <pre id="xray-status-output" class="code-box hidden"></pre>
+              </details>
+            </article>
+
+            <article class="panel stack-md">
+              <div class="panel-header">
+                <h3>Security &amp; Compliance Audit</h3>
+                <button
+                  id="run-audit-btn"
+                  type="button"
+                  class="btn btn-primary btn-sm"
+                >
+                  Run Audit
+                </button>
+              </div>
+              <div id="audit-counts" class="btn-row"></div>
+              <div id="audit-items" class="stack-sm"></div>
+            </article>
+          </section>
+
+          <!-- View 6: Deploy & Updates -->
+          <section id="view-deploy" class="view-section hidden">
             <div class="grid-two">
               <article class="panel stack-md">
                 <div class="panel-header">
-                  <h3>Backups &amp; GeoIP Assets</h3>
-                  <button
-                    id="create-backup-btn"
-                    type="button"
-                    class="btn btn-primary btn-sm"
+                  <h3>Deploy / Redeploy Stack</h3>
+                  <span id="deploy-state-pill" class="pill pill-neutral"
+                    >--</span
                   >
-                    Create Backup
-                  </button>
                 </div>
-                <div id="backups-list" class="stack-sm"></div>
-                <form id="prune-form" class="inline-form">
-                  <label class="muted" for="prune-keep">Retain newest:</label>
-                  <input
-                    id="prune-keep"
-                    type="number"
-                    min="1"
-                    max="100"
-                    value="7"
-                  />
-                  <button type="submit" class="btn btn-ghost btn-sm">
-                    Prune Old
+                <p class="muted">
+                  Install Docker Compose if missing, generate hardened
+                  configuration, pull 3x-ui images, and launch the stack.
+                </p>
+                <form id="deploy-form" class="stack-sm">
+                  <label class="field">
+                    <span>Database Backend</span>
+                    <select id="deploy-db-type">
+                      <option value="sqlite">SQLite (Default, Embedded)</option>
+                      <option value="postgres">
+                        PostgreSQL (Loopback scram-sha-256)
+                      </option>
+                    </select>
+                  </label>
+                  <label class="field hidden" id="deploy-pg-user-wrap">
+                    <span>PostgreSQL Username</span>
+                    <input
+                      id="deploy-pg-user"
+                      type="text"
+                      value="xui"
+                      placeholder="xui"
+                    />
+                  </label>
+                  <button type="submit" class="btn btn-primary">
+                    Deploy / Redeploy Stack
                   </button>
                 </form>
                 <hr class="sep" />
-                <div class="btn-row">
-                  <span class="muted">GeoIP/GeoSite Update:</span>
+                <div class="panel-header-tight">
+                  <h4 class="subheading">Manager CLI Maintenance</h4>
                   <button
+                    id="self-update-btn"
                     type="button"
-                    class="btn btn-sm btn-ghost"
-                    data-geo="std"
+                    class="btn btn-ghost btn-sm"
                   >
-                    Standard
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                    data-geo="ir"
-                  >
-                    Iran (+Std)
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                    data-geo="ru"
-                  >
-                    Russia (+Std)
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                    data-geo="all"
-                  >
-                    All
+                    Update 3xui-deploy Script
                   </button>
                 </div>
               </article>
 
               <article class="panel stack-md">
                 <div class="panel-header">
+                  <h3>3X-UI Compatibility &amp; Safe Upgrade</h3>
+                  <button
+                    id="compat-refresh-btn"
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                  >
+                    Re-check
+                  </button>
+                </div>
+                <div id="compat-summary" class="kv-list"></div>
+                <form id="compat-test-form" class="inline-form">
+                  <input
+                    id="compat-test-tag"
+                    type="text"
+                    placeholder="e.g. v3.2.0 or v2.6.0"
+                    required
+                  />
+                  <button type="submit" class="btn btn-ghost">
+                    Pre-flight Check
+                  </button>
+                </form>
+                <hr class="sep" />
+                <form id="update-form" class="stack-sm">
+                  <label class="field">
+                    <span>Target Release Tag (blank for latest)</span>
+                    <input
+                      id="update-tag-input"
+                      type="text"
+                      placeholder="latest release tag (recommended)"
+                    />
+                  </label>
+                  <label class="checkbox-row">
+                    <input id="update-force-compat" type="checkbox" />
+                    <span
+                      >Override unsupported version block
+                      (<code>--force-compat</code>)</span
+                    >
+                  </label>
+                  <div class="btn-row">
+                    <button type="submit" class="btn btn-primary">
+                      Pull, Verify &amp; Update
+                    </button>
+                    <button
+                      id="rollback-btn"
+                      type="button"
+                      class="btn btn-danger-outline"
+                    >
+                      Rollback Previous
+                    </button>
+                  </div>
+                </form>
+                <pre id="compat-output" class="code-box"></pre>
+              </article>
+            </div>
+          </section>
+
+          <!-- View 7: Backups, Logs & History -->
+          <section id="view-operations" class="view-section hidden">
+            <div class="tab-strip" role="tablist" data-tab-group="operations">
+              <button
+                type="button"
+                class="tab-btn active"
+                data-tab-target="backups"
+                role="tab"
+              >
+                Backups &amp; GeoIP
+              </button>
+              <button
+                type="button"
+                class="tab-btn"
+                data-tab-target="logs"
+                role="tab"
+              >
+                Logs &amp; Health
+              </button>
+              <button
+                type="button"
+                class="tab-btn"
+                data-tab-target="history"
+                role="tab"
+              >
+                Operation History
+              </button>
+            </div>
+
+            <div class="tab-panel" data-tab-panel="operations:backups">
+              <div class="grid-two">
+                <article class="panel stack-md">
+                  <div class="panel-header">
+                    <h3>Backup Archives</h3>
+                    <button
+                      id="create-backup-btn"
+                      type="button"
+                      class="btn btn-primary btn-sm"
+                    >
+                      Create Backup
+                    </button>
+                  </div>
+                  <div id="backups-list" class="stack-sm"></div>
+                  <form id="prune-form" class="inline-form">
+                    <label class="muted" for="prune-keep">Retain newest:</label>
+                    <input
+                      id="prune-keep"
+                      type="number"
+                      min="1"
+                      max="100"
+                      value="7"
+                    />
+                    <button type="submit" class="btn btn-ghost btn-sm">
+                      Prune Old
+                    </button>
+                  </form>
+                </article>
+
+                <div class="stack-md">
+                  <article class="panel stack-md">
+                    <div class="panel-header">
+                      <h3>Automated Daily Backup Cron</h3>
+                      <span id="backup-cron-pill" class="pill pill-neutral"
+                        >--</span
+                      >
+                    </div>
+                    <form id="backup-cron-form" class="stack-sm">
+                      <label class="switch-row strong-toggle">
+                        <span>Enable Daily Automated Backups</span>
+                        <span class="switch">
+                          <input
+                            id="cron-enabled"
+                            type="checkbox"
+                            class="switch-input"
+                          />
+                          <span class="switch-track"></span>
+                        </span>
+                      </label>
+                      <div class="grid-two-tight">
+                        <label class="field">
+                          <span>Run Hour (0-23 UTC)</span>
+                          <input
+                            id="cron-hour"
+                            type="number"
+                            min="0"
+                            max="23"
+                            value="3"
+                          />
+                        </label>
+                        <label class="field">
+                          <span>Retain Archives</span>
+                          <input
+                            id="cron-keep"
+                            type="number"
+                            min="1"
+                            max="365"
+                            value="7"
+                          />
+                        </label>
+                      </div>
+                      <button type="submit" class="btn btn-ghost">
+                        Save Backup Schedule
+                      </button>
+                    </form>
+                  </article>
+
+                  <article class="panel stack-md">
+                    <div class="panel-header">
+                      <h3>Xray GeoIP / GeoSite Assets</h3>
+                    </div>
+                    <p class="muted">
+                      Download verified routing datasets into the running Xray
+                      container with automatic rollback if startup fails.
+                    </p>
+                    <div class="btn-row">
+                      <button
+                        type="button"
+                        class="btn btn-sm btn-ghost"
+                        data-geo="std"
+                      >
+                        Standard
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-sm btn-ghost"
+                        data-geo="ir"
+                      >
+                        Iran (+Std)
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-sm btn-ghost"
+                        data-geo="ru"
+                      >
+                        Russia (+Std)
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-sm btn-ghost"
+                        data-geo="all"
+                      >
+                        All Datasets
+                      </button>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            </div>
+
+            <div class="tab-panel hidden" data-tab-panel="operations:logs">
+              <article class="panel stack-md">
+                <div class="panel-header">
                   <h3>Diagnostics &amp; Service Logs</h3>
-                  <div class="inline-form">
+                  <div class="btn-row">
                     <select id="log-source">
                       <option value="deploy">3xui-deploy Log</option>
                       <option value="audit">WebPanel Audit</option>
                       <option value="xui">3X-UI Container</option>
                       <option value="caddy">Caddy Container</option>
+                      <option value="postgres">PostgreSQL Container</option>
+                      <option value="backup">Backup Cron Log</option>
                     </select>
                     <select id="log-level">
                       <option value="ALL">All Levels</option>
                       <option value="INFO">INFO</option>
+                      <option value="OK">OK</option>
                       <option value="WARN">WARN</option>
                       <option value="ERROR">ERROR</option>
                       <option value="CRITICAL">CRITICAL</option>
+                      <option value="AUDIT">AUDIT</option>
                     </select>
+                    <input
+                      id="log-query"
+                      type="text"
+                      placeholder="Filter keyword..."
+                    />
                     <button
                       id="logs-refresh-btn"
                       type="button"
-                      class="btn btn-sm btn-ghost"
+                      class="btn btn-sm btn-primary"
                     >
                       Load
+                    </button>
+                    <button
+                      id="health-diag-btn"
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                    >
+                      System Health Report
                     </button>
                   </div>
                 </div>
                 <pre id="logs-output" class="code-box code-tall"></pre>
               </article>
             </div>
+
+            <div class="tab-panel hidden" data-tab-panel="operations:history">
+              <article class="panel stack-md">
+                <div class="panel-header">
+                  <h3>Operation History</h3>
+                  <button
+                    id="history-refresh-btn"
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <div id="history-list" class="stack-sm"></div>
+              </article>
+            </div>
           </section>
 
-          <!-- View 6: Settings & Sessions -->
+          <!-- View 8: Settings & Access -->
           <section id="view-settings" class="view-section hidden">
             <div class="grid-two">
               <article class="panel stack-md">
@@ -800,7 +1845,7 @@ Ready for pre-flight check or update.</pre
                   </label>
                   <label class="field">
                     <span
-                      >New Password (min 12 chars, >=2 classes or >=16
+                      >New Password (min 12 chars, &ge;2 classes or &ge;16
                       chars)</span
                     >
                     <input
@@ -823,8 +1868,24 @@ Ready for pre-flight check or update.</pre
                     Update Password &amp; Rotate Sessions
                   </button>
                 </form>
+
                 <hr class="sep" />
-                <h4 class="subheading">WebPanel Isolation Summary</h4>
+                <h4 class="subheading">Session Timeout &amp; Isolation</h4>
+                <form id="webpanel-settings-form" class="inline-form">
+                  <label class="muted" for="wp-idle-input"
+                    >Idle Timeout (min):</label
+                  >
+                  <input
+                    id="wp-idle-input"
+                    type="number"
+                    min="5"
+                    max="1440"
+                    value="30"
+                  />
+                  <button type="submit" class="btn btn-ghost btn-sm">
+                    Save Timeout
+                  </button>
+                </form>
                 <div id="settings-summary" class="kv-list"></div>
               </article>
 
@@ -844,6 +1905,56 @@ Ready for pre-flight check or update.</pre
             </div>
           </section>
         </div>
+
+        <!-- Mobile Bottom Navigation Bar (< 1024px) -->
+        <nav
+          id="mobile-bottom-nav"
+          class="mobile-bottom-nav"
+          aria-label="Mobile Quick Navigation"
+        >
+          <button
+            type="button"
+            class="bottom-nav-btn active"
+            data-view="overview"
+          >
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"
+              />
+            </svg>
+            <span>Dashboard</span>
+          </button>
+          <button type="button" class="bottom-nav-btn" data-view="certs">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z"
+              />
+            </svg>
+            <span>Certs</span>
+          </button>
+          <button type="button" class="bottom-nav-btn" data-view="network">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"
+              />
+            </svg>
+            <span>Network</span>
+          </button>
+          <button type="button" class="bottom-nav-btn" data-view="operations">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9z"
+              />
+            </svg>
+            <span>Ops</span>
+          </button>
+          <button type="button" class="bottom-nav-btn" id="mobile-more-btn">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z" />
+            </svg>
+            <span>Menu</span>
+          </button>
+        </nav>
       </div>
     </div>
 

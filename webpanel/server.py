@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -131,11 +133,44 @@ class DeployHTTPServer(ThreadingHTTPServer):
         self.config = config
         self.auth_store = auth_store
         self.deploy_ops = deploy_ops
+        self._cfg_lock = threading.Lock()
+        self._wp_conf_mtime = self._read_wp_mtime(deploy_ops.webpanel_conf_path)
         super().__init__(server_address, handler_cls)
+
+    @staticmethod
+    def _read_wp_mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    def sync_runtime_config(self) -> None:
+        """Reload allowed_domain/base_path if webpanel.conf changed on disk."""
+        wp_path = self.deploy_ops.webpanel_conf_path
+        cur_mtime = self._read_wp_mtime(wp_path)
+        if cur_mtime <= 0 or cur_mtime == self._wp_conf_mtime:
+            return
+        with self._cfg_lock:
+            cur_mtime = self._read_wp_mtime(wp_path)
+            if cur_mtime <= 0 or cur_mtime == self._wp_conf_mtime:
+                return
+            wp_conf = ops.read_kv_conf(wp_path)
+            new_dom = wp_conf.get("WEBPANEL_DOMAIN", "").strip().lower()
+            if new_dom and ops.validate_domain_name(new_dom):
+                self.config.allowed_domain = new_dom
+            new_bp = wp_conf.get("WEBPANEL_PATH", "").strip()
+            if new_bp:
+                self.config.base_path = ops.normalize_webpath(new_bp)
+            try:
+                idle = int(wp_conf.get("WEBPANEL_SESSION_IDLE", str(self.config.session_idle_minutes)))
+                self.config.session_idle_minutes = self.auth_store.set_idle_minutes(idle)
+            except ValueError:
+                pass
+            self._wp_conf_mtime = cur_mtime
 
 
 class DeployRequestHandler(BaseHTTPRequestHandler):
-    server_version = "3xui-deploy-web/1.0"
+    server_version = "3xui-deploy-web/2.0"
     sys_version = ""
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -166,6 +201,7 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
         return peer or "127.0.0.1"
 
     def _check_allowed_domain(self) -> bool:
+        self.server.sync_runtime_config()  # type: ignore[attr-defined]
         expected = self.cfg.allowed_domain.strip().lower()
         if not expected:
             return False
@@ -238,13 +274,15 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
         return "; ".join(parts)
 
     def _send_common_headers(
-        self, extra_headers: list[tuple[str, str]] | None = None
+        self,
+        extra_headers: list[tuple[str, str]] | None = None,
+        cache_control: str = "no-store",
     ) -> None:
         self.send_header("Content-Security-Policy", CSP_HEADER)
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
         if extra_headers:
             for k, v in extra_headers:
                 self.send_header(k, v)
@@ -262,6 +300,14 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
         self._send_common_headers(extra_headers)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_op_result(self, res: dict[str, Any]) -> None:
+        if res.get("accepted"):
+            self._send_json(202, res)
+        elif res.get("ok"):
+            self._send_json(200, res)
+        else:
+            self._send_json(400, res)
 
     def _send_text_error(self, status: int, message: str) -> None:
         body = message.encode("utf-8")
@@ -308,7 +354,7 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
                 return None, None
         return session, token
 
-    def _serve_static(self, rel_path: str) -> None:
+    def _serve_static(self, rel_path: str, is_asset: bool = False) -> None:
         clean = posixpath.normpath("/" + rel_path).lstrip("/")
         if not clean or clean == ".":
             clean = "index.html"
@@ -336,12 +382,72 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
 
         with open(candidate, "rb") as fh:
             data = fh.read()
+
+        etag = '"' + hashlib.sha256(data).hexdigest()[:16] + '"'
+        cache_ctrl = "private, no-cache" if is_asset else "no-store"
+        if is_asset and self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self._send_common_headers(cache_control=cache_ctrl)
+            self.end_headers()
+            return
+
+        extra: list[tuple[str, str]] = [("ETag", etag)]
+        accept_enc = self.headers.get("Accept-Encoding", "").lower()
+        if "gzip" in accept_enc and len(data) > 512:
+            data = gzip.compress(data, compresslevel=6)
+            extra.append(("Content-Encoding", "gzip"))
+            extra.append(("Vary", "Accept-Encoding"))
+
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self._send_common_headers()
+        self._send_common_headers(extra, cache_control=cache_ctrl)
         self.end_headers()
         self.wfile.write(data)
+
+    def _stream_job_sse(self, job_id: str) -> None:
+        snap = self.deploy_ops.get_job(job_id, since=0)
+        if not snap:
+            self._send_json(404, {"error": "Job not found."})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self._send_common_headers(cache_control="no-store")
+        self.close_connection = True
+        self.end_headers()
+
+        def _write_event(ev_name: str, payload: dict[str, Any]) -> None:
+            chunk = f"event: {ev_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+        try:
+            _write_event("state", snap)
+            cursor = int(snap.get("next_index", 0))
+            if snap.get("status") in ("succeeded", "failed"):
+                _write_event("done", snap)
+                return
+
+            while True:
+                upd = self.deploy_ops.wait_for_job_update(job_id, cursor, timeout=10.0)
+                if not upd:
+                    break
+                next_idx = int(upd.get("next_index", cursor))
+                if next_idx > cursor or upd.get("status") in ("succeeded", "failed"):
+                    _write_event("update", upd)
+                    cursor = next_idx
+                    if upd.get("status") in ("succeeded", "failed"):
+                        _write_event("done", upd)
+                        break
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def do_GET(self) -> None:
         if not self._check_allowed_domain():
@@ -360,10 +466,10 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
 
         route = self._normalized_route()
         if route in ("/", "/index.html"):
-            self._serve_static("index.html")
+            self._serve_static("index.html", is_asset=False)
             return
         if route.startswith("/assets/"):
-            self._serve_static(route[len("/assets/") :])
+            self._serve_static(route[len("/assets/") :], is_asset=True)
             return
 
         if route == "/api/auth/status":
@@ -406,11 +512,46 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.deploy_ops.get_overview())
             return
 
+        if route == "/api/health":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            self._send_json(200, self.deploy_ops.get_health_diagnostics())
+            return
+
+        if route == "/api/xray":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            self._send_json(200, self.deploy_ops.get_xray_status())
+            return
+
         if route == "/api/compat":
             sess, _ = self._require_auth(require_csrf=False)
             if not sess:
                 return
             self._send_json(200, self.deploy_ops.get_compatibility())
+            return
+
+        if route == "/api/certs":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            self._send_json(200, self.deploy_ops.list_certificates())
+            return
+
+        if route == "/api/network":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            self._send_json(200, self.deploy_ops.get_network_config())
+            return
+
+        if route == "/api/network/firewall":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            self._send_json(200, self.deploy_ops.get_firewall_status())
             return
 
         if route == "/api/probe":
@@ -438,7 +579,20 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
             sess, _ = self._require_auth(require_csrf=False)
             if not sess:
                 return
-            self._send_json(200, {"backups": self.deploy_ops.list_backups()})
+            self._send_json(
+                200,
+                {
+                    "backups": self.deploy_ops.list_backups(),
+                    "cron": self.deploy_ops.get_backup_cron(),
+                },
+            )
+            return
+
+        if route == "/api/backups/cron":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            self._send_json(200, self.deploy_ops.get_backup_cron())
             return
 
         if route == "/api/logs":
@@ -452,7 +606,42 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
             except ValueError:
                 lines = 150
             level = params.get("level", "ALL")
-            self._send_json(200, self.deploy_ops.get_logs(source, lines, level))
+            query = params.get("query", "")
+            self._send_json(200, self.deploy_ops.get_logs(source, lines, level, query))
+            return
+
+        if route == "/api/jobs":
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            params = self._query_params()
+            try:
+                limit = int(params.get("limit", "50"))
+            except ValueError:
+                limit = 50
+            self._send_json(200, {"jobs": self.deploy_ops.list_jobs(limit)})
+            return
+
+        if route.startswith("/api/jobs/"):
+            sess, _ = self._require_auth(require_csrf=False)
+            if not sess:
+                return
+            rest = route[len("/api/jobs/") :]
+            if rest.endswith("/stream"):
+                job_id = rest[: -len("/stream")].strip("/")
+                self._stream_job_sse(job_id)
+                return
+            job_id = rest.strip("/")
+            params = self._query_params()
+            try:
+                since = int(params.get("since", "0"))
+            except ValueError:
+                since = 0
+            job = self.deploy_ops.get_job(job_id, since=since)
+            if not job:
+                self._send_json(404, {"error": "Job not found."})
+                return
+            self._send_json(200, job)
             return
 
         self._send_json(404, {"error": "Endpoint not found."})
@@ -523,6 +712,8 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": err_b})
             return
 
+        async_mode = bool(body.get("async", False))
+
         if route == "/api/auth/change-password":
             cur_pw = str(body.get("current_password", ""))
             new_pw = str(body.get("new_password", ""))
@@ -543,15 +734,31 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
         if route == "/api/compat/test":
             tag = str(body.get("tag", "")).strip()
             self.auth_store.audit_log("compat_test", actor, client_ip, f"tag={tag}")
-            res = self.deploy_ops.run_compat_test(tag)
-            self._send_json(200 if res["ok"] else 400, res)
+            res = self.deploy_ops.run_compat_test(tag, async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
             return
 
         if route == "/api/lifecycle":
             action = str(body.get("action", "")).strip()
             self.auth_store.audit_log("lifecycle", actor, client_ip, f"action={action}")
-            res = self.deploy_ops.run_lifecycle(action)
-            self._send_json(200 if res["ok"] else 400, res)
+            res = self.deploy_ops.run_lifecycle(action, async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/deploy":
+            db_type = str(body.get("db_type", "sqlite")).strip().lower()
+            pg_user = str(body.get("pg_user", "xui")).strip()
+            self.auth_store.audit_log("deploy_stack", actor, client_ip, f"db={db_type}")
+            res = self.deploy_ops.run_deploy(
+                db_type=db_type, pg_user=pg_user, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
+            return
+
+        if route == "/api/self-update":
+            self.auth_store.audit_log("self_update", actor, client_ip, "")
+            res = self.deploy_ops.run_lifecycle("self_update", async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
             return
 
         if route == "/api/update":
@@ -564,26 +771,141 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
                 f"tag={tag or 'latest'} force={force_compat}",
             )
             res = self.deploy_ops.run_update(
-                str(tag) if tag else None, force_compat=force_compat
+                str(tag) if tag else None,
+                force_compat=force_compat,
+                async_mode=async_mode,
+                actor=actor,
             )
-            self._send_json(200 if res["ok"] else 400, res)
+            self._send_op_result(res)
             return
 
         if route == "/api/rollback":
             self.auth_store.audit_log("xui_rollback", actor, client_ip, "")
-            res = self.deploy_ops.run_rollback()
-            self._send_json(200 if res["ok"] else 400, res)
+            res = self.deploy_ops.run_rollback(async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/certs/issue":
+            domain = str(body.get("domain", "")).strip()
+            email = str(body.get("email", "")).strip()
+            apply_mode = str(body.get("apply_mode", "none")).strip()
+            self.auth_store.audit_log("cert_issue", actor, client_ip, f"domain={domain} apply={apply_mode}")
+            res = self.deploy_ops.issue_certificate(
+                domain, email=email, apply_mode=apply_mode, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
+            return
+
+        if route == "/api/certs/self-signed":
+            host = str(body.get("host", "")).strip()
+            try:
+                days = int(body.get("days", 3650))
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "Invalid days value."})
+                return
+            apply_mode = str(body.get("apply_mode", "none")).strip()
+            self.auth_store.audit_log("cert_self_signed", actor, client_ip, f"host={host} days={days}")
+            res = self.deploy_ops.generate_self_signed_cert(
+                host, days=days, apply_mode=apply_mode, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
+            return
+
+        if route == "/api/certs/renew":
+            domain = str(body.get("domain", "")).strip()
+            force = bool(body.get("force", False))
+            self.auth_store.audit_log("cert_renew", actor, client_ip, f"domain={domain or 'all'} force={force}")
+            res = self.deploy_ops.renew_certificates(
+                domain=domain, force=force, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
+            return
+
+        if route == "/api/certs/revoke":
+            domain = str(body.get("domain", "")).strip()
+            reason = str(body.get("reason", "unspecified")).strip()
+            self.auth_store.audit_log("cert_revoke", actor, client_ip, f"domain={domain} reason={reason}")
+            res = self.deploy_ops.revoke_certificate(
+                domain=domain, reason=reason, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
+            return
+
+        if route == "/api/certs/apply":
+            domain = str(body.get("domain", "")).strip()
+            target = str(body.get("target", "caddy")).strip()
+            self.auth_store.audit_log("cert_apply", actor, client_ip, f"domain={domain} target={target}")
+            res = self.deploy_ops.apply_certificate(
+                domain=domain, target=target, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
+            return
+
+        if route == "/api/network/proxy/disable":
+            self.auth_store.audit_log("proxy_disable", actor, client_ip, "")
+            res = self.deploy_ops.disable_proxy(async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/network/panel/reset-2fa":
+            self.auth_store.audit_log("panel_reset_2fa", actor, client_ip, "")
+            res = self.deploy_ops.reset_panel_2fa(async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/network/panel/credentials":
+            uname = str(body.get("username", "")).strip()
+            pw = str(body.get("password", ""))
+            self.auth_store.audit_log("panel_reset_credentials", actor, client_ip, f"username={uname}")
+            res = self.deploy_ops.reset_panel_credentials(
+                uname, pw, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
+            return
+
+        if route == "/api/network/dns-check":
+            domain = str(body.get("domain", "")).strip()
+            res = self.deploy_ops.check_domain_dns(domain)
+            self._send_json(200 if res.get("ok") else 400, res)
+            return
+
+        if route == "/api/network/bbr":
+            self.auth_store.audit_log("bbr_tuning", actor, client_ip, "")
+            res = self.deploy_ops.apply_bbr_tuning(async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/network/firewall":
+            action = str(body.get("action", "")).strip()
+            port = body.get("port")
+            proto = str(body.get("proto", "tcp")).strip()
+            self.auth_store.audit_log("firewall_action", actor, client_ip, f"action={action} port={port} proto={proto}")
+            res = self.deploy_ops.run_firewall_action(
+                action, port=port, proto=proto, async_mode=async_mode, actor=actor
+            )
+            self._send_op_result(res)
             return
 
         if route == "/api/audit":
             self.auth_store.audit_log("security_audit", actor, client_ip, "")
-            self._send_json(200, self.deploy_ops.run_security_audit())
+            res = self.deploy_ops.run_security_audit(async_mode=async_mode, actor=actor)
+            if async_mode:
+                self._send_op_result(res)
+            else:
+                self._send_json(200, res)
             return
 
         if route == "/api/backups":
             self.auth_store.audit_log("backup_create", actor, client_ip, "")
-            res = self.deploy_ops.create_backup()
-            self._send_json(200 if res["ok"] else 400, res)
+            res = self.deploy_ops.create_backup(async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/backups/restore":
+            name = str(body.get("name", "")).strip()
+            self.auth_store.audit_log("backup_restore", actor, client_ip, f"name={name}")
+            res = self.deploy_ops.restore_backup(name, async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
             return
 
         if route == "/api/backups/prune":
@@ -630,8 +952,8 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
         if route == "/api/geo-update":
             scope = str(body.get("scope", "std")).strip()
             self.auth_store.audit_log("geo_update", actor, client_ip, f"scope={scope}")
-            res = self.deploy_ops.run_geo_update(scope)
-            self._send_json(200 if res["ok"] else 400, res)
+            res = self.deploy_ops.run_geo_update(scope, async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
             return
 
         self._send_json(404, {"error": "Endpoint not found."})
@@ -652,6 +974,8 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": err_b})
             return
 
+        async_mode = bool(body.get("async", False))
+
         if route == "/api/probe":
             self.auth_store.audit_log(
                 "probe_config_update",
@@ -669,6 +993,61 @@ class DeployRequestHandler(BaseHTTPRequestHandler):
             )
             ok_d, res = self.deploy_ops.update_decoy_config(body)
             self._send_json(200 if ok_d else 400, res)
+            return
+
+        if route == "/api/network/proxy":
+            self.auth_store.audit_log(
+                "proxy_config_update",
+                actor,
+                client_ip,
+                f"domain={body.get('domain')} port={body.get('port')} sub_mode={body.get('sub_mode')}",
+            )
+            res = self.deploy_ops.update_proxy_config(body, async_mode=async_mode, actor=actor)
+            if not async_mode and res.get("ok"):
+                self.server.sync_runtime_config()  # type: ignore[attr-defined]
+            self._send_op_result(res)
+            return
+
+        if route == "/api/network/panel":
+            self.auth_store.audit_log("panel_settings_update", actor, client_ip, "")
+            res = self.deploy_ops.update_panel_settings(body, async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/network/subscription":
+            self.auth_store.audit_log(
+                "sub_settings_update", actor, client_ip, f"enable={body.get('enable')}"
+            )
+            res = self.deploy_ops.update_subscription_settings(body, async_mode=async_mode, actor=actor)
+            self._send_op_result(res)
+            return
+
+        if route == "/api/backups/cron":
+            enabled = bool(body.get("enabled", False))
+            try:
+                hour = int(body.get("hour", 3))
+                keep = int(body.get("keep", 7))
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "Invalid hour or retention count."})
+                return
+            self.auth_store.audit_log(
+                "backup_cron_update", actor, client_ip, f"enabled={enabled} hour={hour} keep={keep}"
+            )
+            res = self.deploy_ops.update_backup_cron(enabled, hour=hour, keep=keep)
+            self._send_json(200 if res.get("ok") else 400, res)
+            return
+
+        if route == "/api/webpanel/settings":
+            try:
+                idle_min = int(body.get("idle_minutes", 30))
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "Invalid idle timeout minutes."})
+                return
+            self.auth_store.audit_log("webpanel_settings_update", actor, client_ip, f"idle={idle_min}")
+            res = self.deploy_ops.update_webpanel_settings(idle_min)
+            if res.get("ok"):
+                self.cfg.session_idle_minutes = self.auth_store.set_idle_minutes(idle_min)
+            self._send_json(200 if res.get("ok") else 400, res)
             return
 
         self._send_json(404, {"error": "Endpoint not found."})

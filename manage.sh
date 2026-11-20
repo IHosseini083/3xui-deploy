@@ -210,7 +210,10 @@ _sanitize_log_text() {
         -e 's/(POSTGRES_PASSWORD=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
         -e 's/(-password=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
         -e 's/(SSH_PASS(_B64)?=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
-        -e 's/(SSHPASS=)[^[:space:]'\''"]+/\1[REDACTED]/g'
+        -e 's/(SSHPASS=)[^[:space:]'\''"]+/\1[REDACTED]/g' \
+        -e 's/(PG Pass[[:space:]]*:[[:space:]]*)[^[:space:]]+/\1[REDACTED]/g' \
+        -e 's/(Generated password[[:space:]]*:[[:space:]]*)[^[:space:]]+/\1[REDACTED]/g' \
+        -e 's/(WebPanel Auth[[:space:]]*:[[:space:]]*[^[:space:]]+[[:space:]]*\/[[:space:]]*)[^[:space:]]+/\1[REDACTED]/g'
 }
 
 _log_write() {
@@ -2722,9 +2725,15 @@ _sync_caddy_if_active() {
     $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]] || return 0
     local p_port="$1" p_path="$2"
     local use_p_cert=false use_s_cert=false
-    run_q "grep -q $(quote_sh "tls /root/cert/$PROXY_DOMAIN/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" && use_p_cert=true
+    if run_q "grep -q $(quote_sh "tls /root/cert/$PROXY_DOMAIN/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" \
+        && run_q "test -f $(quote_sh "$INSTALL_DIR/cert/$PROXY_DOMAIN/fullchain.pem") && test -f $(quote_sh "$INSTALL_DIR/cert/$PROXY_DOMAIN/privkey.pem")"; then
+        use_p_cert=true
+    fi
     if [[ "$SUB_MODE" == "dedicated" && -n "$SUB_DOMAIN" ]]; then
-        run_q "grep -q $(quote_sh "tls /root/cert/$SUB_DOMAIN/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" && use_s_cert=true
+        if run_q "grep -q $(quote_sh "tls /root/cert/$SUB_DOMAIN/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" \
+            && run_q "test -f $(quote_sh "$INSTALL_DIR/cert/$SUB_DOMAIN/fullchain.pem") && test -f $(quote_sh "$INSTALL_DIR/cert/$SUB_DOMAIN/privkey.pem")"; then
+            use_s_cert=true
+        fi
     fi
 
     local cf="$INSTALL_DIR/caddy/Caddyfile"
@@ -3131,6 +3140,345 @@ reset_panel_2fa() {
     run "$(_xui_setting_cmd -resetTwoFactor=true)" || return 1
     success "Two-Factor Authentication reset"
     confirm "Restart panel now?" && restart_panel || true
+}
+
+panel_settings_show() {
+    get_panel_info || true
+    load_webpanel_conf
+    cat <<EOF
+PANEL_PORT=${PANEL_PORT}
+PANEL_PATH=${PANEL_PATH}
+PANEL_USER=${PANEL_USER}
+PANEL_LISTEN=${PANEL_LISTEN}
+PANEL_DOMAIN=${PANEL_DOMAIN}
+PANEL_PROTO=${PANEL_PROTO}
+PANEL_2FA=${PANEL_2FA}
+PANEL_SESSION_AGE=${PANEL_SESSION_AGE}
+PANEL_HAS_DEFAULT=${PANEL_HAS_DEFAULT}
+SUB_ENABLE_DB=${SUB_ENABLE_DB}
+SUB_LISTEN_DB=${SUB_LISTEN_DB}
+SUB_DOMAIN_DB=${SUB_DOMAIN_DB}
+SUB_PORT_DB=${SUB_PORT_DB}
+SUB_PATH_DB=${SUB_PATH_DB}
+SUB_JSON_ENABLE_DB=${SUB_JSON_ENABLE_DB}
+SUB_JSON_PATH_DB=${SUB_JSON_PATH_DB}
+SUB_URI_DB=${SUB_URI_DB}
+SUB_JSON_URI_DB=${SUB_JSON_URI_DB}
+SUB_ENCRYPT_DB=${SUB_ENCRYPT_DB}
+PROXY_ENABLED=${PROXY_ENABLED}
+PROXY_DOMAIN=${PROXY_DOMAIN}
+PROXY_PORT=${PROXY_PORT}
+PROXY_EMAIL=${PROXY_EMAIL}
+SUB_MODE=${SUB_MODE}
+SUB_DOMAIN=${SUB_DOMAIN}
+SUB_PORT=${SUB_PORT}
+SUB_PATH=${SUB_PATH}
+SUB_JSON_PATH=${SUB_JSON_PATH}
+WEBPANEL_ENABLED=${WEBPANEL_ENABLED}
+WEBPANEL_PATH=${WEBPANEL_PATH}
+WEBPANEL_PORT=${WEBPANEL_PORT}
+WEBPANEL_SESSION_IDLE=${WEBPANEL_SESSION_IDLE}
+WEBPANEL_DOMAIN=${WEBPANEL_DOMAIN}
+EOF
+}
+
+settings_cli_dispatch() {
+    local subcmd="${1:-show}"
+    shift || true
+    case "$subcmd" in
+        show)
+            panel_settings_show
+            ;;
+        set-port)
+            require_deployed || return 1
+            require_running  || return 1
+            local new_port="${1:-}"
+            validate_port "$new_port" || { error "Invalid port: $new_port"; return 1; }
+            get_panel_info || true
+            if $PROXY_ENABLED && [[ "$new_port" == "$PROXY_PORT" ]]; then
+                error "Internal panel port cannot equal Caddy HTTPS port ($PROXY_PORT)"
+                return 1
+            fi
+            if [[ "$SUB_ENABLE_DB" == "true" && "$new_port" == "${SUB_PORT_DB:-$SUB_PORT}" ]]; then
+                error "Panel port cannot equal subscription port (${SUB_PORT_DB:-$SUB_PORT})"
+                return 1
+            fi
+            run "$(_xui_setting_cmd -port "$new_port")" || return 1
+            success "Panel port updated to $new_port"
+            restart_panel || true
+            _sync_caddy_if_active "$new_port" "$PANEL_PATH"
+            ;;
+        set-listen)
+            require_deployed || return 1
+            require_running  || return 1
+            get_panel_info || true
+            local new_listen="${1:-}"
+            [[ "$new_listen" == "all" || "$new_listen" == "none" || "$new_listen" == "default" ]] && new_listen=""
+            validate_listen_ip "$new_listen" || { error "Invalid listen IP: $new_listen"; return 1; }
+            if $PROXY_ENABLED && ! _is_loopback_addr "$new_listen"; then
+                warn "Setting a non-loopback listen IP while Caddy proxy is enabled exposes the panel directly!"
+                $AUTO_YES || confirm "Continue with direct exposure?" || return 0
+            fi
+            if [[ -n "$new_listen" ]]; then
+                run "$(_xui_setting_cmd -listenIP "$new_listen")" >/dev/null 2>&1 || true
+            fi
+            xui_db_set "webListen" "$new_listen" || return 1
+            success "Panel listen IP updated to '${new_listen:-0.0.0.0}'"
+            restart_panel || true
+            ;;
+        set-webpath)
+            require_deployed || return 1
+            require_running  || return 1
+            get_panel_info || true
+            load_webpanel_conf
+            local new_path="${1:-}"
+            if [[ "$new_path" == "random" ]]; then
+                new_path="/$(generate_random_string 12)/"
+            else
+                new_path=$(_normalize_webpath "$new_path")
+            fi
+            if ! validate_webpath "$new_path"; then
+                error "Invalid path (allowed: alphanumeric, '/', '_', '-'; max 128 chars; no '..' or '//')"
+                return 1
+            fi
+            if $PROXY_ENABLED && [[ "$new_path" == "/" ]]; then
+                error "Web Base Path cannot be '/' while Caddy camouflage site is active"
+                return 1
+            fi
+            if $WEBPANEL_ENABLED && _paths_overlap "$new_path" "$WEBPANEL_PATH"; then
+                error "Web Base Path '$new_path' overlaps WebPanel path '$WEBPANEL_PATH'"
+                return 1
+            fi
+            if $PROXY_ENABLED && [[ "$SUB_MODE" == "same" ]]; then
+                if _paths_overlap "$new_path" "$SUB_PATH" || _paths_overlap "$new_path" "$SUB_JSON_PATH"; then
+                    error "Web Base Path '$new_path' overlaps subscription paths"
+                    return 1
+                fi
+            fi
+            run "$(_xui_setting_cmd -webBasePath "$new_path")" || return 1
+            success "Web Base Path set to ${new_path}"
+            restart_panel || true
+            _sync_caddy_if_active "$PANEL_PORT" "$new_path"
+            ;;
+        set-security)
+            require_deployed || return 1
+            require_running  || return 1
+            get_panel_info || true
+            local new_age="${1:-keep}" new_wdom="${2:-keep}" changed=false
+            if [[ "$new_age" != "keep" && -n "$new_age" ]]; then
+                if ! [[ "$new_age" =~ ^[0-9]+$ ]] || (( 10#$new_age < 5 || 10#$new_age > 10080 )); then
+                    error "Invalid session timeout (must be 5..10080 minutes)"
+                    return 1
+                fi
+                xui_db_set "sessionMaxAge" "$(( 10#$new_age ))" || return 1
+                success "Session timeout set to $(( 10#$new_age )) minute(s)"
+                changed=true
+            fi
+            if [[ "$new_wdom" != "keep" ]]; then
+                if [[ "$new_wdom" == "none" || "$new_wdom" == "-" || -z "$new_wdom" ]]; then
+                    xui_db_set "webDomain" "" || return 1
+                    success "Cleared webDomain"
+                    changed=true
+                else
+                    validate_domain "$new_wdom" || { error "Invalid domain: $new_wdom"; return 1; }
+                    xui_db_set "webDomain" "$new_wdom" || return 1
+                    success "Panel webDomain set to ${new_wdom}"
+                    changed=true
+                fi
+            fi
+            if $changed; then
+                restart_panel || true
+            else
+                info "No panel security settings changed"
+            fi
+            ;;
+        set-sub)
+            require_deployed || return 1
+            require_running  || return 1
+            get_panel_info || true
+            load_webpanel_conf
+            local s_en="true" s_mode="$SUB_MODE" s_dom="${SUB_DOMAIN_DB:-$SUB_DOMAIN}"
+            local s_listen="${SUB_LISTEN_DB:-}" s_port="${SUB_PORT_DB:-${SUB_PORT:-2096}}"
+            local s_path="${SUB_PATH_DB:-${SUB_PATH:-/sub/}}" s_json_en="${SUB_JSON_ENABLE_DB:-true}"
+            local s_json_path="${SUB_JSON_PATH_DB:-${SUB_JSON_PATH:-/json/}}" s_enc="${SUB_ENCRYPT_DB:-true}"
+            local kv k v
+            for kv in "$@"; do
+                [[ "$kv" == *=* ]] || continue
+                k="${kv%%=*}"
+                v="${kv#*=}"
+                case "$k" in
+                    enable)      [[ "$v" == "false" ]] && s_en="false" || s_en="true" ;;
+                    mode)        s_mode="$v" ;;
+                    domain)      s_dom="$v" ;;
+                    listen)      [[ "$v" == "all" || "$v" == "0.0.0.0" ]] && s_listen="" || s_listen="$v" ;;
+                    port)        s_port="$v" ;;
+                    path)        s_path="$v" ;;
+                    json_enable) [[ "$v" == "false" ]] && s_json_en="false" || s_json_en="true" ;;
+                    json_path)   s_json_path="$v" ;;
+                    encrypt)     [[ "$v" == "false" ]] && s_enc="false" || s_enc="true" ;;
+                    *)           error "Unknown subscription parameter: $k"; return 1 ;;
+                esac
+            done
+
+            if [[ "$s_en" == "false" ]]; then
+                xui_db_set "subEnable" "false" || return 1
+                if $PROXY_ENABLED && [[ "$SUB_MODE" != "none" ]]; then
+                    SUB_MODE="none"
+                    _clear_subscription_proxy_db
+                    save_proxy_conf || true
+                    _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || return 1
+                fi
+                success "Subscription server disabled"
+                restart_panel || true
+                return 0
+            fi
+
+            if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]]; then
+                [[ "$s_mode" == "dedicated" || "$s_mode" == "same" ]] || { error "Proxy subscription mode must be dedicated or same"; return 1; }
+                s_listen="127.0.0.1"
+                if [[ "$s_mode" == "dedicated" ]]; then
+                    if ! validate_domain "$s_dom" || [[ "$s_dom" == "$PROXY_DOMAIN" ]]; then
+                        error "Valid subscription domain different from $PROXY_DOMAIN is required"
+                        return 1
+                    fi
+                else
+                    s_dom="$PROXY_DOMAIN"
+                fi
+            else
+                if [[ "$s_dom" == "none" || "$s_dom" == "-" ]]; then
+                    s_dom=""
+                elif [[ -n "$s_dom" ]]; then
+                    validate_domain "$s_dom" || { error "Invalid subscription domain: $s_dom"; return 1; }
+                fi
+                validate_listen_ip "$s_listen" || { error "Invalid subscription listen IP: $s_listen"; return 1; }
+            fi
+
+            validate_port "$s_port" || { error "Invalid subscription port: $s_port"; return 1; }
+            [[ "$s_port" == "$PANEL_PORT" ]] && { error "Subscription port must differ from panel port ($PANEL_PORT)"; return 1; }
+            if $PROXY_ENABLED && [[ "$s_port" == "$PROXY_PORT" ]]; then
+                error "Internal subscription port cannot equal Caddy HTTPS port ($PROXY_PORT)"
+                return 1
+            fi
+            local inbounds_list=""
+            inbounds_list=$(get_xui_inbounds || true)
+            if [[ -n "$inbounds_list" ]]; then
+                local i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw
+                while IFS='|' read -r i_id i_en i_proto i_listen i_port i_rem i_net i_sec i_path i_fw; do
+                    _is_inbound_enabled "$i_en" || continue
+                    if [[ "$i_port" == "$s_port" ]]; then
+                        error "Inbound #${i_id} (${i_rem:-unnamed}, ${i_proto}/${i_net}) already uses port ${s_port}"
+                        return 1
+                    fi
+                done <<< "$inbounds_list"
+            fi
+
+            s_path=$(_normalize_webpath "$s_path")
+            if [[ "$s_path" == "/" ]] || ! validate_webpath "$s_path"; then
+                error "Invalid subscription path: $s_path"
+                return 1
+            fi
+            s_json_path=$(_normalize_webpath "$s_json_path")
+            if [[ "$s_json_path" == "/" ]] || ! validate_webpath "$s_json_path" || _paths_overlap "$s_path" "$s_json_path"; then
+                error "Invalid or overlapping JSON subscription path: $s_json_path"
+                return 1
+            fi
+            if $PROXY_ENABLED && [[ "$s_mode" == "same" ]]; then
+                if _paths_overlap "$s_path" "$PANEL_PATH" || _paths_overlap "$s_json_path" "$PANEL_PATH"; then
+                    error "Subscription paths overlap panel path '$PANEL_PATH'"
+                    return 1
+                fi
+                if $WEBPANEL_ENABLED && { _paths_overlap "$s_path" "$WEBPANEL_PATH" || _paths_overlap "$s_json_path" "$WEBPANEL_PATH"; }; then
+                    error "Subscription paths overlap WebPanel path '$WEBPANEL_PATH'"
+                    return 1
+                fi
+            fi
+
+            local new_sub_uri="" new_json_uri="" new_sub_cert="${SUB_CERT_DB:-}" new_sub_key="${SUB_KEY_DB:-}"
+            if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]]; then
+                local port_sfx=""
+                [[ "$PROXY_PORT" != "443" ]] && port_sfx=":${PROXY_PORT}"
+                new_sub_uri="https://${s_dom}${port_sfx}${s_path}"
+                new_json_uri="https://${s_dom}${port_sfx}${s_json_path}"
+                new_sub_cert=""
+                new_sub_key=""
+            else
+                local sub_scheme="http" sub_port_sfx=":${s_port}"
+                if [[ -n "$new_sub_cert" && -n "$new_sub_key" ]]; then
+                    sub_scheme="https"
+                    [[ "$s_port" == "443" ]] && sub_port_sfx=""
+                else
+                    [[ "$s_port" == "80" ]] && sub_port_sfx=""
+                fi
+                local ext_host="${s_dom:-$(get_target_ip)}"
+                if [[ -n "$sub_port_sfx" ]]; then
+                    new_sub_uri="${sub_scheme}://$(_format_host_port "$ext_host" "$s_port")${s_path}"
+                    new_json_uri="${sub_scheme}://$(_format_host_port "$ext_host" "$s_port")${s_json_path}"
+                else
+                    new_sub_uri="${sub_scheme}://${ext_host}${s_path}"
+                    new_json_uri="${sub_scheme}://${ext_host}${s_json_path}"
+                fi
+            fi
+
+            _apply_subscription_db_settings "true" "$s_listen" "$s_dom" "$s_port" "$s_path" \
+                "$s_json_en" "$s_json_path" "$s_enc" "$new_sub_cert" "$new_sub_key" \
+                "$new_sub_uri" "$new_json_uri" || return 1
+
+            if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]]; then
+                SUB_MODE="$s_mode"
+                [[ "$s_mode" == "dedicated" ]] && SUB_DOMAIN="$s_dom" || SUB_DOMAIN=""
+                SUB_PORT="$s_port"
+                SUB_PATH="$s_path"
+                SUB_JSON_PATH="$s_json_path"
+                save_proxy_conf || return 1
+                _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || return 1
+            fi
+
+            success "Subscription configuration updated (${new_sub_uri})"
+            compose restart 3xui >/dev/null || compose restart >/dev/null || true
+            invalidate_status
+            verify_panel_loaded 10 || true
+            verify_subscription_endpoint 8 || true
+            ;;
+        reset-2fa)
+            require_deployed || return 1
+            require_running  || return 1
+            run "$(_xui_setting_cmd -resetTwoFactor=true)" || return 1
+            success "Two-Factor Authentication reset"
+            restart_panel || true
+            ;;
+        reset-credentials)
+            require_deployed || return 1
+            require_running  || return 1
+            local new_user="" new_pass=""
+            IFS= read -r new_user || true
+            IFS= read -r new_pass || true
+            if [[ -z "$new_user" || "$new_user" =~ [[:space:]] || "$new_user" == -* ]] || has_control_chars "$new_user"; then
+                new_pass=""
+                error "Invalid username (must be non-empty without spaces, leading '-', or control characters)"
+                return 1
+            fi
+            if ! validate_strong_password "$new_pass"; then
+                new_pass=""
+                error "Password does not meet security requirements (min 12 chars, no control chars or weak defaults, >=16 chars or >=2 classes)"
+                return 1
+            fi
+            local cred_out="" cred_rc=0
+            cred_out=$(_xui_set_credentials_stdin "$new_user" "$new_pass") || cred_rc=$?
+            new_pass=""
+            if (( cred_rc != 0 )) || printf '%s' "$cred_out" | grep -qiE '(failed|error)'; then
+                error "Update credentials failed"
+                [[ -n "$cred_out" ]] && echo "  $cred_out"
+                return 1
+            fi
+            get_panel_info || true
+            success "Credentials updated (username: ${PANEL_USER:-$new_user})"
+            restart_panel || true
+            ;;
+        *)
+            error "Unknown settings action: $subcmd (use: show|set-port|set-listen|set-webpath|set-security|set-sub|reset-2fa|reset-credentials)"
+            return 1
+            ;;
+    esac
 }
 
 manage_panel_settings() {
@@ -3599,6 +3947,7 @@ post_deploy_harden() {
 }
 
 deploy() {
+    local req_db="${1:-}" req_pg_user="${2:-}"
     if is_deployed; then
         warn "Already deployed at $INSTALL_DIR"
         confirm "Redeploy (overwrite compose.yaml)?" || return 0
@@ -3607,7 +3956,12 @@ deploy() {
     ensure_docker || { error "Could not install Docker"; return 1; }
 
     local db_type="sqlite"
-    if $INTERACTIVE; then
+    if [[ -n "$req_db" ]]; then
+        case "$req_db" in
+            sqlite|postgres) db_type="$req_db" ;;
+            *) error "Unsupported database type '$req_db' (use: sqlite or postgres)"; return 1 ;;
+        esac
+    elif $INTERACTIVE; then
         tui_select "Database Selection" "Choose a backend for 3X-UI:" "SQLite (default)" "PostgreSQL" "Cancel"
         local sel=$?
         clear_screen
@@ -3618,17 +3972,21 @@ deploy() {
         esac
     fi
 
-    local pg_user="xui" pg_pass="" pg_auto=false
+    local pg_user="${req_pg_user:-xui}" pg_pass="" pg_auto=false
     if [[ "$db_type" == "postgres" ]]; then
-        echo ""
-        read -rp "  Postgres user [xui]: " pg_user
-        pg_user="${pg_user:-xui}"
+        if [[ -z "$req_pg_user" ]] && $INTERACTIVE; then
+            echo ""
+            read -rp "  Postgres user [xui]: " pg_user
+            pg_user="${pg_user:-xui}"
+        fi
         if ! validate_pg_ident "$pg_user"; then
             error "Invalid Postgres username (alphanumeric/_/-, starting with letter or _)"
             return 1
         fi
-        read -rs -p "  Postgres password [Enter to auto-generate]: " pg_pass
-        echo ""
+        if $INTERACTIVE; then
+            read -rs -p "  Postgres password [Enter to auto-generate]: " pg_pass
+            echo ""
+        fi
         if [[ -z "$pg_pass" ]]; then
             pg_pass=$(generate_random_string 20)
             pg_auto=true
@@ -3670,7 +4028,11 @@ deploy() {
     echo -e "  Dir       : ${BOLD}$INSTALL_DIR${NC}"
     echo -e "  Version   : ${BOLD}$latest_tag${NC}"
     echo -e "  Database  : ${BOLD}$db_type${NC}"
-    $pg_auto && echo -e "  PG Pass   : ${BOLD}${YELLOW}$pg_pass${NC}  (also stored in $INSTALL_DIR/.env)"
+    if $pg_auto && $INTERACTIVE; then
+        echo -e "  PG Pass   : ${BOLD}${YELLOW}$pg_pass${NC}  (also stored in $INSTALL_DIR/.env)"
+    elif [[ "$db_type" == "postgres" ]]; then
+        echo -e "  PG Pass   : stored securely in $INSTALL_DIR/.env"
+    fi
     pg_pass=""
     echo -e "  Panel URL : ${BOLD}$url${NC}"
     if $PROXY_ENABLED && is_caddy_running; then
@@ -4297,45 +4659,44 @@ prune_backups() {
     success "Pruned $to_delete old backup(s)"
 }
 
-setup_backup_cron() {
+_status_backup_cron() {
+    local cron_file="/etc/cron.d/3xui-backup"
+    if run_q "test -f $cron_file"; then
+        local line
+        line=$(run_out "grep -v '^#' $cron_file | head -n 1" || true)
+        printf 'CRON_ENABLED=true\nCRON_LINE=%s\n' "$line"
+        if [[ "$line" =~ ^0[[:space:]]+([0-9]+)[[:space:]] ]]; then
+            printf 'CRON_HOUR=%s\n' "${BASH_REMATCH[1]}"
+        fi
+        local keep_val
+        keep_val=$(run_out "awk -F= '/^KEEP=/{print \$2; exit}' /usr/local/bin/3xui-auto-backup.sh" || true)
+        [[ -n "$keep_val" ]] && printf 'CRON_KEEP=%s\n' "$keep_val"
+    else
+        printf 'CRON_ENABLED=false\n'
+    fi
+}
+
+_install_backup_cron() {
+    local hour="${1:-3}" keep="${2:-7}"
     local cron_file="/etc/cron.d/3xui-backup"
     local helper_script="/usr/local/bin/3xui-auto-backup.sh"
 
-    local current_cron="Not configured"
-    if run_q "test -f $cron_file"; then
-        current_cron=$(run_out "grep -v '^#' $cron_file | head -n 1" || echo "Enabled")
+    if ! [[ "$hour" =~ ^[0-9]+$ ]] || (( 10#$hour < 0 || 10#$hour > 23 )); then
+        error "Invalid hour: $hour (must be 0-23)"
+        return 1
+    fi
+    if ! [[ "$keep" =~ ^[0-9]+$ ]] || (( 10#$keep < 1 || 10#$keep > 365 )); then
+        error "Invalid retention count: $keep (must be 1-365)"
+        return 1
     fi
 
-    tui_select "Scheduled Backups" "Current schedule: ${current_cron}" \
-        "Enable / Update daily automated backup" \
-        "Disable automated backup" \
-        "Back"
-    local sel=$?
-    clear_screen
+    get_pg_env
+    local q_inst q_bdir
+    q_inst=$(quote_sh "$INSTALL_DIR")
+    q_bdir=$(quote_sh "$BACKUP_DIR")
 
-    case "$sel" in
-        0)
-            local hour keep
-            read -rp "  Hour of day to run (0-23) [3]: " hour
-            hour="${hour:-3}"
-            if ! [[ "$hour" =~ ^[0-9]+$ ]] || (( 10#$hour < 0 || 10#$hour > 23 )); then
-                error "Invalid hour: $hour"
-                return 1
-            fi
-            read -rp "  Backups to retain [7]: " keep
-            keep="${keep:-7}"
-            if ! [[ "$keep" =~ ^[0-9]+$ ]] || (( 10#$keep < 1 || 10#$keep > 365 )); then
-                error "Invalid retention count: $keep"
-                return 1
-            fi
-
-            get_pg_env
-            local q_inst q_bdir
-            q_inst=$(quote_sh "$INSTALL_DIR")
-            q_bdir=$(quote_sh "$BACKUP_DIR")
-
-            local script_body
-            script_body=$(cat <<EOF
+    local script_body
+    script_body=$(cat <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
@@ -4380,22 +4741,53 @@ ls -1t "\$BACKUP_DIR"/backup_*.tar.gz 2>/dev/null | tail -n +\$((KEEP + 1)) | wh
 EOF
 )
 
-            if $REMOTE; then
-                printf '%s\n' "$script_body" | ssh_cmd "umask 077 && cat > $helper_script && chmod 700 $helper_script"
-            else
-                ( umask 077; printf '%s\n' "$script_body" > "$helper_script" )
-                chmod 700 "$helper_script"
-            fi
+    if $REMOTE; then
+        printf '%s\n' "$script_body" | ssh_cmd "umask 077 && cat > $helper_script && chmod 700 $helper_script"
+    else
+        ( umask 077; printf '%s\n' "$script_body" > "$helper_script" )
+        chmod 700 "$helper_script"
+    fi
 
-            local log_file="/var/log/3xui-backup.log"
-            run "touch $log_file && chmod 600 $log_file" || true
-            local cron_line="0 $(( 10#$hour )) * * * root $helper_script >> $log_file 2>&1"
-            run "printf '%s\n' $(quote_sh "$cron_line") > $cron_file && chmod 644 $cron_file" || return 1
-            success "Daily backup scheduled at $(printf '%02d:00' "$(( 10#$hour ))") (retaining last $keep backups, log: $log_file)"
+    local log_file="/var/log/3xui-backup.log"
+    run "touch $log_file && chmod 600 $log_file" || true
+    local cron_line="0 $(( 10#$hour )) * * * root $helper_script >> $log_file 2>&1"
+    run "printf '%s\n' $(quote_sh "$cron_line") > $cron_file && chmod 644 $cron_file" || return 1
+    success "Daily backup scheduled at $(printf '%02d:00' "$(( 10#$hour ))") (retaining last $(( 10#$keep )) backups, log: $log_file)"
+}
+
+_disable_backup_cron() {
+    local cron_file="/etc/cron.d/3xui-backup"
+    local helper_script="/usr/local/bin/3xui-auto-backup.sh"
+    run "rm -f $cron_file $helper_script" || return 1
+    success "Automated backup disabled"
+}
+
+setup_backup_cron() {
+    local cron_file="/etc/cron.d/3xui-backup"
+
+    local current_cron="Not configured"
+    if run_q "test -f $cron_file"; then
+        current_cron=$(run_out "grep -v '^#' $cron_file | head -n 1" || echo "Enabled")
+    fi
+
+    tui_select "Scheduled Backups" "Current schedule: ${current_cron}" \
+        "Enable / Update daily automated backup" \
+        "Disable automated backup" \
+        "Back"
+    local sel=$?
+    clear_screen
+
+    case "$sel" in
+        0)
+            local hour keep
+            read -rp "  Hour of day to run (0-23) [3]: " hour
+            hour="${hour:-3}"
+            read -rp "  Backups to retain [7]: " keep
+            keep="${keep:-7}"
+            _install_backup_cron "$hour" "$keep"
             ;;
         1)
-            run "rm -f $cron_file $helper_script" || return 1
-            success "Automated backup disabled"
+            _disable_backup_cron
             ;;
         2|255) _SKIP_PAUSE=true; return 0 ;;
     esac
@@ -4513,13 +4905,73 @@ EOF
 }
 
 apply_panel_cert() {
-    local domain="$1"
-    require_running || return 1
-
+    local domain="$1" target="${2:-panel}"
     local host_cert="$INSTALL_DIR/cert/$domain/fullchain.pem"
     local host_key="$INSTALL_DIR/cert/$domain/privkey.pem"
     if ! run_q "test -f $(quote_sh "$host_cert") && test -f $(quote_sh "$host_key")"; then
         error "Cert or key missing in $INSTALL_DIR/cert/$domain/"
+        return 1
+    fi
+
+    if [[ "$target" == "caddy" ]]; then
+        require_deployed || return 1
+        load_proxy_conf
+        if ! $PROXY_ENABLED || [[ -z "$PROXY_DOMAIN" ]]; then
+            error "Caddy reverse proxy is not enabled; cannot bind certificate to Caddy"
+            return 1
+        fi
+        get_panel_info || true
+        local use_p_cert=false use_s_cert=false
+        local cf="$INSTALL_DIR/caddy/Caddyfile"
+        local cf_bak="$INSTALL_DIR/caddy/Caddyfile.bak"
+        run_q "grep -q $(quote_sh "tls /root/cert/$PROXY_DOMAIN/") $(quote_sh "$cf")" && use_p_cert=true
+        if [[ "$SUB_MODE" == "dedicated" && -n "$SUB_DOMAIN" ]]; then
+            run_q "grep -q $(quote_sh "tls /root/cert/$SUB_DOMAIN/") $(quote_sh "$cf")" && use_s_cert=true
+        fi
+        if [[ "$domain" == "$PROXY_DOMAIN" ]]; then
+            use_p_cert=true
+        elif [[ "$SUB_MODE" == "dedicated" && "$domain" == "$SUB_DOMAIN" ]]; then
+            use_s_cert=true
+        else
+            error "Certificate domain '$domain' does not match configured proxy domain ($PROXY_DOMAIN) or subscription domain (${SUB_DOMAIN:-none})"
+            return 1
+        fi
+
+        local had_cf=false
+        if run_q "test -f $(quote_sh "$cf")"; then
+            had_cf=true
+            run "cp $(quote_sh "$cf") $(quote_sh "$cf_bak") && chmod 644 $(quote_sh "$cf_bak")" || true
+        fi
+        if ! generate_caddyfile "$PROXY_DOMAIN" "$PROXY_PORT" "$PROXY_EMAIL" "$PANEL_PORT" "$PANEL_PATH" \
+            "$SUB_MODE" "$SUB_DOMAIN" "$SUB_PORT" "$SUB_PATH" "$SUB_JSON_PATH" \
+            "$use_p_cert" "$use_s_cert"; then
+            $had_cf && run_q "mv -f $(quote_sh "$cf_bak") $(quote_sh "$cf")" || true
+            error "Failed to update Caddyfile for certificate '$domain'"
+            return 1
+        fi
+        if is_caddy_running; then
+            if _caddy_reload; then
+                run_q "rm -f $(quote_sh "$cf_bak")" || true
+                success "Caddy configured to serve TLS certificate for $domain"
+            else
+                if $had_cf; then
+                    run_q "mv -f $(quote_sh "$cf_bak") $(quote_sh "$cf")" || true
+                    _caddy_reload >/dev/null 2>&1 || true
+                fi
+                error "Caddy rejected TLS configuration for $domain; rolled back"
+                return 1
+            fi
+        else
+            run_q "rm -f $(quote_sh "$cf_bak")" || true
+            success "Saved Caddyfile TLS configuration for $domain"
+        fi
+        return 0
+    fi
+
+    require_running || return 1
+    load_proxy_conf
+    if $PROXY_ENABLED; then
+        error "Caddy reverse proxy is active — keep 3X-UI panel HTTP on loopback and apply certificates to Caddy instead."
         return 1
     fi
 
@@ -4533,22 +4985,31 @@ apply_panel_cert() {
 
     run "$(_xui_setting_cmd -webCert "$cert_path" -webCertKey "$key_path")" \
         || { error "Failed to set TLS paths"; return 1; }
-    success "TLS configured — restart panel to apply."
-    confirm "Restart panel now?" && restart_panel || true
+    success "TLS configured — restarting panel to apply..."
+    if $INTERACTIVE; then
+        confirm "Restart panel now?" && restart_panel || true
+    else
+        restart_panel || true
+    fi
 }
 
 cert_issue() {
-    echo ""
-    local domain email
-    read -rp "  Domain: " domain
+    local domain="${1:-}" email="${2:-}" apply_mode="${3:-}"
+    local interactive_mode=false
+    if [[ -z "$domain" ]]; then
+        interactive_mode=true
+        echo ""
+        read -rp "  Domain: " domain
+        read -rp "  Email for Let's Encrypt notices [blank to skip]: " email
+    fi
+
     if ! validate_domain "$domain"; then
         error "Invalid domain name: $domain"
         return 1
     fi
 
-    read -rp "  Email for Let's Encrypt notices [blank to skip]: " email
     local email_args
-    if [[ -n "$email" ]]; then
+    if [[ -n "$email" && "$email" != "-" ]]; then
         if ! validate_email "$email"; then
             error "Invalid email address: $email"
             return 1
@@ -4575,14 +5036,14 @@ cert_issue() {
     fi
 
     local was_running=false
-    if is_running; then
+    if is_running || is_caddy_running; then
         was_running=true
-        warn "Panel will be briefly stopped so certbot can bind port 80."
+        warn "Stack will be briefly stopped so certbot standalone can bind port 80."
         confirm "Continue?" || return 0
-        compose stop || { error "Could not stop panel"; return 1; }
+        compose stop || { error "Could not stop stack"; return 1; }
     fi
 
-    info "Requesting cert for $domain (port 80 must be publicly reachable)..."
+    info "Requesting Let's Encrypt cert for $domain (port 80 must be publicly reachable)..."
     local issued=false
     if run "certbot certonly --standalone --agree-tos $email_args -d $(quote_sh "$domain") --non-interactive"; then
         local dest="$INSTALL_DIR/cert/$domain"
@@ -4597,39 +5058,59 @@ cert_issue() {
     fi
 
     if $was_running; then
-        compose up -d && success "Panel restarted" || warn "Panel restart failed"
+        compose up -d && success "Stack restarted" || warn "Stack restart failed"
         invalidate_status
     fi
 
-    if $issued && is_running; then
-        apply_panel_cert "$domain" || true
+    if $issued; then
+        if [[ "$apply_mode" == "caddy" ]]; then
+            apply_panel_cert "$domain" "caddy" || return 1
+        elif [[ "$apply_mode" == "panel" ]]; then
+            apply_panel_cert "$domain" "panel" || return 1
+        elif $interactive_mode && is_running; then
+            load_proxy_conf
+            $PROXY_ENABLED || apply_panel_cert "$domain" "panel" || true
+        fi
+        return 0
     fi
+    return 1
 }
 
 cert_renew() {
+    local domain="${1:-}" force="${2:-false}"
+    if [[ -n "$domain" && "$domain" != "all" && "$domain" != "-" ]]; then
+        validate_domain "$domain" || { error "Invalid domain: $domain"; return 1; }
+    else
+        domain=""
+    fi
+
     if ! run_q "command -v certbot"; then
         error "certbot not installed — issue a cert first"
         return 1
     fi
 
     local was_running=false
-    if is_running; then
-        if confirm "Stop panel briefly during renewal so standalone challenge can bind port 80?"; then
+    if is_running || is_caddy_running; then
+        if confirm "Stop stack briefly during renewal so standalone challenge can bind port 80?"; then
             was_running=true
-            compose stop || { error "Could not stop panel"; return 1; }
+            compose stop || { error "Could not stop stack"; return 1; }
         fi
     fi
 
-    info "Renewing all certbot certificates..."
+    local renew_cmd="certbot renew --non-interactive"
+    [[ -n "$domain" ]] && renew_cmd+=" --cert-name $(quote_sh "$domain")"
+    [[ "$force" == "force" || "$force" == "true" ]] && renew_cmd+=" --force-renewal"
+
+    info "Renewing certbot certificate(s)${domain:+ ($domain)}..."
     local rc=0
-    run "certbot renew" || rc=1
+    run "$renew_cmd" || rc=1
 
     install_certbot_deploy_hook || true
     info "Syncing certificates into $INSTALL_DIR/cert/..."
     sync_letsencrypt_certs || true
 
     if $was_running; then
-        compose up -d && success "Panel restarted" || warn "Panel restart failed"
+        compose up -d && success "Stack restarted" || warn "Stack restart failed"
         invalidate_status
     elif is_running; then
         confirm "Restart panel to load renewed certificates?" && restart_panel || true
@@ -4638,7 +5119,12 @@ cert_renew() {
         _caddy_reload || true
     fi
 
-    (( rc == 0 )) && success "Renewal & sync complete" || error "Renewal encountered errors — check certbot logs"
+    if (( rc == 0 )); then
+        success "Renewal & sync complete"
+        return 0
+    fi
+    error "Renewal encountered errors — check certbot logs"
+    return 1
 }
 
 cert_self_signed() {
@@ -4648,14 +5134,22 @@ cert_self_signed() {
         return 1
     fi
 
-    echo ""
-    local default_host
-    default_host=$(get_target_ip)
-    local host
-    read -rp "  Domain or IP for certificate [${default_host}]: " host
-    host="${host:-$default_host}"
+    local host="${1:-}" days="${2:-3650}" apply_mode="${3:-}"
+    local interactive_mode=false
+    if [[ -z "$host" ]]; then
+        interactive_mode=true
+        echo ""
+        local default_host
+        default_host=$(get_target_ip)
+        read -rp "  Domain or IP for certificate [${default_host}]: " host
+        host="${host:-$default_host}"
+    fi
     if ! validate_domain_or_ip "$host"; then
         error "Invalid domain or IP address: $host"
+        return 1
+    fi
+    if ! [[ "$days" =~ ^[0-9]+$ ]] || (( 10#$days < 1 || 10#$days > 3650 )); then
+        error "Invalid validity days '$days' (must be 1-3650)"
         return 1
     fi
 
@@ -4663,7 +5157,7 @@ cert_self_signed() {
     ( validate_ipv4 "$host" || validate_ipv6 "$host" ) && san_entry="IP:${host}"
 
     local dest="$INSTALL_DIR/cert/$host"
-    info "Generating 10-year ECDSA P-256 self-signed certificate for $host..."
+    info "Generating ${days}-day ECDSA P-256 self-signed certificate for $host..."
 
     local gen_cmd
     gen_cmd=$(cat <<EOF
@@ -4687,7 +5181,7 @@ extendedKeyUsage = serverAuth
 subjectAltName = $san_entry
 CFG
 openssl ecparam -name prime256v1 -genkey -noout -out $(quote_sh "$dest/privkey.pem")
-openssl req -new -x509 -sha256 -days 3650 -key $(quote_sh "$dest/privkey.pem") -out $(quote_sh "$dest/fullchain.pem") -config "\$cfg"
+openssl req -new -x509 -sha256 -days $(( 10#$days )) -key $(quote_sh "$dest/privkey.pem") -out $(quote_sh "$dest/fullchain.pem") -config "\$cfg"
 chmod 644 $(quote_sh "$dest/fullchain.pem")
 chmod 600 $(quote_sh "$dest/privkey.pem")
 EOF
@@ -4695,9 +5189,145 @@ EOF
     run "$gen_cmd" || { error "Certificate generation failed"; return 1; }
     success "Self-signed certificate saved to $dest"
 
-    if is_running; then
-        apply_panel_cert "$host" || true
+    if [[ "$apply_mode" == "caddy" ]]; then
+        apply_panel_cert "$host" "caddy" || return 1
+    elif [[ "$apply_mode" == "panel" ]]; then
+        apply_panel_cert "$host" "panel" || return 1
+    elif $interactive_mode && is_running; then
+        load_proxy_conf
+        $PROXY_ENABLED || apply_panel_cert "$host" "panel" || true
     fi
+}
+
+cert_revoke() {
+    require_deployed || return 1
+    validate_safe_dir "$INSTALL_DIR" || { error "Unsafe install directory: $INSTALL_DIR"; return 1; }
+
+    local domain="${1:-}" reason="${2:-unspecified}"
+    if [[ -z "$domain" ]]; then
+        echo ""
+        read -rp "  Certificate domain or IP folder in $INSTALL_DIR/cert/ to revoke/remove: " domain
+    fi
+    if [[ "$domain" == *"/"* || "$domain" == *".."* ]] || ! validate_domain_or_ip "$domain"; then
+        error "Invalid certificate domain or IP: $domain"
+        return 1
+    fi
+    case "$reason" in
+        unspecified|keycompromise|affiliationchanged|superseded|cessationofoperation) ;;
+        *)
+            error "Invalid revocation reason '$reason' (allowed: unspecified, keycompromise, affiliationchanged, superseded, cessationofoperation)"
+            return 1
+            ;;
+    esac
+
+    local dest="$INSTALL_DIR/cert/$domain"
+    local le_cert="/etc/letsencrypt/live/$domain/fullchain.pem"
+    local has_local=false has_le=false
+    run_q "test -d $(quote_sh "$dest")" && has_local=true
+    run_q "test -f $(quote_sh "$le_cert")" && has_le=true
+
+    if ! $has_local && ! $has_le; then
+        error "No certificate found for '$domain' in $INSTALL_DIR/cert/ or /etc/letsencrypt/live/"
+        return 1
+    fi
+
+    confirm "Revoke and delete certificate for '${domain}' (reason: ${reason})?" || return 0
+
+    if $has_le; then
+        if ! run_q "command -v certbot"; then
+            error "Let's Encrypt lineage exists at $le_cert but certbot is not installed"
+            return 1
+        fi
+        info "Revoking Let's Encrypt certificate for $domain (reason=${reason})..."
+        if ! run "certbot revoke --non-interactive --cert-path $(quote_sh "$le_cert") --reason $(quote_sh "$reason") --delete-after-revoke"; then
+            report_diagnostic "ERROR" "cert_revoke" \
+                "Let's Encrypt revocation failed for $domain" \
+                "certbot ($le_cert)" \
+                "Check network connectivity and Let's Encrypt rate limits/account state."
+            return 1
+        fi
+        success "Revoked Let's Encrypt certificate for $domain"
+    fi
+
+    if $has_local; then
+        run "rm -rf $(quote_sh "$dest")" || { error "Failed to delete $dest"; return 1; }
+        success "Removed local certificate directory $dest"
+    fi
+
+    # Clear references in 3X-UI database if active
+    local db_changed=false
+    if is_running || is_pg_running || run_q "test -f $(quote_sh "$INSTALL_DIR/db/x-ui.db")"; then
+        local cur_wcert cur_scert
+        cur_wcert=$(xui_db_get "webCertFile" || true)
+        cur_scert=$(xui_db_get "subCertFile" || true)
+        if [[ "$cur_wcert" == *"/cert/${domain}/"* ]]; then
+            xui_db_set "webCertFile" "" || true
+            xui_db_set "webKeyFile" "" || true
+            db_changed=true
+            info "Cleared webCertFile/webKeyFile references for $domain"
+        fi
+        if [[ "$cur_scert" == *"/cert/${domain}/"* ]]; then
+            xui_db_set "subCertFile" "" || true
+            xui_db_set "subKeyFile" "" || true
+            db_changed=true
+            info "Cleared subCertFile/subKeyFile references for $domain"
+        fi
+    fi
+
+    if $db_changed && is_running; then
+        restart_panel || true
+    fi
+
+    load_proxy_conf
+    if $PROXY_ENABLED && [[ -n "$PROXY_DOMAIN" ]]; then
+        if run_q "grep -q $(quote_sh "/root/cert/$domain/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")"; then
+            info "Updating Caddyfile after certificate removal..."
+            get_panel_info >/dev/null 2>&1 || true
+            _sync_caddy_if_active "$PANEL_PORT" "$PANEL_PATH" || warn "Caddy reload warning after cert removal"
+        fi
+    fi
+    return 0
+}
+
+cert_list() {
+    if ! run_q "test -d $(quote_sh "$INSTALL_DIR/cert")"; then
+        info "No certificate directory at $INSTALL_DIR/cert"
+        return 0
+    fi
+    local cert_files
+    cert_files=$(run_out "find $(quote_sh "$INSTALL_DIR/cert") -name 'fullchain.pem' | sort" || true)
+    if [[ -z "$cert_files" ]]; then
+        info "No certificates found in $INSTALL_DIR/cert"
+        return 0
+    fi
+    local cf dom exp
+    while IFS= read -r cf; do
+        [[ -z "$cf" ]] && continue
+        dom=$(basename "$(dirname "$cf")")
+        exp=$(run_out "openssl x509 -enddate -noout -in $(quote_sh "$cf") | cut -d= -f2" || echo "unknown")
+        printf '%s\t%s\n' "$dom" "${exp:-unknown}"
+    done <<< "$cert_files"
+}
+
+certs_cli_dispatch() {
+    local subcmd="${1:-}"
+    shift || true
+    case "$subcmd" in
+        list)        cert_list ;;
+        issue)       cert_issue "${1:-}" "${2:-}" "${3:-none}" ;;
+        renew)       cert_renew "${1:-}" "${2:-false}" ;;
+        revoke)      cert_revoke "${1:-}" "${2:-unspecified}" ;;
+        self-signed) cert_self_signed "${1:-}" "${2:-3650}" "${3:-none}" ;;
+        apply)
+            [[ -n "${1:-}" ]] || { error "Usage: manage.sh certs apply <domain> [caddy|panel]"; return 1; }
+            validate_domain_or_ip "$1" || { error "Invalid domain/IP: $1"; return 1; }
+            apply_panel_cert "$1" "${2:-caddy}"
+            ;;
+        *)
+            error "Unknown certs action: $subcmd (use: list|issue|renew|revoke|self-signed|apply)"
+            return 1
+            ;;
+    esac
 }
 
 cert_configure() {
@@ -4766,6 +5396,7 @@ manage_certs() {
             "Renew & sync all certbot certs"
             "Generate self-signed cert (ECDSA P-256)"
             "Set panel TLS cert"
+            "Revoke / delete certificate"
             "List cert files"
             "Back"
         )
@@ -4778,7 +5409,8 @@ manage_certs() {
             1) cert_renew ;;
             2) cert_self_signed ;;
             3) cert_configure ;;
-            4)
+            4) cert_revoke ;;
+            5)
                 echo ""
                 if run_q "test -d $(quote_sh "$INSTALL_DIR/cert")"; then
                     run "find $(quote_sh "$INSTALL_DIR/cert") \\( -name '*.pem' -o -name '*.crt' -o -name '*.key' \\) 2>/dev/null || echo '  (none)'" || true
@@ -4786,7 +5418,7 @@ manage_certs() {
                     echo "  (cert directory does not exist)"
                 fi
                 ;;
-            5|255) _SKIP_PAUSE=true; return ;;
+            6|255) _SKIP_PAUSE=true; return ;;
         esac
 
         echo ""
@@ -6567,6 +7199,200 @@ setup_reverse_proxy() {
     echo -e "  ${DIM}Ensure DNS points to this server and firewall allows 80/tcp + ${https_port}/tcp+udp.${NC}"
 }
 
+configure_reverse_proxy_cli() {
+    require_deployed || return 1
+    require_running  || return 1
+    get_panel_info || true
+    load_webpanel_conf
+
+    local prev_sub_mode="$SUB_MODE"
+    local panel_domain="${PROXY_DOMAIN:-}" https_port="${PROXY_PORT:-443}" acme_email="${PROXY_EMAIL:-}"
+    local sub_mode="${SUB_MODE:-none}" sub_domain="${SUB_DOMAIN:-}" sub_port="${SUB_PORT_DB:-${SUB_PORT:-2096}}"
+    local sub_path="${SUB_PATH_DB:-${SUB_PATH:-/sub/}}" sub_json_path="${SUB_JSON_PATH_DB:-${SUB_JSON_PATH:-/json/}}"
+    local use_existing_panel_cert=false use_existing_sub_cert=false
+    if [[ -n "$panel_domain" ]]; then
+        run_q "grep -q $(quote_sh "tls /root/cert/$panel_domain/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" && use_existing_panel_cert=true
+    fi
+    if [[ -n "$sub_domain" ]]; then
+        run_q "grep -q $(quote_sh "tls /root/cert/$sub_domain/") $(quote_sh "$INSTALL_DIR/caddy/Caddyfile")" && use_existing_sub_cert=true
+    fi
+
+    local kv k v
+    for kv in "$@"; do
+        [[ "$kv" == *=* ]] || continue
+        k="${kv%%=*}"
+        v="${kv#*=}"
+        case "$k" in
+            domain)         panel_domain="$v" ;;
+            port)           https_port="$v" ;;
+            email)          acme_email="$v" ;;
+            sub_mode)       sub_mode="$v" ;;
+            sub_domain)     sub_domain="$v" ;;
+            sub_port)       sub_port="$v" ;;
+            sub_path)       sub_path="$v" ;;
+            sub_json_path)  sub_json_path="$v" ;;
+            use_panel_cert) [[ "$v" == "true" ]] && use_existing_panel_cert=true || use_existing_panel_cert=false ;;
+            use_sub_cert)   [[ "$v" == "true" ]] && use_existing_sub_cert=true || use_existing_sub_cert=false ;;
+            *)              error "Unknown proxy configure parameter: $k"; return 1 ;;
+        esac
+    done
+
+    validate_domain "$panel_domain" || { error "Valid panel domain required (e.g. panel.example.com)"; return 1; }
+    validate_port "$https_port" || { error "Invalid HTTPS port: $https_port"; return 1; }
+    [[ "$https_port" == "$PANEL_PORT" ]] && { error "Caddy HTTPS port cannot equal internal panel port ($PANEL_PORT)"; return 1; }
+    [[ -n "$acme_email" ]] && ! validate_email "$acme_email" && { error "Invalid ACME email: $acme_email"; return 1; }
+    [[ "$sub_mode" =~ ^(none|same|dedicated)$ ]] || { error "sub_mode must be none, same, or dedicated"; return 1; }
+
+    local panel_path="$PANEL_PATH"
+    if [[ "$panel_path" == "/" ]]; then
+        local gen_path="/$(generate_random_string 12)/"
+        run "$(_xui_setting_cmd -webBasePath "$gen_path")" || { error "Failed to assign non-root Web Base Path"; return 1; }
+        panel_path="$gen_path"
+        info "Assigned non-root panel Web Base Path: ${panel_path}"
+    fi
+
+    if [[ "$sub_mode" != "none" ]]; then
+        validate_port "$sub_port" || { error "Invalid subscription port: $sub_port"; return 1; }
+        [[ "$sub_port" == "$PANEL_PORT" ]] && { error "Subscription port must differ from panel port ($PANEL_PORT)"; return 1; }
+        [[ "$sub_port" == "$https_port" ]] && { error "Internal subscription port cannot equal Caddy HTTPS port ($https_port)"; return 1; }
+        sub_path=$(_normalize_webpath "$sub_path")
+        sub_json_path=$(_normalize_webpath "$sub_json_path")
+        if [[ "$sub_path" == "/" ]] || ! validate_webpath "$sub_path"; then
+            error "Invalid subscription path: $sub_path"
+            return 1
+        fi
+        if [[ "$sub_json_path" == "/" ]] || ! validate_webpath "$sub_json_path" || _paths_overlap "$sub_path" "$sub_json_path"; then
+            error "Invalid or overlapping JSON subscription path: $sub_json_path"
+            return 1
+        fi
+        if [[ "$sub_mode" == "same" ]]; then
+            if _paths_overlap "$sub_path" "$panel_path" || _paths_overlap "$sub_json_path" "$panel_path"; then
+                error "Subscription paths overlap panel path '$panel_path'"
+                return 1
+            fi
+        elif [[ "$sub_mode" == "dedicated" ]]; then
+            if ! validate_domain "$sub_domain" || [[ "$sub_domain" == "$panel_domain" ]]; then
+                error "Valid subscription domain different from $panel_domain is required"
+                return 1
+            fi
+        fi
+    else
+        sub_domain=""
+    fi
+
+    if $use_existing_panel_cert && ! run_q "test -f $(quote_sh "$INSTALL_DIR/cert/$panel_domain/fullchain.pem") && test -f $(quote_sh "$INSTALL_DIR/cert/$panel_domain/privkey.pem")"; then
+        error "Existing certificate requested for $panel_domain, but files are missing in $INSTALL_DIR/cert/$panel_domain/"
+        return 1
+    fi
+    if [[ "$sub_mode" == "dedicated" ]] && $use_existing_sub_cert && ! run_q "test -f $(quote_sh "$INSTALL_DIR/cert/$sub_domain/fullchain.pem") && test -f $(quote_sh "$INSTALL_DIR/cert/$sub_domain/privkey.pem")"; then
+        error "Existing certificate requested for $sub_domain, but files are missing in $INSTALL_DIR/cert/$sub_domain/"
+        return 1
+    fi
+
+    # Snapshot proxy.conf, Caddyfile, webpanel.conf for transactional rollback
+    local pconf="$INSTALL_DIR/caddy/proxy.conf" pconf_bak="$INSTALL_DIR/caddy/proxy.conf.bak"
+    local cf="$INSTALL_DIR/caddy/Caddyfile" cf_bak="$INSTALL_DIR/caddy/Caddyfile.bak"
+    local wpconf="$INSTALL_DIR/webpanel/webpanel.conf" wpconf_bak="$INSTALL_DIR/webpanel/webpanel.conf.bak"
+    local had_pconf=false had_cf=false had_wpconf=false
+    run_q "test -f $(quote_sh "$pconf")" && { had_pconf=true; run "cp $(quote_sh "$pconf") $(quote_sh "$pconf_bak")" || true; }
+    run_q "test -f $(quote_sh "$cf")" && { had_cf=true; run "cp $(quote_sh "$cf") $(quote_sh "$cf_bak")" || true; }
+    run_q "test -f $(quote_sh "$wpconf")" && { had_wpconf=true; run "cp $(quote_sh "$wpconf") $(quote_sh "$wpconf_bak")" || true; }
+
+    _restore_proxy_snapshot() {
+        $had_pconf && run_q "mv -f $(quote_sh "$pconf_bak") $(quote_sh "$pconf")" || run_q "rm -f $(quote_sh "$pconf_bak")" || true
+        $had_cf && run_q "mv -f $(quote_sh "$cf_bak") $(quote_sh "$cf")" || run_q "rm -f $(quote_sh "$cf_bak")" || true
+        $had_wpconf && run_q "mv -f $(quote_sh "$wpconf_bak") $(quote_sh "$wpconf")" || run_q "rm -f $(quote_sh "$wpconf_bak")" || true
+        load_proxy_conf
+        load_webpanel_conf
+    }
+
+    PROXY_ENABLED=true
+    PROXY_DOMAIN="$panel_domain"
+    PROXY_PORT="$https_port"
+    PROXY_EMAIL="$acme_email"
+    SUB_MODE="$sub_mode"
+    SUB_DOMAIN="$sub_domain"
+    SUB_PORT="$sub_port"
+    SUB_PATH="$sub_path"
+    SUB_JSON_PATH="$sub_json_path"
+
+    WEBPANEL_DOMAIN="$panel_domain"
+    WEBPANEL_BIND="127.0.0.1"
+    validate_port "$WEBPANEL_PORT" || WEBPANEL_PORT=$(_find_free_webpanel_port "$PANEL_PORT" "$sub_port" "$https_port")
+    if ! $WEBPANEL_ENABLED; then
+        WEBPANEL_ENABLED=true
+    fi
+    if _paths_overlap "$WEBPANEL_PATH" "$panel_path" \
+        || { [[ "$sub_mode" == "same" ]] && { _paths_overlap "$WEBPANEL_PATH" "$sub_path" || _paths_overlap "$WEBPANEL_PATH" "$sub_json_path"; }; }; then
+        WEBPANEL_PATH=$(_choose_exclusive_webpanel_path "$panel_path" "$sub_path" "$sub_json_path")
+    fi
+
+    generate_decoy_site false || { _restore_proxy_snapshot; return 1; }
+    if ! generate_caddyfile "$panel_domain" "$https_port" "$acme_email" "$PANEL_PORT" "$panel_path" \
+        "$sub_mode" "$sub_domain" "$sub_port" "$sub_path" "$sub_json_path" \
+        "$use_existing_panel_cert" "$use_existing_sub_cert"; then
+        _restore_proxy_snapshot
+        error "Failed to generate Caddyfile; rolled back"
+        return 1
+    fi
+    save_proxy_conf || { _restore_proxy_snapshot; return 1; }
+    save_webpanel_conf || true
+    inject_caddy_compose || { _restore_proxy_snapshot; return 1; }
+
+    compose up -d || { _restore_proxy_snapshot; error "Failed to start Caddy container; rolled back"; return 1; }
+    if is_caddy_running; then
+        if ! _caddy_reload; then
+            _restore_proxy_snapshot
+            _caddy_reload >/dev/null 2>&1 || true
+            error "Caddy rejected updated configuration; rolled back"
+            return 1
+        fi
+    fi
+
+    run_q "rm -f $(quote_sh "$pconf_bak") $(quote_sh "$cf_bak") $(quote_sh "$wpconf_bak")" || true
+
+    info "Locking 3X-UI panel to loopback (127.0.0.1) & updating webDomain..."
+    run "$(_xui_setting_cmd -listenIP 127.0.0.1)" >/dev/null || true
+    xui_db_set "webListen" "127.0.0.1" || return 1
+    xui_db_set "webDomain" "$panel_domain" || return 1
+    xui_db_set "webCertFile" "" || true
+    xui_db_set "webKeyFile" "" || true
+
+    local port_sfx=""
+    [[ "$https_port" != "443" ]] && port_sfx=":${https_port}"
+    local ext_sub_url="" ext_sub_json_url="" sub_host=""
+    if [[ "$sub_mode" == "dedicated" ]]; then
+        sub_host="$sub_domain"
+        ext_sub_url="https://${sub_domain}${port_sfx}${sub_path}"
+        ext_sub_json_url="https://${sub_domain}${port_sfx}${sub_json_path}"
+    elif [[ "$sub_mode" == "same" ]]; then
+        sub_host="$panel_domain"
+        ext_sub_url="https://${panel_domain}${port_sfx}${sub_path}"
+        ext_sub_json_url="https://${panel_domain}${port_sfx}${sub_json_path}"
+    fi
+
+    if [[ "$sub_mode" != "none" ]]; then
+        local sub_enc="${SUB_ENCRYPT_DB:-true}"
+        [[ "$sub_enc" != "true" && "$sub_enc" != "false" ]] && sub_enc="true"
+        _apply_subscription_db_settings "true" "127.0.0.1" "$sub_host" "$sub_port" "$sub_path" \
+            "true" "$sub_json_path" "$sub_enc" "" "" \
+            "$ext_sub_url" "$ext_sub_json_url" || return 1
+    elif [[ "$prev_sub_mode" != "none" ]] || _is_loopback_addr "${SUB_LISTEN_DB:-}"; then
+        _clear_subscription_proxy_db
+    fi
+
+    compose restart 3xui >/dev/null || true
+    if [[ "${WEBPANEL_NO_SELF_RESTART:-0}" != "1" ]]; then
+        enable_webpanel auto || warn "WebPanel service update warning"
+    fi
+
+    invalidate_status
+    verify_panel_loaded 10 || true
+    [[ "$sub_mode" != "none" ]] && { verify_subscription_endpoint 6 || true; }
+    printf 'WEBPANEL_NEW_URL=https://%s%s%s\n' "$panel_domain" "$port_sfx" "$WEBPANEL_PATH"
+    success "Caddy reverse proxy configured for https://${panel_domain}${port_sfx}/"
+}
+
 _print_protected_paths() {
     get_panel_info >/dev/null 2>&1 || true
     load_webpanel_conf >/dev/null 2>&1 || true
@@ -7273,6 +8099,32 @@ reset_webpanel_password() {
     new_pw=""
 }
 
+webpanel_update_settings() {
+    require_deployed || return 1
+    load_webpanel_conf
+    local kv k v
+    for kv in "$@"; do
+        [[ "$kv" == *=* ]] || continue
+        k="${kv%%=*}"
+        v="${kv#*=}"
+        case "$k" in
+            idle)
+                if ! [[ "$v" =~ ^[0-9]+$ ]] || (( 10#$v < 5 || 10#$v > 1440 )); then
+                    error "Session idle timeout must be 5..1440 minutes"
+                    return 1
+                fi
+                WEBPANEL_SESSION_IDLE="$(( 10#$v ))"
+                ;;
+            *)
+                error "Unknown webpanel setting: $k"
+                return 1
+                ;;
+        esac
+    done
+    save_webpanel_conf || return 1
+    success "WebPanel settings updated (idle=${WEBPANEL_SESSION_IDLE}m)"
+}
+
 manage_webpanel() {
     require_deployed || return 1
     while true; do
@@ -7700,7 +8552,11 @@ xray_status() {
     echo -e "\n${BOLD}Xray Core Status:${NC}"
 
     info "Internal panel settings (/app/x-ui setting -show)..."
-    run_it "$(_xui_setting_cmd -show=true) 2>/dev/null || echo 'x-ui CLI unavailable'"
+    if $INTERACTIVE; then
+        run_it "$(_xui_setting_cmd -show=true) 2>/dev/null || echo 'x-ui CLI unavailable'"
+    else
+        run "$(_xui_setting_cmd -show=true) 2>/dev/null || echo 'x-ui CLI unavailable'"
+    fi
 
     echo -e "\n${DIM}Xray process:${NC}"
     local ps_out
@@ -7888,6 +8744,139 @@ _fw_open_port() {
         firewalld)
             run "firewall-cmd --permanent --add-port=${port}/${proto} >/dev/null" ;;
     esac
+}
+
+_fw_close_port() {
+    local fw="$1" port="$2" proto="${3:-tcp}"
+    validate_port "$port" || return 1
+    case "$fw" in
+        ufw)
+            run "ufw --force delete allow ${port}/${proto} >/dev/null" ;;
+        firewalld)
+            run "firewall-cmd --permanent --remove-port=${port}/${proto} >/dev/null" ;;
+    esac
+}
+
+_fw_detect_backend() {
+    if run_q "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'"; then
+        printf 'ufw'
+    elif run_q "command -v firewall-cmd >/dev/null 2>&1 && (firewall-cmd --state 2>/dev/null | grep -q 'running' || systemctl is-active --quiet firewalld 2>/dev/null)"; then
+        printf 'firewalld'
+    else
+        printf 'none'
+    fi
+}
+
+firewall_cli_dispatch() {
+    local action="${1:-status}"
+    shift || true
+    local fw
+    fw=$(_fw_detect_backend)
+
+    case "$action" in
+        status)
+            printf 'FIREWALL_BACKEND=%s\n' "$fw"
+            case "$fw" in
+                ufw)       run "ufw status verbose" ;;
+                firewalld) run "firewall-cmd --list-all" ;;
+                *)
+                    info "No active ufw or firewalld detected. Active sockets:"
+                    run "ss -tulnp 2>/dev/null || netstat -tulnp 2>/dev/null || true"
+                    ;;
+            esac
+            ;;
+        sync)
+            sync_inbound_firewall "$fw"
+            ;;
+        open)
+            local p="${1:-}" proto="${2:-tcp}"
+            validate_port "$p" || { error "Invalid port: $p"; return 1; }
+            [[ "$fw" == "none" ]] && { error "No active ufw or firewalld firewall detected"; return 1; }
+            case "$proto" in
+                tcp|udp) _fw_open_port "$fw" "$p" "$proto" || return 1 ;;
+                both)    { _fw_open_port "$fw" "$p" "tcp" && _fw_open_port "$fw" "$p" "udp"; } || return 1 ;;
+                *)       error "Invalid protocol '$proto' (use: tcp|udp|both)"; return 1 ;;
+            esac
+            [[ "$fw" == "firewalld" ]] && run "firewall-cmd --reload >/dev/null" || true
+            success "Opened port $p ($proto) via $fw"
+            ;;
+        close)
+            local p="${1:-}" proto="${2:-tcp}"
+            validate_port "$p" || { error "Invalid port: $p"; return 1; }
+            [[ "$fw" == "none" ]] && { error "No active ufw or firewalld firewall detected"; return 1; }
+            local ssh_ports=" 22 ${SSH_PORT:-22} "
+            local sshd_ports
+            sshd_ports=$(run_out "awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print \$2}' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null" || true)
+            if [[ -n "$sshd_ports" ]]; then
+                local sp
+                while IFS= read -r sp; do
+                    validate_port "$sp" && ssh_ports+="${sp} "
+                done <<< "$sshd_ports"
+            fi
+            if [[ "$ssh_ports" == *" ${p} "* ]] && [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+                error "Refusing to close active SSH port ${p}/tcp (prevents administrative lockout)"
+                return 1
+            fi
+            load_proxy_conf
+            if $PROXY_ENABLED && [[ "$p" == "$PROXY_PORT" ]]; then
+                error "Refusing to close active Caddy reverse-proxy port ${PROXY_PORT} while WebPanel/Proxy is active"
+                return 1
+            fi
+            case "$proto" in
+                tcp|udp) _fw_close_port "$fw" "$p" "$proto" || return 1 ;;
+                both)    { _fw_close_port "$fw" "$p" "tcp" && _fw_close_port "$fw" "$p" "udp"; } || return 1 ;;
+                *)       error "Invalid protocol '$proto' (use: tcp|udp|both)"; return 1 ;;
+            esac
+            [[ "$fw" == "firewalld" ]] && run "firewall-cmd --reload >/dev/null" || true
+            success "Closed port $p ($proto) via $fw"
+            ;;
+        *)
+            error "Unknown firewall action: $action (use: status|sync|open|close)"
+            return 1
+            ;;
+    esac
+}
+
+dns_check_cli() {
+    local domain="${1:-}"
+    validate_domain "$domain" || { error "Invalid domain: $domain"; return 1; }
+    local resolved=""
+    resolved=$(run_out "
+        if command -v getent >/dev/null 2>&1; then
+            getent ahosts $(quote_sh "$domain") 2>/dev/null | awk '{print \$1}' | sort -u
+        elif command -v dig >/dev/null 2>&1; then
+            { dig +short A $(quote_sh "$domain"); dig +short AAAA $(quote_sh "$domain"); } 2>/dev/null | grep -E '^[0-9a-fA-F:.]+$' | sort -u
+        elif command -v nslookup >/dev/null 2>&1; then
+            nslookup $(quote_sh "$domain") 2>/dev/null | awk '/^Address:[[:space:]]*/ {print \$2}' | grep -E '^[0-9a-fA-F:.]+$' | sort -u
+        fi
+    " || true)
+    local pub4="" pub6=""
+    pub4=$(run_out "curl -4fsS --proto '=https' --tlsv1.2 --max-time 2 https://api.ipify.org" || true)
+    pub6=$(run_out "curl -6fsS --proto '=https' --tlsv1.2 --max-time 2 https://api64.ipify.org" || true)
+    local rec_csv="" matched="false" r
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        rec_csv+="${rec_csv:+,}${r}"
+        if [[ -n "$pub4" && "$r" == "$pub4" ]] || [[ -n "$pub6" && "$r" == "$pub6" ]]; then
+            matched="true"
+        fi
+    done <<< "$resolved"
+    printf 'DNS_DOMAIN=%s\nDNS_RECORDS=%s\nSERVER_IPV4=%s\nSERVER_IPV6=%s\nDNS_MATCH=%s\n' \
+        "$domain" "$rec_csv" "$pub4" "$pub6" "$matched"
+    _check_domain_dns "$domain"
+}
+
+dns_status_cli() {
+    local ns=""
+    ns=$(run_out "awk '/^nameserver[[:space:]]+/{printf \"%s%s\", (c++?\",\":\"\"), \$2}' /etc/resolv.conf 2>/dev/null" || true)
+    local hn=""
+    hn=$(run_out "hostname -f 2>/dev/null || hostname 2>/dev/null" || true)
+    local ifaces=""
+    ifaces=$(run_out "ip -o addr show 2>/dev/null | awk '{print \$2\" \"\$3\" \"\$4}'" || true)
+    printf 'HOSTNAME=%s\nNAMESERVERS=%s\n' "$hn" "$ns"
+    if [[ -n "$ifaces" ]]; then
+        printf '%s\n' "$ifaces" | sed 's/^/IFACE=/'
+    fi
 }
 
 manage_firewall() {
@@ -8395,7 +9384,8 @@ Options:
   -h, --help              Show this help message
 
 Commands (omit to launch interactive TUI):
-  deploy                  Install Docker if needed and deploy 3X-UI
+  deploy [sqlite|postgres [user]]
+                          Install Docker if needed and deploy 3X-UI
   status                  Show deployment and panel status
   start | stop | restart  Control container lifecycle
   update [tag]            Update 3X-UI (latest or specific tag) with preflight & auto-rollback
@@ -8404,16 +9394,24 @@ Commands (omit to launch interactive TUI):
                           Check 3x-ui compatibility, DB schema & preflight image contract
   logs [follow|all|N|deploy]
                           View container logs or 3xui-deploy operation logs
-  backup                  Create timestamped backup archive
+  backup [now|cron-status|cron-set <hour> <keep>|cron-disable]
+                          Create timestamped backup or manage daily backup schedule
   restore [archive]       Restore from backup archive
   health                  Show system & panel diagnostics
+  xray-status             Show Xray core process, listening sockets & Fail2ban status
   bbr                     Enable TCP BBR & proxy network sysctl tuning
   geo-update [std|ir|ru|all]  Update Xray GeoIP & GeoSite databases
-  settings                Open Panel Settings & Security menu
-  certs                   Open Certificate Management menu
-  proxy [setup|status|verify|reload|probe|check-redirect|disable]
+  settings [show|set-port|set-listen|set-webpath|set-security|set-sub|reset-2fa|reset-credentials]
+                          Manage panel settings, listen IP, subscriptions & security
+  certs [list|issue|renew|revoke|self-signed|apply]
+                          Manage Let's Encrypt & self-signed SSL/TLS certificates
+  dns [status|check <domain>]
+                          Inspect host DNS resolvers, interfaces & domain A/AAAA match
+  firewall [status|sync|open <port> [proto]|close <port> [proto]]
+                          Inspect and safely manage UFW/Firewalld rules
+  proxy [setup|configure|status|verify|reload|probe|check-redirect|disable]
                           Manage Caddy reverse proxy, decoy website & probe redirection
-  webpanel [enable|disable|status|reset-password]
+  webpanel [enable|disable|status|reset-password|update-settings|logs]
                           Manage standalone Web Management Panel (/deploy/)
   inbounds [list|verify|sync-proxy|sync-fw]
                           Inspect inbounds, verify sockets & sync Caddy/firewall
@@ -8676,6 +9674,7 @@ main() {
     load_config
 
     local cli_cmd="" cli_arg="" cli_arg2=""
+    local -a cli_args=() cli_rest=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -r|--remote)
@@ -8718,18 +9717,19 @@ main() {
             *)
                 if [[ -z "$cli_cmd" ]]; then
                     cli_cmd="$1"
-                elif [[ -z "$cli_arg" ]]; then
-                    cli_arg="$1"
-                elif [[ -z "$cli_arg2" ]]; then
-                    cli_arg2="$1"
                 else
-                    error "Unexpected argument: $1"
-                    exit 1
+                    cli_args+=("$1")
                 fi
                 shift
                 ;;
         esac
     done
+
+    cli_arg="${cli_args[0]:-}"
+    cli_arg2="${cli_args[1]:-}"
+    if (( ${#cli_args[@]} > 1 )); then
+        cli_rest=("${cli_args[@]:1}")
+    fi
 
     validate_safe_dir "$INSTALL_DIR" || { error "Unsafe install directory: $INSTALL_DIR"; exit 1; }
     validate_safe_dir "$BACKUP_DIR"  || { error "Unsafe backup directory: $BACKUP_DIR"; exit 1; }
@@ -8745,7 +9745,7 @@ main() {
         local _needs_tty=false
         if ! $AUTO_YES; then
             case "$cli_cmd:${cli_arg:-}" in
-                deploy:*|settings:*|certs:*) _needs_tty=true ;;
+                deploy:|settings:|certs:) _needs_tty=true ;;
                 proxy:|proxy:setup|proxy:probe) _needs_tty=true ;;
                 webpanel:|webpanel:reset-password) _needs_tty=true ;;
                 inbounds:) _needs_tty=true ;;
@@ -8763,7 +9763,14 @@ main() {
         fi
 
         case "$cli_cmd" in
-            deploy)       INTERACTIVE=true; deploy ;;
+            deploy)
+                if [[ -n "$cli_arg" ]] || $AUTO_YES; then
+                    deploy "$cli_arg" "$cli_arg2"
+                else
+                    INTERACTIVE=true
+                    deploy
+                fi
+                ;;
             status)       status_panel ;;
             start)        start_panel ;;
             stop)         stop_panel ;;
@@ -8778,17 +9785,51 @@ main() {
                 esac
                 ;;
             logs)         logs_panel "${cli_arg:-100}" ;;
-            backup)       backup_panel ;;
+            backup)
+                case "${cli_arg:-now}" in
+                    now)          backup_panel ;;
+                    cron-status)  _status_backup_cron ;;
+                    cron-set)     _install_backup_cron "${cli_arg2:-3}" "${cli_args[2]:-7}" ;;
+                    cron-disable) _disable_backup_cron ;;
+                    *)            error "Unknown backup action: $cli_arg (use: now|cron-status|cron-set <hour> <keep>|cron-disable)"; exit 1 ;;
+                esac
+                ;;
             restore)      restore_panel "$cli_arg" ;;
             health)       health_check ;;
+            xray-status)  xray_status ;;
             bbr)          enable_bbr_tuning ;;
             geo-update)   manage_geo_assets "${cli_arg:-std}" ;;
-            settings)     INTERACTIVE=true; manage_panel_settings ;;
-            certs)        INTERACTIVE=true; manage_certs ;;
+            settings)
+                if [[ -z "$cli_arg" ]]; then
+                    INTERACTIVE=true
+                    manage_panel_settings
+                else
+                    settings_cli_dispatch "$cli_arg" ${cli_rest[@]+"${cli_rest[@]}"}
+                fi
+                ;;
+            certs)
+                if [[ -z "$cli_arg" ]]; then
+                    INTERACTIVE=true
+                    manage_certs
+                else
+                    certs_cli_dispatch "$cli_arg" ${cli_rest[@]+"${cli_rest[@]}"}
+                fi
+                ;;
+            dns)
+                case "${cli_arg:-status}" in
+                    status) dns_status_cli ;;
+                    check)  dns_check_cli "$cli_arg2" ;;
+                    *)      error "Unknown dns action: $cli_arg (use: status|check <domain>)"; exit 1 ;;
+                esac
+                ;;
+            firewall)
+                firewall_cli_dispatch "${cli_arg:-status}" ${cli_rest[@]+"${cli_rest[@]}"}
+                ;;
             proxy)
                 case "${cli_arg:-}" in
                     "")              INTERACTIVE=true; manage_reverse_proxy ;;
                     setup)           INTERACTIVE=true; setup_reverse_proxy ;;
+                    configure)       configure_reverse_proxy_cli ${cli_rest[@]+"${cli_rest[@]}"} ;;
                     status)          status_reverse_proxy ;;
                     verify)          verify_reverse_proxy ;;
                     reload)          reload_reverse_proxy ;;
@@ -8798,18 +9839,19 @@ main() {
                     decoy-apply)     load_probe_conf; generate_decoy_site true ;;
                     protected-paths) _print_protected_paths ;;
                     disable)         disable_reverse_proxy ;;
-                    *)               error "Unknown proxy action: $cli_arg (use: setup|status|verify|reload|probe|check-redirect|disable)"; exit 1 ;;
+                    *)               error "Unknown proxy action: $cli_arg (use: setup|configure|status|verify|reload|probe|check-redirect|disable)"; exit 1 ;;
                 esac
                 ;;
             webpanel)
                 case "${cli_arg:-}" in
-                    "")             INTERACTIVE=true; manage_webpanel ;;
-                    enable)         enable_webpanel "${cli_arg2:-cli}" ;;
-                    disable)        disable_webpanel ;;
-                    status)         status_webpanel ;;
-                    reset-password) INTERACTIVE=true; reset_webpanel_password ;;
-                    logs)           run "tail -n 100 $(quote_sh "$INSTALL_DIR/logs/webpanel-audit.log") 2>/dev/null || echo '(no audit log yet)'" ;;
-                    *)              error "Unknown webpanel action: $cli_arg (use: enable|disable|status|reset-password|logs)"; exit 1 ;;
+                    "")              INTERACTIVE=true; manage_webpanel ;;
+                    enable)          enable_webpanel "${cli_arg2:-cli}" ;;
+                    disable)         disable_webpanel ;;
+                    status)          status_webpanel ;;
+                    reset-password)  INTERACTIVE=true; reset_webpanel_password ;;
+                    update-settings) webpanel_update_settings ${cli_rest[@]+"${cli_rest[@]}"} ;;
+                    logs)            run "tail -n 100 $(quote_sh "$INSTALL_DIR/logs/webpanel-audit.log") 2>/dev/null || echo '(no audit log yet)'" ;;
+                    *)               error "Unknown webpanel action: $cli_arg (use: enable|disable|status|reset-password|update-settings|logs)"; exit 1 ;;
                 esac
                 ;;
             inbounds)

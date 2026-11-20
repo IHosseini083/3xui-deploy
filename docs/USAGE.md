@@ -81,8 +81,14 @@ Under **Reverse proxy (Caddy)** (`manage.sh proxy`), `manage.sh` runs `caddy:2-a
 When you configure a panel domain via `proxy setup` (or set `webDomain` in Panel Settings and enable proxy), `3xui-deploy` automatically installs and starts the standalone **Web Management Panel** (`3xui-deploy-web.service`):
 
 - **Exclusive Domain & Dedicated Path**: Bound strictly to `127.0.0.1` (`2059`) and reverse-proxied exclusively under the main panel domain (`https://panel.example.com/deploy/`), automatically selecting a non-overlapping path if `/deploy/` collides with existing panel/subscription routes. Never mounted on dedicated subscription domains (`sub.example.com`).
-- **Capabilities**: View system metrics & container status, start/stop/restart stack, run 3X-UI compatibility & preflight checks, execute rollback-safe updates, configure decoy themes and probe redirection rules (including live target health tester and request simulator), inspect Xray inbounds, run `audit`, create/prune backups, update GeoIP/GeoSite datasets, and filter `3xui-deploy` / audit / container logs.
-- **CLI Commands**: `webpanel enable`, `webpanel status`, `webpanel reset-password`, `webpanel logs`, `webpanel disable`.
+- **Mobile-First Responsive Interface**: Responsive drawer + sticky mobile bottom navigation, touch-sized controls, semantic progress meters, confirmation dialogs (with typed confirmation phrases for high-risk actions), and a **Live Operation Console** streaming real-time SSE output with automatic polling fallback.
+- **Capabilities**:
+  - **Dashboard**: Deployment health status, CPU/RAM/Disk/TCP BBR gauges, live `3xui_*` container stats, copyable URLs, TLS health summary, and recent operations.
+  - **SSL Certificates**: Inspect installed & Caddy ACME certs (SANs, expiry, issuer, days remaining), issue Let's Encrypt certs (`certbot standalone`), generate ECDSA P-256 self-signed certs, renew or force-renew, apply certs to Caddy/Panel, and revoke/delete certificates safely.
+  - **Domains & Network**: Reconfigure Caddy reverse proxy domains/ports/subscription modes with atomic rollback, tune 3X-UI `listenIP`/`port`/`webBasePath`/`webDomain`/credentials/2FA, run DNS A/AAAA checks against host public IP, enable TCP BBR sysctl tuning, and manage UFW/Firewalld port rules (with SSH/proxy lockout protection).
+  - **Decoy & Stealth, Inbounds & Audit**: Manage decoy themes and probe-redirection rules + simulator, inspect Xray inbounds and Xray Core status, and run security audits.
+  - **Deploy, Backups, Logs & History**: Deploy/redeploy SQLite or PostgreSQL stacks, run compatibility preflight checks, perform rollback-safe updates, create/restore/prune backups, configure daily backup cron schedules, update GeoIP/GeoSite datasets, filter 6 log sources, and inspect persistent operation history.
+- **CLI Commands**: `webpanel enable`, `webpanel status`, `webpanel reset-password`, `webpanel update-settings`, `webpanel logs`, `webpanel disable`.
 
 ---
 
